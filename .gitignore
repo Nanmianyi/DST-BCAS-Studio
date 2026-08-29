@@ -14,3 +14,9 @@ tools/patch_ui_*.py
 
 # 字体源 zip 保留（mod 运行需要），但排除可能的解包产物
 BCAS-Studio/fonts/*.zip.orig
+
+# 根目录原始截图（正式版已入库 docs/images/）
+/原版.png
+/开启后.png
+/原版2.png
+/开启后2.png

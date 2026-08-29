@@ -20,3 +20,12 @@ BCAS-Studio/fonts/*.zip.orig
 /开启后.png
 /原版2.png
 /开启后2.png
+/插件UI.png
+/插件色轮UI.png
+/海中.png
+/海中开启后.png
+/KB.jpg
+
+# SteamCMD 上传工具与压缩包（非仓库内容）
+/steamcmd.zip
+/steamcmd_dist/

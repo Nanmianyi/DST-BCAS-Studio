@@ -1,0 +1,16 @@
+# 第三方研究材料（体积大、非原创，不入库）
+reference/
+
+# Python 构建缓存
+__pycache__/
+*.pyc
+
+# 开发期一次性补丁脚本
+tools/patch_ui_*.py
+
+# 崩溃转储与临时文件
+*.dmp
+*.tmp
+
+# 字体源 zip 保留（mod 运行需要），但排除可能的解包产物
+BCAS-Studio/fonts/*.zip.orig

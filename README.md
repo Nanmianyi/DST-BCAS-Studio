@@ -12,7 +12,7 @@
 BCAS是一个只使用极少量的等同于CAS的十字形5采样开销就实现了等价双边锐化的自然效果，提供非常自然，几乎不产生伪影与振铃过充产生的效果
 
 **人尽皆知的是，锐化是提升清晰度的好手段，但是副作用令人诟病良久，那么您有想过如果对画质无损的锐化是怎么样的吗？**
-
+2K分辨率下测试
 | 原版 | BCAS Studio |
 | --- | --- |
 | ![原版](docs/images/comparison_before.png) | ![BCAS Studio](docs/images/comparison_after.png) |

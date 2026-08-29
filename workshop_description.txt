@@ -1,7 +1,7 @@
 【BCAS Studio —— 饥荒联机版画质增强 · 全开源】
 
 ≡ 仓库位置（全开源）≡
-GitHub: https://github.com/nanmianyi/BCAS-Studio
+GitHub: https://github.com/Nanmianyi/DST-BCAS-Studio
 （含全部源码：GLSL 着色器、参数状态机、UI、构建工具链）
 任何人都可以下载、学习、二次开发、借鉴，无需任何授权，作者没有任何意见。
 

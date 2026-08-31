@@ -3,8 +3,8 @@
 接入引擎官方 Mod 着色器链：
   Asset("SHADER") 声明 -> AddModShadersInit 注册 -> AddModShadersSortAndEnable 排序启用
 
-另整合高清字体（改编自创意工坊 2403997762，TsAIM 的高清字体 mod），
-可通过 mod 配置里的「高清字体」开关。
+另整合高清字体（思源黑体，打包资源取自创意工坊 Chinese++ 1418746242，
+见 fonts/ATTRIBUTION.txt），可通过 mod 配置里的「高清字体」开关。
 
 注意：TheFrontEnd / TheInput 在 modmain 加载时还不存在（client_log 实测
 "attempt to index upvalue 'TheFrontEnd' (a nil value)"），必须在回调里
@@ -26,7 +26,8 @@ local State = require "bcas_state"
 State.boot_preset = GetModConfigData("PRESET") or "standard"
 
 -- ==========================================================================
--- 高清字体整合（改编自 workshop-2403997762 / TsAIM，GPL，见 fonts/LICENSE）
+-- 高清字体整合（思源黑体，SIL OFL 1.1，见 fonts/ATTRIBUTION.txt；
+-- 字体接入结构改编自 workshop-2403997762 / TsAIM 的高清字体 mod）
 -- ==========================================================================
 
 local ENABLE_HDFONT = GetModConfigData("HDFONT") ~= "off"
@@ -71,8 +72,6 @@ if ENABLE_HDFONT then
 
         TheSim:LoadFont(MODROOT_ .. "fonts/normal.zip", "normalfont")
         TheSim:LoadFont(MODROOT_ .. "fonts/normal_outline.zip", "normalfont_outline")
-        TheSim:SetupFontFallbacks("normalfont", GLOBAL.DEFAULT_FALLBACK_TABLE)
-        TheSim:SetupFontFallbacks("normalfont_outline", GLOBAL.DEFAULT_FALLBACK_TABLE_OUTLINE)
 
         -- 与原 mod 相同的字重分配：outline 系走描边字体，正文/按钮走普通字体
         GLOBAL.DEFAULTFONT = "normalfont_outline"
@@ -98,6 +97,21 @@ if ENABLE_HDFONT then
         GLOBAL.rawset(GLOBAL, "BCAS_FONT_CLEAN", "normalfont")
     end
 
+    -- fallback 链（DEFAULT_FALLBACK_TABLE）引用的 fallback_font / controllers /
+    -- emoji 等字体由引擎在 GlobalInit→LoadFonts() 里加载，时机晚于 modmain。
+    -- 若在 modmain 阶段调用 SetupFontFallbacks，这些字体尚不存在，引擎该 C 函数
+    -- 不做防御会直接原生崩溃——不抛 Lua 错误、xpcall 拦不住，进程当场退出
+    -- （client_log 实测：'dmp written' 后紧跟 [C](-1): SetupFontFallbacks）。
+    -- 这就是 3.0.0「游戏内启用正常、开着 mod 冷启动必崩」的根因。
+    -- 因此 fallback 设置只能放在 LoadFonts 之后的重挂点里（下方三个重挂点
+    -- 均晚于 GlobalInit：Start 由引擎在 main.lua 跑完后调用，另两个在 gamelogic
+    -- /世界重建期触发，而 gamelogic 本身是 Start 里 require 的）。
+    local function ApplyFontFallbacks()
+        local TheSim = GLOBAL.TheSim
+        TheSim:SetupFontFallbacks("normalfont", GLOBAL.DEFAULT_FALLBACK_TABLE)
+        TheSim:SetupFontFallbacks("normalfont_outline", GLOBAL.DEFAULT_FALLBACK_TABLE_OUTLINE)
+    end
+
     -- 游戏会在重建预制件/开始游戏时重置字体，沿用原 mod 的三个重挂点
     -- 注意先备份再覆盖（顺序反了会备份到自己的包装函数造成无限递归）
     local SimIndex = GLOBAL.getmetatable(GLOBAL.TheSim).__index
@@ -105,17 +119,20 @@ if ENABLE_HDFONT then
     SimIndex.UnregisterAllPrefabs = function(self, ...)
         oldUnregisterAllPrefabs(self, ...)
         ApplyHDFonts()
+        ApplyFontFallbacks()
     end
 
     local oldRegisterPrefabs = GLOBAL.ModManager.RegisterPrefabs
     GLOBAL.ModManager.RegisterPrefabs = function(self, ...)
         oldRegisterPrefabs(self, ...)
         ApplyHDFonts()
+        ApplyFontFallbacks()
     end
 
     local oldStart = GLOBAL.Start
     GLOBAL.Start = function(...)
         ApplyHDFonts()
+        ApplyFontFallbacks()
         return oldStart(...)
     end
 

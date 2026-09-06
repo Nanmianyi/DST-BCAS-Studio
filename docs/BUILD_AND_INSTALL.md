@@ -31,7 +31,7 @@
 python tools/build_ksh.py          # 构建 src_shaders/ 下全部着色器
 python tools/build_ksh.py 源.ps 输出.ksh   # 单独构建一个
 python tools/make_modicon.py       # 模组图标 → KTEX(DXT5 全 mip 链)
-python tools/build_sarasa_font.py  # 高清字体打包
+python tools/build_hanfont.py      # 高清字体打包
 ```
 
 产物直接写入 `BCAS-Studio/shaders/`，构建后把 `BCAS-Studio/` 复制到
@@ -76,7 +76,7 @@ BCAS-Studio/                 ← Mod 本体
 │   ├── bcas_sun_emitter.lua ← 动态太阳：日晷模型 / 剪影投影 / 透云光束
 │   └── bcas_ocean.lua       ← 海洋地皮调色（世界生成烘焙）
 ├── shaders/                 ← 构建产物（.ksh，勿手改）
-├── fonts/                   ← 更纱黑体（SIL OFL，见 ATTRIBUTION.txt）
+├── fonts/                   ← 思源黑体 85px 视网膜重铸版（SIL OFL，见 ATTRIBUTION.txt）
 └── anim/                    ← 投影剪影动画
 src_shaders/                 ← 全部 GLSL ES 源码（cinema/studio/glow×5）
 tools/                       ← build_ksh / ksh_parse / make_modicon 等

@@ -1,0 +1,97 @@
+#if defined( GL_ES )
+precision highp float;
+#endif
+
+// ============================================================================
+//  BCAS Studio - PASS 4/4: glow composite B + light wrap + true rim light
+// ============================================================================
+
+uniform sampler2D SAMPLER[3];
+
+#define SRC_IMAGE   SAMPLER[0]
+#define GLOW_WIDE   SAMPLER[1]
+#define GLOW_HALO   SAMPLER[2]
+
+uniform vec4 BCAS_GLOW;
+uniform vec4 BCAS_GLOW2;
+uniform vec4 BCAS_GLOW3;
+uniform vec4 BCAS_ATMO;
+uniform vec4 BCAS_EXTRA;    // y = SunFill(day/cave gate) zw = sun screen uv
+uniform vec4 SCREEN_PARAMS;
+
+varying vec2 PS_TEXCOORD0;
+
+float bcas_luma(vec3 c)
+{
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main()
+{
+    vec3 src  = texture2D(SRC_IMAGE, PS_TEXCOORD0.xy).rgb;
+    vec3 wide = texture2D(GLOW_WIDE, PS_TEXCOORD0.xy).rgb;
+    vec3 halo = texture2D(GLOW_HALO, PS_TEXCOORD0.xy).rgb;
+
+    float ht = clamp(bcas_luma(halo) * 4.0, 0.0, 1.0);
+    float tail = 1.0 - ht;
+    tail = tail * tail;
+    halo *= 1.0 + BCAS_GLOW3.x * tail * tail;
+
+    vec2 w = mix(vec2(0.20, 0.10), vec2(0.30, 0.30), BCAS_GLOW2.x);
+
+    vec3 pal = mix(vec3(0.90, 0.96, 1.0), vec3(1.0, 0.92, 0.82),
+                   BCAS_GLOW.w * 0.5 + 0.5);
+    wide *= mix(vec3(1.0), pal, 0.66);
+    halo *= mix(vec3(1.0), pal, 1.0);
+    halo *= BCAS_GLOW2.w;
+
+    vec3 bloom = wide * w.x + halo * w.y;
+    float bl = bcas_luma(bloom);
+    bloom = mix(vec3(bl), bloom, BCAS_GLOW2.y);
+
+    vec3 final = src + bloom * BCAS_GLOW.x;
+
+    float srcL = clamp(bcas_luma(src), 0.0, 1.0);
+    float shadow = 1.0 - srcL;
+    // Light wrap + a hair of air from GodRays (world shafts are Lua FX;
+    // this keeps BCAS_GLOW3.w live and slightly lifts shadowed air).
+    final += halo * (BCAS_GLOW3.y * shadow * shadow + BCAS_GLOW3.w * 0.02 * shadow);
+
+    // Rim: 4-neighbour luma edge, gated by bloom halo (fire/lantern/sunlight
+    // that actually hit the glow buffer). World-space sun shafts are Lua FX.
+    if (BCAS_GLOW3.z > 0.001) {
+        vec2 px = SCREEN_PARAMS.zw;
+        if (px.x > 0.0 && px.y > 0.0) {
+            float Lr = bcas_luma(texture2D(SRC_IMAGE, PS_TEXCOORD0.xy + vec2(px.x * 1.5, 0.0)).rgb);
+            float Ll = bcas_luma(texture2D(SRC_IMAGE, PS_TEXCOORD0.xy - vec2(px.x * 1.5, 0.0)).rgb);
+            float Lu = bcas_luma(texture2D(SRC_IMAGE, PS_TEXCOORD0.xy + vec2(0.0, px.y * 1.5)).rgb);
+            float Ld = bcas_luma(texture2D(SRC_IMAGE, PS_TEXCOORD0.xy - vec2(0.0, px.y * 1.5)).rgb);
+            float edge = max(abs(srcL - Lr), abs(srcL - Ll));
+            edge = max(edge, max(abs(srcL - Lu), abs(srcL - Ld)));
+            float haloMask = clamp(bcas_luma(halo) * 6.0, 0.0, 1.0);
+            vec3 rim_gold = vec3(1.18, 1.06, 0.88);
+            final += rim_gold * (BCAS_GLOW3.z * 2.2 * edge * haloMask);
+        }
+    }
+    // Water sun-glitter: lives ONLY on bright, low-saturation crests (the
+    // engine's world-anchored white dashes). No teal gate here -- white
+    // crests have g-r ~ 0 and the hue test would reject exactly the pixels
+    // we want. Radial sun weighting with a small base so far dashes still
+    // glint a little; global breathing; zero spatial patterns.
+    if (BCAS_GLOW3.w > 0.001 && BCAS_EXTRA.y > 0.001) {
+        float mx = max(src.r, max(src.g, src.b));
+        float mn = min(src.r, min(src.g, src.b));
+        float sat = mx - mn;
+        float dash = smoothstep(0.45, 0.78, srcL) * (1.0 - smoothstep(0.32, 0.60, sat));
+        vec2 ar = vec2(SCREEN_PARAMS.x / max(SCREEN_PARAMS.y, 1.0), 1.0);
+        vec2 dv = (PS_TEXCOORD0 - BCAS_EXTRA.zw) * ar;
+        float toward = 0.25 + 0.75 * pow(max(1.0 - length(dv) * 0.55, 0.0), 2.0);
+        float fres = mix(0.75, 1.30, 1.0 - PS_TEXCOORD0.y);
+        float breathe = 0.60 + 0.40 * sin(BCAS_ATMO.z * 1.7);
+        float amt = BCAS_GLOW3.w * BCAS_EXTRA.y * 0.55
+                  * dash * toward * fres * breathe;
+        final += vec3(1.20, 1.12, 0.94) * amt;
+    }
+    final = final / (1.0 + final * BCAS_GLOW2.z);
+    gl_FragColor = vec4(final, 1.0);
+}

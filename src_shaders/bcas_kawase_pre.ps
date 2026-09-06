@@ -1,0 +1,60 @@
+#if defined( GL_ES )
+precision mediump float;
+#endif
+
+// ============================================================================
+//  BCAS Studio - glow pyramid head: soft-knee prefilter + Kawase stride 1
+//
+//  Reads the RAW engine bloom buffer (BloomSampler) and applies the
+//  Unreal-style soft-knee high-light extraction BEFORE any blurring, so
+//  every downstream pyramid level blurs thresholded light only. Also runs
+//  the first tiny Kawase tap (stride 1) to soften the 1/4-res sprite edges
+//  of the raw buffer - this stage is the pyramid CORE.
+//
+//  Soft-knee: quadratic ramp between (threshold - knee) and
+//  (threshold + knee); colour-preserving (RGB scaled by one multiplier
+//  derived from luma); no hard cut and no dimming of the midrange beyond
+//  the smooth curve. knee is clamped to threshold so the ramp always ends
+//  at luma 0 - dark pixels can never be amplified.
+//
+//  Uniform note: BCAS_GLOW is SHARED with the composite passes (same
+//  handle, bound per effect via SetEffectUniformVariables - the engine's
+//  OVERLAY_BLEND precedent). Entry table lists it as vec4, only y/z are
+//  read here.
+//
+//  NOTE FOR MAINTAINERS: pure ASCII only (ANGLE rejects anything else).
+// ============================================================================
+
+uniform sampler2D SAMPLER[1];
+uniform vec4 SAMPLER_PARAMS;
+uniform vec4 BCAS_GLOW;
+
+varying vec2 PS_TEXCOORD0;
+
+#define THRESHOLD BCAS_GLOW.y
+#define KNEE      BCAS_GLOW.z
+
+vec3 bcas_prefilter(vec3 c)
+{
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    float kk = min(KNEE, THRESHOLD);
+    float rq = clamp(l - THRESHOLD + kk, 0.0, kk * 2.0);
+    rq = rq * rq / (4.0 * kk + 1e-4);
+    float m = clamp(max(rq, l - THRESHOLD) / max(l, 1e-4), 0.0, 1.0);
+    return c * m;
+}
+
+void main()
+{
+    vec2 px = SAMPLER_PARAMS.zw;
+    vec2 off = vec2(px.x * 1.5, px.y * 1.5);
+
+    vec3 c0 = texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2( off.x,  off.y)).rgb;
+    vec3 c1 = texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2( off.x, -off.y)).rgb;
+    vec3 c2 = texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2(-off.x,  off.y)).rgb;
+    vec3 c3 = texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2(-off.x, -off.y)).rgb;
+
+    gl_FragColor = vec4(
+        (bcas_prefilter(c0) + bcas_prefilter(c1)
+       + bcas_prefilter(c2) + bcas_prefilter(c3)) * 0.25, 1.0);
+}

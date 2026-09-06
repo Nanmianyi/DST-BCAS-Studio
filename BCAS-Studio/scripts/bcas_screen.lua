@@ -1,18 +1,12 @@
---[[ BCAS Studio —— 设置面板 v3
-
-视觉：楠眠已 LAB 博客风（奶油纸底 / 深棕墨色 / 橄榄绿点缀 / # 与 // 装饰 /
-虚线分隔），浅底文字一律无描边干净字体（BCAS_FONT_CLEAN，见 modmain）。
-
-布局纪律（防重叠/超框）：
-  * 面板 470x670，所有 y 坐标走同一张台账（见 BuildXXX 各常量）；
-  * 所有 Text 必须给 SetRegionSize + 对齐，禁止让文字自由伸展；
-  * 文字宽度按 15pt 中文约 15px/字、拉丁约 8px/字 预算，区域留 10% 余量。
-
-交互：
-  * 数值框：按住左右拖动（ReShade 式）；单击弹出输入框可直接键入任意值；
-  * R 按钮：恢复该参数默认值；
-  * 色彩页：白平衡调色轮（色相环 + 饱和/明度方格 + RGB 增益行 + 快捷预设），
-    增益经 GainToTempTint 映射到 Temp/Tint 两个 uniform，不占新 uniform。
+--[[
+    BCAS Studio —— 设置面板 v4.5 (Master Precision Edition)
+    视觉设计：楠眠已 LAB · 光色几何实验室 (Color & Light Optical Laboratory)
+    调色体系：暖米工程底纸 / 深焙黑巧 / 实验室橄榄绿 / 光色琥珀金 / 瓷白高亮
+    
+    架构特性：
+      * 100% 纯矢量矩阵构建（基于引擎 square.tex 多层光影着色），零模糊、零外部图片依赖；
+      * 欧几里得几何与包豪斯排版：十字准星、L型标尺、光学滑轨刻度、状态指示灯；
+      * ReShade 式无级拖拽 + 单击直接键入 + 实时双向同步光谱白平衡仪。
 ]]
 
 local Screen = require "widgets/screen"
@@ -24,106 +18,142 @@ local TextEdit = require "widgets/textedit"
 
 local State = require "bcas_state"
 
--- 无描边干净字体（HDFONT 开启时由 modmain rawset 注入；关闭时回落到游戏原 UIFONT）
--- 注意：本文件经 require 跑在游戏环境（没有 modenv 的 GLOBAL 名字），
--- 且 strict.lua 对未声明名字的普通读取会报错，必须 rawget(_G, ...) 绕过。
+-- 无描边干净字体（HDFONT 开启时注入，关闭时回落 UIFONT）
 local F_CLEAN = rawget(_G, "BCAS_FONT_CLEAN") or UIFONT
 
--- ==== 博客色板（取自楠眠已 LAB） ==========================================
+-- ==== 1. 实验室签名调色板 (OPTICAL LAB PALETTE) ==============================
 local C = {
-    CREAM      = {0.949, 0.937, 0.902, 1},   -- 页面底 #F2EFE6
-    CREAM_ALT  = {0.914, 0.894, 0.835, 1},   -- 行底 #E9E4D5
-    PAPER      = {0.980, 0.969, 0.933, 1},   -- 卡片/数值框 #FAF7EE
-    BROWN      = {0.180, 0.137, 0.090, 1},   -- 墨棕 #2E2317
-    BROWN_MID  = {0.352, 0.278, 0.196, 1},   -- 次强调
-    BROWN_SOFT = {0.431, 0.373, 0.294, 1},   -- 说明文字 #6E5F4B
-    LINE       = {0.788, 0.753, 0.663, 1},   -- 边框线 #C9C0A9
-    OLIVE      = {0.486, 0.604, 0.247, 1},   -- 橄榄绿 #7C9A3F
-    OLIVE_DK   = {0.361, 0.463, 0.157, 1},
-    CREAM_TXT  = {0.961, 0.937, 0.867, 1},   -- 深底上的米白字
+    -- 纸张与底色
+    BG_CANVAS   = {0.957, 0.937, 0.890, 1}, -- 主工程纸底 #F4EFE3
+    BG_CARD     = {0.933, 0.910, 0.855, 1}, -- 参数卡片底 #EEE8DA
+    CARD_WHITE  = {0.984, 0.973, 0.949, 1}, -- 瓷白高光框 #FAF8F2
+    BG_MUTED    = {0.890, 0.863, 0.796, 1}, -- 浅灰辅底 #E3DCB
+    
+    -- 墨色与文字
+    ESPRESSO    = {0.173, 0.114, 0.094, 1}, -- 深焙黑巧 #2C1D18 (主墨色)
+    ESPRESSO_LT = {0.267, 0.188, 0.157, 1}, -- 次强调黑巧 #443028
+    TEXT_MUTED  = {0.482, 0.420, 0.345, 1}, -- 说明/辅助文字 #7B6B58
+    TEXT_LIGHT  = {0.980, 0.965, 0.933, 1}, -- 深底上的米白字 #FAF6EE
+    
+    -- 实验室高光与点睛
+    OLIVE       = {0.431, 0.522, 0.216, 1}, -- 实验室橄榄绿 #6E8537
+    OLIVE_DK    = {0.314, 0.384, 0.145, 1}, -- 深橄榄 #506225
+    OLIVE_LT    = {0.553, 0.651, 0.251, 1}, -- 浅亮橄榄 #8DA640
+    AMBER       = {0.918, 0.659, 0.275, 1}, -- 光色琥珀金 #EAA846
+    AMBER_LT    = {0.965, 0.784, 0.420, 1}, -- 亮琥珀 #F6C86B
+    
+    -- 标尺与结构线
+    LINE_DARK   = {0.784, 0.733, 0.635, 1}, -- 边框结构线 #C8BBA2
+    LINE_LIGHT  = {0.867, 0.835, 0.757, 1}, -- 浅坐标线 #DDD5C1
+    GRID_DOT    = {0.741, 0.686, 0.584, 0.7}, -- 网格定位点
 }
-local R, G, B = 1, 2, 3 -- 可读性别名
+local R, G, B = 1, 2, 3
 
--- ==== 布局台账 =============================================================
-local PANEL_W, PANEL_H = 470, 670
-local PANEL_X = 12 + PANEL_W / 2       -- ANCHOR_LEFT 原点在屏幕左缘
-local ROW_W = PANEL_W - 32             -- 行宽 438
-local ROW_H = 34
-local ROW_STEP = 40
-local VAL_X = 134                      -- 数值框中心 x（面板局部）
-local RST_X = 196                      -- 重置按钮中心 x
+-- ==== 2. 布局台账与几何规范 ===================================================
+local PANEL_W, PANEL_H = 484, 686
+local PANEL_X = 14 + PANEL_W / 2
+local ROW_W = PANEL_W - 32            -- 452
+local ROW_H = 36
+local ROW_STEP = 42
 
--- 纵向：335 顶 → [312 头] [262 预设] [244 虚线] [216 页签] [192 虚线]
---       行区 160..-137 → [-262 虚线] [-292 按钮] [-322 提示]
-local Y_HEADER, Y_PRESET, Y_TABS = 312, 262, 216
-local Y_DIV1, Y_DIV2, Y_DIV3 = 244, 192, -262
-local Y_ROW0, Y_BTNS, Y_HINT = 160, -292, -322
+local METER_W = 68                    -- 光学滑轨宽度
+local METER_X = 94                    -- 滑轨中心 X（66..122；避免与数值框左缘 125 重叠）
+local VAL_X   = 154                   -- 数值框中心 X
+local RST_X   = 206                   -- 复位按钮中心 X
+
+-- 纵向台账
+local Y_HEADER   = 314
+local Y_PRESET   = 266
+local Y_DIV1     = 246
+local Y_TABS     = 220
+local Y_DIV2     = 196
+local Y_ROW0     = 164
+local Y_DIV3     = -256
+local Y_BTNS     = -286
+local Y_HINT     = -324
 
 local STR = {
-    TITLE = "# BCAS STUDIO",
-    SUBTITLE = "// 画质工作室",
-    APPLY = "# 应用并保存",
-    CANCEL = "# 放弃",
-    PRESETS = {
-        {key = "standard", label = "作者特调"},
-        {key = "light",    label = "轻量"},
-        {key = "cinema",   label = "电影"},
-        {key = "off",      label = "关闭"},
+    BRAND_TAG = "● NANMIANYI LAB // OPTICAL PIPELINE",
+    TITLE     = "# BCAS STUDIO",
+    SUBTITLE  = "// 楠楠画质实验室",
+    APPLY     = "# 保存并写入配置",
+    CANCEL    = "// 放弃更改",
+    PRESETS   = {
+        {key = "standard", label = "# 特调方案"},
+        {key = "light",    label = "# 轻量画质"},
+        {key = "cinema",   label = "# 电影胶片"},
+        {key = "off",      label = "# 原版关闭"},
     },
-    HINT = "拖数值微调 · 点数值键入 · R 重置 · PgDn 保存 · ESC 放弃 · P 开关",
-    TABS = {"锐化", "进阶", "色彩", "调色", "氛围"},
+    HINT = "拖动微调 · 单击键入 · R 复位 · ESC 退出 · P 快捷开关",
+    TABS = {"01 锐化", "02 进阶", "03 色彩", "04 调色", "05 氛围", "06 辉光", "07 光影"},
     LABELS = {
-        Strength = "锐化强度 STRENGTH", NoiseReduce = "降噪 DENOISE",
-        AntiRinging = "抗振铃 AURA", DarkProtect = "暗部保护 DARK",
-        ExposureEV = "曝光 EXPOSURE EV", Saturation = "饱和度 SAT",
+        Strength = "锐化强度 STRENGTH", DeconvStrength = "逆卷积墨线收敛 DECONV",
+        NoiseReduce = "图像降噪 DENOISE",
+        AntiRinging = "抗振铃 AURA", DarkProtect = "暗部保护 DARK-PROT",
+        ExposureEV = "曝光增益 EXPOSURE", Saturation = "色彩饱和 SATURATION",
         Vibrance = "自然饱和 VIBRANCE", Contrast = "对比度 CONTRAST",
-        Lightness = "亮度 LIGHTNESS", Gamma = "GAMMA",
-        Filmic = "胶片曲线 ACES",
-        Vignette = "暗角 VIGNETTE", Grain = "颗粒 GRAIN",
-        RangeSigma = "双边范围σ RANGE", SpatialSigma = "空间σ SPATIAL",
+        Lightness = "明度 LIGHTNESS", Gamma = "伽马校正 GAMMA",
+        Filmic = "胶片曲线 ACES-FILM",
+        Vignette = "暗角强度 VIGNETTE", Grain = "胶片颗粒 GRAIN",
+        RangeSigma = "双边范围σ RANGE", SpatialSigma = "空间范围σ SPATIAL",
         CenterWeight = "中心权重 CENTER", NoiseFloor = "噪声基底 FLOOR",
         AR_Threshold = "AURA 边缘阈值", AR_L_Overshoot = "AURA 亮部过冲",
         AR_D_Overshoot = "AURA 暗部过冲", ChromaProtect = "色度保护 CHROMA",
-        HL_Desat = "高光去饱和 HL-DESAT", OriginalMix = "原始混合 ORIGINAL",
-        SlopeR = "一级斜率 R SLOPE", SlopeG = "一级斜率 G SLOPE", SlopeB = "一级斜率 B SLOPE",
-        OffsetR = "一级偏移 R OFFSET", OffsetG = "一级偏移 G OFFSET", OffsetB = "一级偏移 B OFFSET",
-        PowerR = "一级幂 R POWER", PowerG = "一级幂 G POWER", PowerB = "一级幂 B POWER",
+        HL_Desat = "高光去饱和 HL-DESAT", OriginalMix = "原画混合 ORIGINAL",
+        SlopeR = "一级斜率 R-SLOPE", SlopeG = "一级斜率 G-SLOPE", SlopeB = "一级斜率 B-SLOPE",
+        OffsetR = "一级偏移 R-OFFSET", OffsetG = "一级偏移 G-OFFSET", OffsetB = "一级偏移 B-OFFSET",
+        PowerR = "一级幂指数 R-POWER", PowerG = "一级幂指数 G-POWER", PowerB = "一级幂指数 B-POWER",
         ColourCubeOn = "原版昼夜滤镜 VANILLA",
+        BloomOn = "辉光总开关 BLOOM-ON",
+        SanityColourOn = "低精神保色 SANITY-COL", DistortFree = "失真消除 NO-DISTORT",
+        SnowCap = "积雪上限 SNOW-CAP", SandFilter = "风沙遮罩过滤 SAND",
+        GlowIntensity = "辉光强度 INTENSITY", GlowThreshold = "辉光阈值 THRESHOLD",
+        GlowWarmth = "辉光暖度 WARMTH", GlowSat = "辉光饱和 GLOW-SAT",
+        GlowKnee = "辉光软膝 KNEE", GlowSpread = "辉光扩散 SPREAD",
+        GlowCompress = "高光压缩 COMPRESS",
+        VanillaGrade = "官方调色强度 GRADE",
+        SunFill = "太阳全局光 SUN-FILL", GodRays = "透云光束 SUN-SHAFTS", ShadowsOn = "地面投影 SHADOWS", OceanOn = "海水波光 OCEAN", GlowTail = "光晕长尾 GLOW-TAIL", LightWrap = "光包裹 LIGHT-WRAP", GlowRim = "轮廓光 GLOW-RIM",
     },
-    SHARP_NOTE = "双边自适应锐化：只锐世界画面，HUD 不受影响；抗振铃(AURA)调到 0 可完全关闭过冲抑制；改乱了点行尾 R 复位。",
-    WB_LAUNCH = "白平衡 · 调色轮（点击进入）",
-    WB_TIP = "在色轮上取色会映射为 RGB 增益，等效于 ReShade 的 CDL 斜率",
-    ATMO_NOTE = "暗角：压暗四角聚焦视线；颗粒：动态胶片颗粒(8Hz 闪动)；原版昼夜滤镜：开关游戏自带 ColourCube 调色。",
-    WB_TITLE = "# 色彩轮 / 白平衡",
-    WB_SUB = "// CDL SLOPE",
-    WB_CLOSE = "关闭",
-    WB_AXIS = "右 = 饱和 · 上 = 明度 · 环 = 色相",
+    SHARP_NOTE = "双边自适应锐化：仅作用于游戏世界，HUD 界面不受影响；抗振铃(AURA)可消除白边。",
+    WB_LAUNCH  = "# 白平衡 · 光学色彩轮 (点击展开调色仪)",
+    WB_TIP     = "取色直接映射为 RGB 增益，等效于专业影视级 CDL 斜率校准。",
+    ATMO_NOTE  = "环境氛围：暗角压暗四边、胶片颗粒增添质感；官方调色可控制原版季节滤镜强度。",
+    GLOW_NOTE  = "金字塔柔光：沿游戏自带光源柔化发散，软膝控制起点，长尾权重使光晕温暖宽广。",
+    GLOW2_NOTE = "地面投影随日晷。波光改的是海洋地块，绿洲般通透粼粼。\n⚠ 水面配色烘在世界生成：改动 OCEAN 需重进世界生效。",
+    WB_TITLE   = "# 光学色轮 / 白平衡",
+    WB_SUB     = "// CDL SPECTRUM ANALYZER",
+    WB_CLOSE   = "完成校准",
+    WB_AXIS    = "环 = 色相 (H) · 横 = 饱和 (S) · 纵 = 明度 (V)",
     WB_PRESETS = {
-        {label = "标准", v = {1.0, 1.0, 1.0}},
-        {label = "暖",   v = {1.08, 1.0, 0.90}},
-        {label = "冷",   v = {0.90, 1.0, 1.10}},
-        {label = "品红", v = {1.06, 0.94, 1.06}},
-        {label = "草绿", v = {0.94, 1.08, 0.92}},
+        {label = "# 标准", v = {1.00, 1.00, 1.00}},
+        {label = "# 暖调", v = {1.08, 1.00, 0.90}},
+        {label = "# 冷调", v = {0.90, 1.00, 1.10}},
+        {label = "# 品红", v = {1.06, 0.94, 1.06}},
+        {label = "# 草绿", v = {0.94, 1.08, 0.92}},
     },
-    WB_RESET = "1:1",
-    EDIT_TITLE = "输入数值后回车（ESC 取消）",
+    WB_RESET   = "1:1 复位",
 }
 
 local TAB_ROWS = {
-    [1] = {"Strength", "NoiseReduce", "AntiRinging", "DarkProtect"},
+    [1] = {"Strength", "DeconvStrength", "NoiseReduce", "AntiRinging", "DarkProtect"},
     [2] = {"RangeSigma", "SpatialSigma", "CenterWeight", "NoiseFloor",
            "AR_Threshold", "AR_L_Overshoot", "AR_D_Overshoot", "ChromaProtect"},
     [3] = {"ExposureEV", "Saturation", "Vibrance", "Contrast", "Lightness",
            "Gamma", "Filmic", "HL_Desat", "OriginalMix"},
     [4] = {"SlopeR", "SlopeG", "SlopeB", "OffsetR", "OffsetG", "OffsetB",
            "PowerR", "PowerG", "PowerB"},
-    [5] = {"Vignette", "Grain", "ColourCubeOn"},
+    [5] = {"Vignette", "Grain", "ColourCubeOn", "SanityColourOn",
+           "DistortFree", "SnowCap", "SandFilter", "VanillaGrade"},
+    [6] = {"BloomOn", "GlowIntensity", "GlowThreshold", "GlowKnee",
+           "GlowSpread", "GlowWarmth", "GlowSat", "GlowCompress"},
+    [7] = {"ShadowsOn", "OceanOn", "SunFill", "GodRays", "GlowRim", "GlowTail", "LightWrap"},
 }
 
--- 开关型参数行：值区显示 ON/OFF 胶片，点击切换（不走拖拽/键入）
-local BOOL_KEYS = { ColourCubeOn = true }
+local BOOL_KEYS = { ColourCubeOn = true, BloomOn = true,
+    SanityColourOn = true, DistortFree = true, SandFilter = true,
+    ShadowsOn = true, OceanOn = true }
 
--- ==== 颜色数学 =============================================================
+-- ==== 3. 颜色数学 ===========================================================
 
 local function hsv2rgb(h, s, v)
     h = (h % 1) * 6
@@ -158,19 +188,16 @@ local function FmtHex(r, g, b)
         math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
 end
 
--- Temp/Tint -> RGB 增益（State.GainToTempTint 的精确逆）
 local function GainsFromParams()
     local T, Ti = State.params.Temp, State.params.Tint
     return 2 ^ (0.2 * T), 2 ^ (0.12 * Ti), 2 ^ (-0.2 * T)
 end
 
--- 增益 -> 显示色（归一化到最大分量 1，便于当颜色看）
 local function GainsToDisplay(r, g, b)
     local mx = math.max(r, g, b, 1e-6)
     return r / mx, g / mx, b / mx
 end
 
--- 色轮取色 -> RGB 增益（按亮度归一，保持通道比值），写回 Temp/Tint
 local function SetGainsFromColor(r, g, b)
     local Y = 0.299 * r + 0.587 * g + 0.114 * b
     if Y < 1e-3 then r, g, b = 1, 1, 1; Y = 1 end
@@ -181,6 +208,8 @@ local function SetGainsFromColor(r, g, b)
     State.SetParam("Temp", T)
     State.SetParam("Tint", Ti)
 end
+
+-- ==== 4. 面板主体 ===========================================================
 
 local BCASScreen = Class(Screen, function(self)
     Screen._ctor(self, "BCAS_Studio")
@@ -196,58 +225,120 @@ local BCASScreen = Class(Screen, function(self)
     self.root:SetHAnchor(ANCHOR_LEFT)
     self.root:SetVAnchor(ANCHOR_MIDDLE)
 
-    -- 面板装饰层：root 原点在屏幕左缘（ANCHOR_LEFT），不是面板中心！
-    -- 标题/预设/页签/底栏等一切用"面板中心坐标"的静态件必须挂在这里，
-    -- 否则整体左移一个 PANEL_X 跑出屏幕（v3 首测翻车的教训）。
     self.chrome = self.root:AddChild(Widget("chrome"))
     self.chrome:SetPosition(PANEL_X, 0)
 
-    -- 面板底盘 + 墨棕描边（博客卡片风）
-    self:Rect(0, 0, PANEL_W + 4, PANEL_H + 4, C.BROWN)
-    self:Rect(0, 0, PANEL_W, PANEL_H, C.CREAM)
+    -- 1. 多层阴影 (Drop Shadows)
+    self:SolidRect(self.chrome, 10, -10, PANEL_W + 4, PANEL_H + 4, {0.10, 0.07, 0.05, 0.08})
+    self:SolidRect(self.chrome, 6, -6, PANEL_W + 2, PANEL_H + 2, {0.10, 0.07, 0.05, 0.14})
+
+    -- 2. 面板底盘与双层线框
+    self:SolidRect(self.chrome, 0, 0, PANEL_W + 4, PANEL_H + 4, C.ESPRESSO)
+    self:SolidRect(self.chrome, 0, 0, PANEL_W, PANEL_H, C.BG_CANVAS)
+    
+    -- 3. 背景工程点阵与十字准星
+    self:BuildEngineeringGrid(self.chrome, PANEL_W - 8, PANEL_H - 8)
+
+    -- 4. 实验室标尺与四角取景器 (Reticles)
+    self:BuildReticleMarks(self.chrome, PANEL_W - 20, PANEL_H - 20, C.ESPRESSO)
 
     self:BuildHeader()
     self:BuildPresetRow()
-    self:Dashed(0, Y_DIV1, PANEL_W - 48)
+    self:Dashed(0, Y_DIV1, PANEL_W - 44)
     self:BuildTabRow()
-    self:Dashed(0, Y_DIV2, PANEL_W - 48)
+    self:Dashed(0, Y_DIV2, PANEL_W - 44)
 
     self.content = self.root:AddChild(Widget("content"))
     self.content:SetPosition(PANEL_X, 0)
     self:BuildContent()
 
-    self:Dashed(0, Y_DIV3, PANEL_W - 48)
+    self:Dashed(0, Y_DIV3, PANEL_W - 44)
     self:BuildFooter()
     self:BuildWBPopup()
 
     self.default_focus = self.enable_btn
 end)
 
--- ==== 基础件 ===============================================================
+-- ==== 5. 光学/几何原子渲染器 (GRAPHICAL ATOMS) ===============================
 
-function BCASScreen:Rect(x, y, w, h, col)
-    local img = self.chrome:AddChild(Image("images/global.xml", "square.tex"))
+function BCASScreen:SolidRect(parent, x, y, w, h, col)
+    local img = parent:AddChild(Image("images/global.xml", "square.tex"))
     img:ScaleToSize(w, h)
     img:SetPosition(x, y)
     img:SetTint(col[1], col[2], col[3], col[4] or 1)
     return img
 end
 
--- 虚线分隔（博客风格细节）
-function BCASScreen:Dashed(cx, y, w)
-    local n = math.floor(w / 14)
-    local x0 = cx - (n - 1) * 14 / 2
-    for i = 0, n - 1 do
-        local d = self.chrome:AddChild(Image("images/global.xml", "square.tex"))
-        d:ScaleToSize(7, 2)
-        d:SetPosition(x0 + i * 14, y)
-        d:SetTint(C.LINE[1], C.LINE[2], C.LINE[3], 1)
+-- 背景工程微型点阵
+function BCASScreen:BuildEngineeringGrid(parent, w, h)
+    local cols, rows = 7, 10
+    local step_x = w / (cols + 1)
+    local step_y = h / (rows + 1)
+    for c = 1, cols do
+        for r = 1, rows do
+            local x = -w/2 + c * step_x
+            local y = -h/2 + r * step_y
+            local dot = parent:AddChild(Image("images/global.xml", "square.tex"))
+            dot:ScaleToSize(2, 2)
+            dot:SetPosition(x, y)
+            dot:SetTint(C.GRID_DOT[1], C.GRID_DOT[2], C.GRID_DOT[3], C.GRID_DOT[4])
+        end
     end
 end
 
--- 1px 感细边框（四条细矩形，返回可整体移动的 widget）
+-- 实验室光学四角取景 L 型标尺与刻度
+function BCASScreen:BuildReticleMarks(parent, w, h, col)
+    local len, thick = 14, 2
+    local hw, hh = w / 2, h / 2
+    local marks = {
+        -- Top-Left
+        {-hw, hh - thick/2, len, thick}, {-hw + thick/2, hh - len/2, thick, len},
+        -- Top-Right
+        {hw - len + thick, hh - thick/2, len, thick}, {hw - thick/2, hh - len/2, thick, len},
+        -- Bottom-Left
+        {-hw, -hh + thick/2, len, thick}, {-hw + thick/2, -hh + len/2, thick, len},
+        -- Bottom-Right
+        {hw - len + thick, -hh + thick/2, len, thick}, {hw - thick/2, -hh + len/2, thick, len},
+    }
+    for _, m in ipairs(marks) do
+        local r = parent:AddChild(Image("images/global.xml", "square.tex"))
+        r:ScaleToSize(m[3], m[4])
+        r:SetPosition(m[1] + (m[3] > m[4] and m[3]/2 - thick/2 or 0), m[2])
+        r:SetTint(col[1], col[2], col[3], 0.8)
+    end
+
+    -- 十字准星 (+)
+    local function Cross(cx, cy)
+        local h_ = parent:AddChild(Image("images/global.xml", "square.tex"))
+        h_:ScaleToSize(10, 1.5)
+        h_:SetPosition(cx, cy)
+        h_:SetTint(C.OLIVE[1], C.OLIVE[2], C.OLIVE[3], 0.7)
+        local v_ = parent:AddChild(Image("images/global.xml", "square.tex"))
+        v_:ScaleToSize(1.5, 10)
+        v_:SetPosition(cx, cy)
+        v_:SetTint(C.OLIVE[1], C.OLIVE[2], C.OLIVE[3], 0.7)
+    end
+    Cross(-hw + 30, hh - 30)
+    Cross(hw - 30, -hh + 30)
+end
+
+-- 虚线分隔线
+function BCASScreen:Dashed(cx, y, w)
+    local seg_w, gap = 8, 6
+    local step = seg_w + gap
+    local n = math.floor(w / step)
+    local x0 = cx - (n - 1) * step / 2
+    for i = 0, n - 1 do
+        local d = self.chrome:AddChild(Image("images/global.xml", "square.tex"))
+        d:ScaleToSize(seg_w, 1.5)
+        d:SetPosition(x0 + i * step, y)
+        d:SetTint(C.LINE_DARK[1], C.LINE_DARK[2], C.LINE_DARK[3], 0.85)
+    end
+end
+
+-- 细线结构边框
 function BCASScreen:FrameRect(parent, x, y, w, h, col, t)
-    t = t or 2
+    t = t or 1.5
     local fr = parent:AddChild(Widget("frame"))
     fr:SetPosition(x, y)
     local edges = {
@@ -260,15 +351,12 @@ function BCASScreen:FrameRect(parent, x, y, w, h, col, t)
         local img = fr:AddChild(Image("images/global.xml", "square.tex"))
         img:ScaleToSize(e[3], e[4])
         img:SetPosition(e[1], e[2])
-        img:SetTint(col[1], col[2], col[3], 1)
+        img:SetTint(col[1], col[2], col[3], col[4] or 1)
     end
     return fr
 end
 
--- x 语义：LEFT = 文本左缘，RIGHT = 文本右缘，MIDDLE = 文本中心。
--- 关坑：DST 的 Text 区域以"区域中心"对齐到控件坐标，若把区域中心直接
--- 设在期望的文本边缘，文本会整体偏移半个区域宽（v3 首测：行标签整体
--- 飞出屏幕左侧、"R=重置"提示悬空到面板外、标题消失，全是这一根因）。
+-- 安全文本排版
 function BCASScreen:Label(parent, x, y, w, size, str, col, halign, h)
     local ha = halign or ANCHOR_LEFT
     local t = parent:AddChild(Text(F_CLEAN, size, str))
@@ -279,62 +367,58 @@ function BCASScreen:Label(parent, x, y, w, size, str, col, halign, h)
         cx = x - w / 2
     end
     t:SetPosition(cx, y)
-    -- 区域高度给足 2 倍字号：高清位图字体实际行高偏大，贴边区域会把单行文本裁没
-    t:SetRegionSize(w, h or size * 2)
+    t:SetRegionSize(w, h or size * 2.2)
     t:SetHAlign(ha)
-    -- 引擎实测怪癖：HAlign LEFT 的文本不显式设 VAlign 就整段不渲染
-    -- （LEFT+TOP 验证可用；MIDDLE/RIGHT 配 MIDDLE 验证可用）
     if h ~= nil or ha == ANCHOR_LEFT then
         t:SetVAlign(ANCHOR_TOP)
     else
         t:SetVAlign(ANCHOR_MIDDLE)
     end
-    t:SetColour(col[1], col[2], col[3], 1)
+    t:SetColour(col[1], col[2], col[3], col[4] or 1)
     return t
 end
 
--- 博客风胶囊按钮：active=墨棕底米白字，idle=浅底棕字，focus=橄榄深
+-- 芯片胶囊按钮
 function BCASScreen:Chip(parent, x, y, w, h, label, active, onclick, fontsize)
     local btn = parent:AddChild(ImageButton("images/global.xml", "square.tex"))
     btn:SetPosition(x, y)
     btn:ForceImageSize(w, h)
     btn.scale_on_focus = false
     btn.move_on_click = false
-    btn:SetImageNormalColour(
-        active and C.BROWN[R] or C.CREAM_ALT[R],
-        active and C.BROWN[G] or C.CREAM_ALT[G],
-        active and C.BROWN[B] or C.CREAM_ALT[B], 1)
-    btn:SetImageFocusColour(C.OLIVE_DK[R], C.OLIVE_DK[G], C.OLIVE_DK[B], 1)
-    local t = btn:AddChild(Text(F_CLEAN, fontsize or 15, label))
+    
+    local normal_col = active and C.ESPRESSO or C.BG_CARD
+    btn:SetImageNormalColour(normal_col[R], normal_col[G], normal_col[B], 1)
+    btn:SetImageFocusColour(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
+    
+    local t = btn:AddChild(Text(F_CLEAN, fontsize or 13, label))
     t:SetHAlign(ANCHOR_MIDDLE)
     t:SetVAlign(ANCHOR_MIDDLE)
     t:SetRegionSize(w, h)
     t:SetPosition(0, 0)
-    t:SetColour(active and C.CREAM_TXT[R] or C.BROWN[R],
-                active and C.CREAM_TXT[G] or C.BROWN[G],
-                active and C.CREAM_TXT[B] or C.BROWN[B], 1)
+    local txt_col = active and C.TEXT_LIGHT or C.ESPRESSO
+    t:SetColour(txt_col[R], txt_col[G], txt_col[B], 1)
     btn.text = t
     if onclick ~= nil then btn:SetOnClick(onclick) end
     return btn
 end
 
 function BCASScreen:RefreshChip(btn, active)
-    btn:SetImageNormalColour(
-        active and C.BROWN[R] or C.CREAM_ALT[R],
-        active and C.BROWN[G] or C.CREAM_ALT[G],
-        active and C.BROWN[B] or C.CREAM_ALT[B], 1)
-    btn.text:SetColour(active and C.CREAM_TXT[R] or C.BROWN[R],
-                       active and C.CREAM_TXT[G] or C.BROWN[G],
-                       active and C.CREAM_TXT[B] or C.BROWN[B], 1)
+    local normal_col = active and C.ESPRESSO or C.BG_CARD
+    btn:SetImageNormalColour(normal_col[R], normal_col[G], normal_col[B], 1)
+    local txt_col = active and C.TEXT_LIGHT or C.ESPRESSO
+    btn.text:SetColour(txt_col[R], txt_col[G], txt_col[B], 1)
 end
 
--- ==== 标题栏 / 预设 / 页签 ==================================================
+-- ==== 6. 顶栏 / 预设 / 频道页签 =============================================
 
 function BCASScreen:BuildHeader()
-    local title = self:Label(self.chrome, -PANEL_W / 2 + 14, Y_HEADER, 220, 19, STR.TITLE, C.CREAM_TXT, ANCHOR_LEFT)
-    local sub = self:Label(self.chrome, PANEL_W / 2 - 88, Y_HEADER, 120, 14, STR.SUBTITLE, C.OLIVE, ANCHOR_RIGHT)
+    -- 顶栏微标
+    self:Label(self.chrome, -PANEL_W / 2 + 16, Y_HEADER + 14, 260, 11, STR.BRAND_TAG, C.OLIVE, ANCHOR_LEFT)
+    self:Label(self.chrome, -PANEL_W / 2 + 16, Y_HEADER - 4, 180, 19, STR.TITLE, C.ESPRESSO, ANCHOR_LEFT)
+    self:Label(self.chrome, -PANEL_W / 2 + 160, Y_HEADER - 5, 120, 13, STR.SUBTITLE, C.TEXT_MUTED, ANCHOR_LEFT)
 
-    self.enable_btn = self:Chip(self.chrome, PANEL_W / 2 - 50, Y_HEADER, 64, 28, "", true, nil, 14)
+    -- 电源总开关 (Power Instrument Switch)
+    self.enable_btn = self:Chip(self.chrome, PANEL_W / 2 - 52, Y_HEADER + 2, 76, 28, "", true, nil, 13)
     self.enable_text = self.enable_btn.text
     self.enable_btn:SetOnClick(function()
         State.SetEnabled(not State.enabled)
@@ -346,30 +430,39 @@ end
 
 function BCASScreen:RefreshEnable()
     local on = State.enabled
-    -- ON = 橄榄绿点亮；OFF = 线框灰底
     self.enable_btn:SetImageNormalColour(
-        on and C.OLIVE[R] or C.CREAM_ALT[R],
-        on and C.OLIVE[G] or C.CREAM_ALT[G],
-        on and C.OLIVE[B] or C.CREAM_ALT[B], 1)
-    self.enable_text:SetString(on and "ON" or "OFF")
+        on and C.OLIVE[R] or C.BG_MUTED[R],
+        on and C.OLIVE[G] or C.BG_MUTED[G],
+        on and C.OLIVE[B] or C.BG_MUTED[B], 1)
+    self.enable_text:SetColour(
+        on and C.TEXT_LIGHT[R] or C.TEXT_MUTED[R],
+        on and C.TEXT_LIGHT[G] or C.TEXT_MUTED[G],
+        on and C.TEXT_LIGHT[B] or C.TEXT_MUTED[B], 1)
+    self.enable_text:SetString(on and "● RUN" or "○ OFF")
 end
 
 function BCASScreen:BuildPresetRow()
-    self:Label(self.chrome, -PANEL_W / 2 + 14, Y_PRESET, 52, 13, "预设", C.OLIVE, ANCHOR_LEFT)
+    self:Label(self.chrome, -PANEL_W / 2 + 16, Y_PRESET, 52, 12, "校准", C.TEXT_MUTED, ANCHOR_LEFT)
     for i, preset in ipairs(STR.PRESETS) do
-        self:Chip(self.chrome, -PANEL_W / 2 + 70 + 43 + (i - 1) * 94, Y_PRESET, 86, 28, preset.label, false, function()
+        local btn_w = 88
+        local btn_x = -PANEL_W / 2 + 70 + btn_w / 2 + (i - 1) * (btn_w + 6)
+        self:Chip(self.chrome, btn_x, Y_PRESET, btn_w, 26, preset.label, false, function()
             State.ApplyPreset(preset.key)
             self:MakeDirty()
             self:RefreshRows()
             self:RefreshWBChip()
-        end, 13)
+        end, 12)
     end
 end
 
 function BCASScreen:BuildTabRow()
     self.tab_btns = {}
+    local n = #STR.TABS
+    local chip_w = math.floor((PANEL_W - 32 - (n - 1) * 3) / n)
+    local step = chip_w + 3
     for i, label in ipairs(STR.TABS) do
-        local btn = self:Chip(self.chrome, -PANEL_W / 2 + 14 + 40 + (i - 1) * 90, Y_TABS, 80, 30, label, i == self.tab, nil, 14)
+        local btn_x = -PANEL_W / 2 + 16 + chip_w / 2 + (i - 1) * step
+        local btn = self:Chip(self.chrome, btn_x, Y_TABS, chip_w, 28, label, i == self.tab, nil, 12)
         btn:SetOnClick(function()
             if self.tab ~= i then
                 self.tab = i
@@ -387,9 +480,7 @@ function BCASScreen:RefreshTabs()
     end
 end
 
--- ==== 数值行 ===============================================================
--- 行结构（面板局部坐标，x 相对 content 中心 0）：
---   [bg 438x34] [label 左对齐 x=-207 区域 236] [数值框 86x26 @134] [R 26x26 @196]
+-- ==== 7. 参数仪表卡片 (PRECISION ROW CARD) ==================================
 
 function BCASScreen:BuildRow(key, y)
     local meta = State.VEC[key]
@@ -398,63 +489,80 @@ function BCASScreen:BuildRow(key, y)
     row:SetPosition(0, y)
     table.insert(self.content_children, row)
 
+    -- 1. 卡片底盘 + 细边框 (Porcelain Sub-Card)
     local bg = row:AddChild(Image("images/global.xml", "square.tex"))
     bg:ScaleToSize(ROW_W, ROW_H)
-    bg:SetTint(C.CREAM_ALT[R], C.CREAM_ALT[G], C.CREAM_ALT[B], 1)
+    bg:SetTint(C.BG_CARD[R], C.BG_CARD[G], C.BG_CARD[B], 1)
 
-    self:Label(row, -ROW_W / 2 + 12, 0, 236, 15, STR.LABELS[key] or key, C.BROWN, ANCHOR_LEFT)
+    -- 2. 左侧光学通道指示条 (Channel Indicator Accent)
+    local dot = row:AddChild(Image("images/global.xml", "square.tex"))
+    dot:ScaleToSize(3.5, 16)
+    dot:SetPosition(-ROW_W / 2 + 6, 0)
+    dot:SetTint(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 0.9)
 
-    -- 数值框：细边框 + 纸色按钮
-    self:FrameRect(row, VAL_X, 0, 90, 30, C.LINE, 2)
+    -- 3. 参数中英文名称
+    self:Label(row, -ROW_W / 2 + 16, 0, 190, 14, STR.LABELS[key] or key, C.ESPRESSO, ANCHOR_LEFT)
+
+    -- 4. 光学微型滑轨 (Optical Track Meter)
+    local track, fill, needle
+    if not isbool and meta then
+        local norm = math.clamp((State.params[key] - meta.min) / (meta.max - meta.min), 0, 1)
+        
+        -- 底轨
+        track = row:AddChild(Image("images/global.xml", "square.tex"))
+        track:ScaleToSize(METER_W, 4)
+        track:SetPosition(METER_X, 0)
+        track:SetTint(C.LINE_LIGHT[R], C.LINE_LIGHT[G], C.LINE_LIGHT[B], 1)
+
+        -- 填充条
+        fill = row:AddChild(Image("images/global.xml", "square.tex"))
+        fill:ScaleToSize(math.max(2, METER_W * norm), 4)
+        fill:SetPosition(METER_X - METER_W/2 + (METER_W * norm)/2, 0)
+        fill:SetTint(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 0.85)
+
+        -- 琥珀光标指针 (Needle)
+        needle = row:AddChild(Image("images/global.xml", "square.tex"))
+        needle:ScaleToSize(2.5, 12)
+        needle:SetPosition(METER_X - METER_W/2 + METER_W * norm, 0)
+        needle:SetTint(C.AMBER[R], C.AMBER[G], C.AMBER[B], 1)
+    end
+
+    -- 5. 瓷白数值视窗 (Display Box)
+    self:FrameRect(row, VAL_X, 0, 58, 26, C.LINE_DARK, 1.5)
     local value_btn = row:AddChild(ImageButton("images/global.xml", "square.tex"))
     value_btn:SetPosition(VAL_X, 0)
-    value_btn:ForceImageSize(86, 26)
+    value_btn:ForceImageSize(56, 24)
     value_btn.scale_on_focus = false
     value_btn.move_on_click = false
-    value_btn:SetImageNormalColour(C.PAPER[R], C.PAPER[G], C.PAPER[B], 1)
-    value_btn:SetImageFocusColour(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
+    value_btn:SetImageNormalColour(C.CARD_WHITE[R], C.CARD_WHITE[G], C.CARD_WHITE[B], 1)
+    value_btn:SetImageFocusColour(C.AMBER[R], C.AMBER[G], C.AMBER[B], 0.25)
 
-    local value_text = value_btn:AddChild(Text(F_CLEAN, 15, ""))
-    value_text:SetRegionSize(86, 26)
+    local value_text = value_btn:AddChild(Text(F_CLEAN, 13, ""))
+    value_text:SetRegionSize(56, 24)
     value_text:SetPosition(0, 0)
     value_text:SetHAlign(ANCHOR_MIDDLE)
     value_text:SetVAlign(ANCHOR_MIDDLE)
-    value_text:SetColour(C.BROWN[R], C.BROWN[G], C.BROWN[B], 1)
+    value_text:SetColour(C.ESPRESSO[R], C.ESPRESSO[G], C.ESPRESSO[B], 1)
     value_text:SetString(isbool
-        and ((State.params[key] or 0) > 0.5 and "ON" or "OFF")
+        and ((State.params[key] or 0) > 0.5 and "● ON" or "○ OFF")
         or string.format("%.2f", State.params[key]))
 
-    -- 行内进度线（博客感的小仪表）；开关行没有进度概念
-    local track, fill
-    if not isbool then
-        local norm = (State.params[key] - meta.min) / (meta.max - meta.min)
-        track = row:AddChild(Image("images/global.xml", "square.tex"))
-        track:ScaleToSize(86, 3)
-        track:SetPosition(VAL_X, -ROW_H / 2 + 4)
-        track:SetTint(C.LINE[R], C.LINE[G], C.LINE[B], 1)
-        fill = row:AddChild(Image("images/global.xml", "square.tex"))
-        fill:ScaleToSize(math.max(2, 86 * math.clamp(norm, 0, 1)), 3)
-        fill:SetPosition(VAL_X - 43 + math.max(1, 43 * math.clamp(norm, 0, 1)), -ROW_H / 2 + 4)
-        fill:SetTint(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
-    end
-
-    -- R 重置
-    local reset_btn = self:Chip(row, RST_X, 0, 26, 26, "R", true, nil, 12)
+    -- 6. 复位微型芯片 (R Button)
+    local reset_btn = self:Chip(row, RST_X, 0, 26, 26, "R", false, nil, 12)
     reset_btn:SetOnClick(function()
         State.ResetParam(key)
         self:RefreshRow(key)
         self:MakeDirty()
     end)
 
+    -- 7. 交互绑定
     if isbool then
-        -- 开关行：点击切换 0/1，不拖拽不键入
         value_btn:SetOnClick(function()
             State.SetParam(key, (State.params[key] or 0) > 0.5 and 0 or 1)
             self:RefreshRow(key)
             self:MakeDirty()
         end)
     else
-        -- 拖动 + 单击输入
         local drag = {active = false, moved = false, start_x = 0, start_value = 0}
         value_btn:SetOnDown(function()
             TheFrontEnd:LockFocus(true)
@@ -466,8 +574,7 @@ function BCASScreen:BuildRow(key, y)
         value_btn:SetWhileDown(function()
             if not drag.active then return end
             if math.abs(TheFrontEnd.lastx - drag.start_x) > 2 then drag.moved = true end
-            local span = 220
-            local delta = (TheFrontEnd.lastx - drag.start_x) * (meta.max - meta.min) / span
+            local delta = (TheFrontEnd.lastx - drag.start_x) * (meta.max - meta.min) / 200
             local step = (meta.max - meta.min) > 4 and 0.1 or 0.01
             local v = math.clamp(drag.start_value + delta, meta.min, meta.max)
             v = v - v % step
@@ -484,14 +591,13 @@ function BCASScreen:BuildRow(key, y)
                 self:OpenEdit(key, value_btn, value_text)
             end
         end)
-        -- 隐藏的输入框（点击数值时浮现）
-        self:MakeEdit(row, key, VAL_X, 0, 86, 26, value_text,
+        self:MakeEdit(row, key, VAL_X, 0, 56, 24, value_text,
             function(v) State.SetParam(key, v) end,
             function() return State.params[key] end,
             function() self:RefreshRow(key); self:MakeDirty() end)
     end
 
-    self.rows[key] = {text = value_text, fill = fill, meta = meta, isbool = isbool}
+    self.rows[key] = {text = value_text, fill = fill, needle = needle, meta = meta, isbool = isbool}
 end
 
 function BCASScreen:RefreshRow(key)
@@ -499,15 +605,16 @@ function BCASScreen:RefreshRow(key)
     if entry == nil then return end
     local v = State.params[key]
     if entry.isbool then
-        entry.text:SetString((v or 0) > 0.5 and "ON" or "OFF")
+        entry.text:SetString((v or 0) > 0.5 and "● ON" or "○ OFF")
         return
     end
     entry.text:SetString(string.format("%.2f", v))
     local meta = entry.meta
-    local norm = math.clamp((v - meta.min) / (meta.max - meta.min), 0, 1)
-    if entry.fill ~= nil then
-        entry.fill:ScaleToSize(math.max(2, 86 * norm), 3)
-        entry.fill:SetPosition(VAL_X - 43 + math.max(1, 43 * norm), -ROW_H / 2 + 4)
+    if meta and entry.fill ~= nil and entry.needle ~= nil then
+        local norm = math.clamp((v - meta.min) / (meta.max - meta.min), 0, 1)
+        entry.fill:ScaleToSize(math.max(2, METER_W * norm), 4)
+        entry.fill:SetPosition(METER_X - METER_W/2 + (METER_W * norm)/2, 0)
+        entry.needle:SetPosition(METER_X - METER_W/2 + METER_W * norm, 0)
     end
     if key == "Temp" or key == "Tint" then
         self:RefreshWBChip()
@@ -521,43 +628,36 @@ function BCASScreen:RefreshRows()
     self:RefreshWBChip()
 end
 
--- ==== 数值输入框（TextEdit） ===============================================
--- 点击数值 -> 输入框浮现原位，回车提交（自动 clamp 到滑条范围），ESC/失焦取消。
+-- ==== 8. 数值输入交互 (TextEdit) ============================================
 
 function BCASScreen:MakeEdit(parent, tag, x, y, w, h, value_text, setter, getter, after)
-    local edit = parent:AddChild(TextEdit(F_CLEAN, 15, "", {0.18, 0.137, 0.09, 1}))
+    local edit = parent:AddChild(TextEdit(F_CLEAN, 13, "", C.ESPRESSO))
     edit:SetPosition(x, y)
-    edit:SetRegionSize(w - 8, h)
+    edit:SetRegionSize(w - 6, h)
     edit:SetHAlign(ANCHOR_MIDDLE)
-    edit:SetEditCursorColour(0.30, 0.42, 0.13, 1)
+    edit:SetEditCursorColour(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
     edit:SetCharacterFilter("0123456789.-")
     edit:SetPassControlToScreen(CONTROL_CANCEL, true)
     edit:Hide()
     self.edits[tag] = {edit = edit, value_text = value_text, setter = setter, getter = getter, after = after}
 
-    edit.OnTextEntered = function()
-        self:CommitEdit(tag)
-    end
-    -- 失焦（点了面板其他地方）= 回退收起，绝不留幽灵输入框
+    edit.OnTextEntered = function() self:CommitEdit(tag) end
     local base_losefocus = edit.OnLoseFocus
-    edit.OnLoseFocus = function(w)
-        base_losefocus(w)
-        if self.active_edit == tag then
-            self:CloseEdit(tag, false)
-        end
+    edit.OnLoseFocus = function(wgt)
+        base_losefocus(wgt)
+        if self.active_edit == tag then self:CloseEdit(tag, false) end
     end
 end
 
 function BCASScreen:OpenEdit(tag, btn, value_text)
     local entry = self.edits[tag]
     if entry == nil then return end
-    -- 再点一次同一个数值框 = 收起
     if self.active_edit == tag then
         self:CloseEdit(tag, false)
         return
     end
     if self.active_edit ~= nil then
-        self:CloseEdit(self.active_edit, false) -- 失焦回退
+        self:CloseEdit(self.active_edit, false)
     end
     self.active_edit = tag
     entry.value_text = value_text
@@ -565,7 +665,7 @@ function BCASScreen:OpenEdit(tag, btn, value_text)
     entry.edit:SetString(string.format("%.2f", entry.getter()))
     entry.edit:Show()
     entry.edit:MoveToFront()
-    entry.edit:SetEditing(true) -- 内部自带 SetFocus
+    entry.edit:SetEditing(true)
     self.edit_skip = 2
 end
 
@@ -584,9 +684,7 @@ end
 function BCASScreen:CloseEdit(tag, keep)
     local entry = self.edits[tag]
     if entry == nil then return end
-    if entry.edit.editing then
-        entry.edit:SetEditing(false)
-    end
+    if entry.edit.editing then entry.edit:SetEditing(false) end
     entry.edit:Hide()
     if entry.value_text ~= nil then
         entry.value_text:Show()
@@ -596,7 +694,6 @@ function BCASScreen:CloseEdit(tag, keep)
 end
 
 function BCASScreen:OnUpdate(dt)
-    -- 输入框失去焦点（点了别处）-> 自动回退显示原值
     if self.edit_skip and self.edit_skip > 0 then
         self.edit_skip = self.edit_skip - 1
         return
@@ -609,21 +706,17 @@ function BCASScreen:OnUpdate(dt)
     end
 end
 
--- ==== 内容区 ===============================================================
+-- ==== 9. 内容区加载 =========================================================
 
 function BCASScreen:BuildContent()
-    for _, wgt in ipairs(self.content_children) do
-        wgt:Kill()
-    end
+    for _, wgt in ipairs(self.content_children) do wgt:Kill() end
     self.content_children = {}
     self.rows = {}
-    self.wb_chip_swatch = nil -- 随内容销毁，防死控件引用
+    self.wb_chip_swatch = nil
     self.wb_chip_hex = nil
-    -- 行输入框随行销毁，清掉注册（gain 输入框在弹窗里，保留）
+
     for tag in pairs(self.edits) do
-        if string.sub(tag, 1, 4) ~= "gain" then
-            self.edits[tag] = nil
-        end
+        if string.sub(tag, 1, 4) ~= "gain" then self.edits[tag] = nil end
     end
     self.active_edit = nil
 
@@ -632,95 +725,107 @@ function BCASScreen:BuildContent()
         self:BuildRow(key, Y_ROW0 - (i - 1) * ROW_STEP)
     end
 
-    -- 说明文字：永远放在该页最后一行之下
-    local note_y = Y_ROW0 - #rows * ROW_STEP - 20
+    -- 实验室说明卡片 (SPECIFICATION NOTE)
+    local note_y = Y_ROW0 - #rows * ROW_STEP - 18
+    local note_card = self.content:AddChild(Widget("note_card"))
+    note_card:SetPosition(0, note_y)
+    table.insert(self.content_children, note_card)
 
     if self.tab == 1 then
-        local note = self:Label(self.content, -(ROW_W - 20) / 2, note_y, ROW_W - 20, 13, STR.SHARP_NOTE, C.BROWN_SOFT, ANCHOR_LEFT, 60)
-        table.insert(self.content_children, note)
+        self:BuildNote(note_card, STR.SHARP_NOTE, 52)
     elseif self.tab == 2 then
-        local note = self:Label(self.content, -(ROW_W - 20) / 2, note_y, ROW_W - 20, 13,
-            "进阶参数与旧 fx 同名项一一对应；改乱可按行尾 R 复位，或切预设回正。", C.BROWN_SOFT, ANCHOR_LEFT, 40)
-        table.insert(self.content_children, note)
+        self:BuildNote(note_card, "进阶参数：算法与底层 Shader 一一对应；调节过度可按 R 复位或选用预设恢复。", 40)
     elseif self.tab == 3 then
         self:BuildWBLaunch(note_y)
     elseif self.tab == 5 then
-        local info = self:Label(self.content, -(ROW_W - 20) / 2, note_y, ROW_W - 20, 13, STR.ATMO_NOTE, C.BROWN_SOFT, ANCHOR_LEFT, 110)
-        table.insert(self.content_children, info)
+        self:BuildNote(note_card, STR.ATMO_NOTE, 54)
+    elseif self.tab == 6 then
+        self:BuildNote(note_card, STR.GLOW_NOTE, 48)
+    elseif self.tab == 7 then
+        self:BuildNote(note_card, STR.GLOW2_NOTE, 54)
     end
 end
 
--- 色彩页底部：调色轮入口（带当前色色块）
+function BCASScreen:BuildNote(parent, text, height)
+    local bg = parent:AddChild(Image("images/global.xml", "square.tex"))
+    bg:ScaleToSize(ROW_W, height)
+    bg:SetTint(C.CARD_WHITE[R], C.CARD_WHITE[G], C.CARD_WHITE[B], 0.88)
+
+    local bar = parent:AddChild(Image("images/global.xml", "square.tex"))
+    bar:ScaleToSize(3.5, height)
+    bar:SetPosition(-ROW_W / 2 + 1.75, 0)
+    bar:SetTint(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
+
+    self:Label(parent, -ROW_W / 2 + 14, 0, ROW_W - 24, 12, text, C.TEXT_MUTED, ANCHOR_LEFT, height - 6)
+end
+
+-- 色彩页调色轮入口
 function BCASScreen:BuildWBLaunch(y)
     local row = self.content:AddChild(Widget("wb_launch"))
     row:SetPosition(0, y)
     table.insert(self.content_children, row)
 
     local bg = row:AddChild(Image("images/global.xml", "square.tex"))
-    bg:ScaleToSize(ROW_W, 40)
-    bg:SetTint(C.CREAM[R], C.CREAM[G], C.CREAM[B], 1)
-    -- 橄榄绿描边 + 左侧竖条：告诉用户这整块是个入口
-    self:FrameRect(row, 0, 0, ROW_W, 40, C.OLIVE, 2)
+    bg:ScaleToSize(ROW_W, 42)
+    bg:SetTint(C.CARD_WHITE[R], C.CARD_WHITE[G], C.CARD_WHITE[B], 1)
+    self:FrameRect(row, 0, 0, ROW_W, 42, C.OLIVE, 1.8)
+
     local accent = row:AddChild(Image("images/global.xml", "square.tex"))
-    accent:ScaleToSize(6, 36)
-    accent:SetPosition(-ROW_W / 2 + 7, 0)
+    accent:ScaleToSize(5, 42)
+    accent:SetPosition(-ROW_W / 2 + 2.5, 0)
     accent:SetTint(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
 
     local btn = row:AddChild(ImageButton("images/global.xml", "square.tex"))
     btn:SetPosition(0, 0)
-    btn:ForceImageSize(ROW_W, 40)
+    btn:ForceImageSize(ROW_W, 42)
     btn.scale_on_focus = false
     btn.move_on_click = false
-    btn:SetImageNormalColour(1, 1, 1, 0) -- 全透明，只负责点击
-    btn:SetImageFocusColour(1, 1, 1, 0)
+    btn:SetImageNormalColour(1, 1, 1, 0)
+    btn:SetImageFocusColour(C.AMBER[R], C.AMBER[G], C.AMBER[B], 0.15)
     btn:SetOnClick(function() self:OpenWBPopup() end)
 
     local swatch = row:AddChild(Image("images/global.xml", "square.tex"))
-    swatch:ScaleToSize(26, 26)
-    swatch:SetPosition(-ROW_W / 2 + 27, 0)
+    swatch:ScaleToSize(28, 28)
+    swatch:SetPosition(-ROW_W / 2 + 28, 0)
     self.wb_chip_swatch = swatch
 
-    self:Label(row, -ROW_W / 2 + 47, 0, 250, 15, STR.WB_LAUNCH, C.BROWN, ANCHOR_LEFT)
+    self:Label(row, -ROW_W / 2 + 50, 0, 240, 14, STR.WB_LAUNCH, C.ESPRESSO, ANCHOR_LEFT)
 
     local r, g, b = GainsFromParams()
     local cr, cg, cb = GainsToDisplay(r, g, b)
     swatch:SetTint(cr, cg, cb, 1)
-    self.wb_chip_hex = self:Label(row, ROW_W / 2 - 12, 0, 84, 13, FmtHex(cr, cg, cb), C.BROWN_SOFT, ANCHOR_RIGHT)
+    self.wb_chip_hex = self:Label(row, ROW_W / 2 - 14, 0, 84, 13, FmtHex(cr, cg, cb), C.TEXT_MUTED, ANCHOR_RIGHT)
 end
 
 function BCASScreen:RefreshWBChip()
-    if self.wb_chip_swatch ~= nil then
-        local r, g, b = GainsFromParams()
-        local cr, cg, cb = GainsToDisplay(r, g, b)
-        self.wb_chip_swatch:SetTint(cr, cg, cb, 1)
-    end
-    if self.wb_chip_hex ~= nil then
-        local r, g, b = GainsFromParams()
-        local cr, cg, cb = GainsToDisplay(r, g, b)
-        self.wb_chip_hex:SetString(FmtHex(cr, cg, cb))
-    end
+    local r, g, b = GainsFromParams()
+    local cr, cg, cb = GainsToDisplay(r, g, b)
+    if self.wb_chip_swatch ~= nil then self.wb_chip_swatch:SetTint(cr, cg, cb, 1) end
+    if self.wb_chip_hex ~= nil then self.wb_chip_hex:SetString(FmtHex(cr, cg, cb)) end
 end
 
--- ==== 底部 =================================================================
+-- ==== 10. 底部保存 / 放弃区 =================================================
 
 function BCASScreen:BuildFooter()
-    local apply = self:Chip(self.chrome, -70, Y_BTNS, 168, 36, STR.APPLY, true, function() self:Apply() end)
-    apply:SetImageNormalColour(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
-    apply:SetImageFocusColour(C.OLIVE_DK[R], C.OLIVE_DK[G], C.OLIVE_DK[B], 1)
-    apply.text:SetColour(C.CREAM_TXT[R], C.CREAM_TXT[G], C.CREAM_TXT[B], 1)
-    self:Chip(self.chrome, 92, Y_BTNS, 104, 36, STR.CANCEL, false, function() self:Cancel() end)
-    self:Label(self.chrome, 0, Y_HINT, PANEL_W - 24, 12, STR.HINT, C.BROWN_SOFT, ANCHOR_MIDDLE)
+    -- 1. 保存按钮 (深焙黑巧主色)
+    local apply = self:Chip(self.chrome, -82, Y_BTNS, 184, 36, STR.APPLY, true, function() self:Apply() end, 14)
+    apply:SetImageNormalColour(C.ESPRESSO[R], C.ESPRESSO[G], C.ESPRESSO[B], 1)
+    apply:SetImageFocusColour(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
+    apply.text:SetColour(C.TEXT_LIGHT[R], C.TEXT_LIGHT[G], C.TEXT_LIGHT[B], 1)
+
+    -- 2. 放弃按钮
+    local cancel = self:Chip(self.chrome, 92, Y_BTNS, 120, 36, STR.CANCEL, false, function() self:Cancel() end, 14)
+
+    -- 3. 提示与状态
+    self:Label(self.chrome, 0, Y_HINT, PANEL_W - 32, 11, STR.HINT, C.TEXT_MUTED, ANCHOR_MIDDLE)
 end
 
--- ==== 白平衡调色轮弹窗 ======================================================
--- 弹窗局部坐标（中心原点，470x520）：
---   [260 头 46] 色相环中心(-130,55) 半径78 | SV 方格 14x9 @格20 中心(85,115)
---   RGB 增益行 y=-60/-104/-148 | 预设 y=-196 | 提示 y=-232
+-- ==== 11. 光学光谱分析仪 (WHITE BALANCE SPECTRUM ANALYZER) ==================
 
 local HUE_N = 48
 local SV_COLS, SV_ROWS, SV_CELL = 20, 14, 14
-local RING_CX, RING_CY, RING_R = -130, 55, 72
-local GRID_CX, GRID_CY = 95, 113
+local RING_CX, RING_CY, RING_R = -130, 60, 72
+local GRID_CX, GRID_CY = 95, 118
 local GAIN_MIN, GAIN_MAX = 0.55, 1.85
 
 function BCASScreen:BuildWBPopup()
@@ -728,13 +833,29 @@ function BCASScreen:BuildWBPopup()
     self.wb_popup:SetPosition(PANEL_X, -10)
     self.wb_popup:Hide()
 
-    local W, H = PANEL_W, 520
+    local W, H = PANEL_W, 530
 
-    self:PopupRect(W, H)
+    -- 弹窗底盘与标尺
+    self:SolidRect(self.wb_popup, 0, 0, W + 6, H + 6, C.ESPRESSO)
+    self:SolidRect(self.wb_popup, 0, 0, W, H, C.BG_CANVAS)
+    self:BuildReticleMarks(self.wb_popup, W - 16, H - 16, C.ESPRESSO)
 
-    -- 色相环：48 块色砖按钮（7.5 度一档，体素风细粒度）。
-    -- 判定走引擎的按钮命中测试，任何窗口/全屏/DPI 模式都零漂移
-    -- （绝对坐标换算方案在小窗口下受窗口偏移影响，已弃用）。
+    -- 顶栏
+    local header = self.wb_popup:AddChild(Image("images/global.xml", "square.tex"))
+    header:ScaleToSize(W, 46)
+    header:SetPosition(0, H / 2 - 23)
+    header:SetTint(C.ESPRESSO[R], C.ESPRESSO[G], C.ESPRESSO[B], 1)
+
+    self:Label(self.wb_popup, -W / 2 + 16, H / 2 - 23, 220, 16, STR.WB_TITLE, C.TEXT_LIGHT, ANCHOR_LEFT)
+    self:Label(self.wb_popup, 136, H / 2 - 23, 140, 12, STR.WB_SUB, C.AMBER, ANCHOR_RIGHT)
+
+    local close = self:Chip(self.wb_popup, W / 2 - 46, H / 2 - 23, 64, 28, STR.WB_CLOSE, true, function()
+        self.wb_popup:Hide()
+    end, 13)
+    close:SetImageNormalColour(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
+    close.text:SetColour(C.TEXT_LIGHT[R], C.TEXT_LIGHT[G], C.TEXT_LIGHT[B], 1)
+
+    -- 色相环
     self.hue_tiles = {}
     for i = 0, HUE_N - 1 do
         local hue = i / HUE_N
@@ -755,16 +876,16 @@ function BCASScreen:BuildWBPopup()
         end)
         self.hue_tiles[i] = tile
     end
-    self.hue_marker = self:FrameRect(self.wb_popup, 0, 0, 22, 22, C.PAPER, 2)
+    self.hue_marker = self:FrameRect(self.wb_popup, 0, 0, 22, 22, C.CARD_WHITE, 2)
 
-    -- 环心：当前颜色预览 + HEX
-    self:FrameRect(self.wb_popup, RING_CX, RING_CY, 62, 62, C.LINE, 2)
+    -- 环心预览色块 + HEX
+    self:FrameRect(self.wb_popup, RING_CX, RING_CY, 60, 60, C.LINE_DARK, 2)
     self.wb_preview = self.wb_popup:AddChild(Image("images/global.xml", "square.tex"))
-    self.wb_preview:ScaleToSize(56, 56)
+    self.wb_preview:ScaleToSize(54, 54)
     self.wb_preview:SetPosition(RING_CX, RING_CY)
-    self.wb_hex = self:Label(self.wb_popup, RING_CX, RING_CY - 44, 90, 12, "#FFFFFF", C.BROWN_SOFT, ANCHOR_MIDDLE)
+    self.wb_hex = self:Label(self.wb_popup, RING_CX, RING_CY - 44, 90, 12, "#FFFFFF", C.TEXT_MUTED, ANCHOR_MIDDLE)
 
-    -- SV 方格：20x14 按钮（饱和 5% 一档 / 明度 7% 一档，视觉近似无级）
+    -- SV 饱和/明度矩阵方阵
     self.sv_cells = {}
     for r_i = 0, SV_ROWS - 1 do
         for c_i = 0, SV_COLS - 1 do
@@ -786,25 +907,24 @@ function BCASScreen:BuildWBPopup()
             self.sv_cells[r_i * SV_COLS + c_i] = cell
         end
     end
-    self.sv_marker = self:FrameRect(self.wb_popup, 0, 0, 20, 20, C.PAPER, 2)
-    self:Label(self.wb_popup, GRID_CX, GRID_CY - (SV_ROWS * SV_CELL) / 2 - 16, 240, 12, STR.WB_AXIS, C.BROWN_SOFT, ANCHOR_MIDDLE)
+    self.sv_marker = self:FrameRect(self.wb_popup, 0, 0, 20, 20, C.CARD_WHITE, 2)
+    self:Label(self.wb_popup, GRID_CX, GRID_CY - (SV_ROWS * SV_CELL) / 2 - 16, 240, 11, STR.WB_AXIS, C.TEXT_MUTED, ANCHOR_MIDDLE)
 
-    -- RGB 增益行
-    self:Label(self.wb_popup, -W / 2 + 14, -34, 300, 13, "RGB 增益（映射到色温/色调）", C.OLIVE, ANCHOR_LEFT)
+    -- RGB 增益校准通道
+    self:Label(self.wb_popup, -W / 2 + 16, -30, 280, 12, "# RGB 增益校准通道 (映射至色温与色调)", C.OLIVE, ANCHOR_LEFT)
     self.gain_rows = {}
     local names = {"R", "G", "B"}
     for i = 1, 3 do
-        local y = -60 - (i - 1) * 44
+        local y = -58 - (i - 1) * 44
         local row = self.wb_popup:AddChild(Widget("gain_" .. names[i]))
         row:SetPosition(0, y)
 
-        local chip = self:Chip(row, -W / 2 + 32, 0, 28, 26, names[i], true, nil, 14)
-        local chr_, cgg_, cbb_ = hsv2rgb(i == 1 and 0 or (i == 2 and 0.33 or 0.66), 0.55, 1)
-        chip:SetImageNormalColour(chr_, cgg_, cbb_, 1)
+        local chip = self:Chip(row, -W / 2 + 32, 0, 28, 26, names[i], true, nil, 13)
+        local chr, cgg, cbb = hsv2rgb(i == 1 and 0 or (i == 2 and 0.33 or 0.66), 0.55, 1)
+        chip:SetImageNormalColour(chr, cgg, cbb, 1)
         chip.text:SetColour(0.12, 0.09, 0.06, 1)
 
-        -- 增益标尺：11 格从 GAIN_MIN 到 GAIN_MAX
-        local cells = {}
+        -- 标尺格
         for ci = 0, 10 do
             local gv = GAIN_MIN + (GAIN_MAX - GAIN_MIN) * ci / 10
             local disp = math.min(1, 0.55 + 0.45 * (gv - GAIN_MIN) / (GAIN_MAX - GAIN_MIN))
@@ -821,30 +941,30 @@ function BCASScreen:BuildWBPopup()
                 self.wb_gain[i] = gv
                 self:SyncFromGains()
             end)
-            cells[ci] = cell
         end
         local marker = row:AddChild(Image("images/global.xml", "square.tex"))
-        marker:ScaleToSize(4, 32)
+        marker:ScaleToSize(4, 30)
         marker:SetPosition(-160, 0)
-        marker:SetTint(C.BROWN[R], C.BROWN[G], C.BROWN[B], 1)
+        marker:SetTint(C.ESPRESSO[R], C.ESPRESSO[G], C.ESPRESSO[B], 1)
 
+        -- 瓷白数值框
         local value_btn = row:AddChild(ImageButton("images/global.xml", "square.tex"))
         value_btn:SetPosition(VAL_X, 0)
-        value_btn:ForceImageSize(86, 26)
+        value_btn:ForceImageSize(58, 26)
         value_btn.scale_on_focus = false
         value_btn.move_on_click = false
-        value_btn:SetImageNormalColour(C.PAPER[R], C.PAPER[G], C.PAPER[B], 1)
-        value_btn:SetImageFocusColour(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
-        local value_text = value_btn:AddChild(Text(F_CLEAN, 15, "1.00"))
-        value_text:SetRegionSize(86, 26)
+        value_btn:SetImageNormalColour(C.CARD_WHITE[R], C.CARD_WHITE[G], C.CARD_WHITE[B], 1)
+        value_btn:SetImageFocusColour(C.AMBER[R], C.AMBER[G], C.AMBER[B], 0.3)
+
+        local value_text = value_btn:AddChild(Text(F_CLEAN, 13, "1.00"))
+        value_text:SetRegionSize(58, 26)
         value_text:SetPosition(0, 0)
         value_text:SetHAlign(ANCHOR_MIDDLE)
         value_text:SetVAlign(ANCHOR_MIDDLE)
-        value_text:SetColour(C.BROWN[R], C.BROWN[G], C.BROWN[B], 1)
+        value_text:SetColour(C.ESPRESSO[R], C.ESPRESSO[G], C.ESPRESSO[B], 1)
 
         self:MakeGainEdit(row, i, value_text)
 
-        -- 拖动微调 + 单击键入（与主面板数值行同一套交互）
         local gdrag = {active = false, moved = false, start_x = 0, start_v = 1}
         value_btn:SetOnDown(function()
             TheFrontEnd:LockFocus(true)
@@ -856,7 +976,7 @@ function BCASScreen:BuildWBPopup()
         value_btn:SetWhileDown(function()
             if not gdrag.active then return end
             if math.abs(TheFrontEnd.lastx - gdrag.start_x) > 2 then gdrag.moved = true end
-            local v = math.clamp(gdrag.start_v + (TheFrontEnd.lastx - gdrag.start_x) / 220, GAIN_MIN, GAIN_MAX)
+            local v = math.clamp(gdrag.start_v + (TheFrontEnd.lastx - gdrag.start_x) / 200, GAIN_MIN, GAIN_MAX)
             v = v - v % 0.01
             if v ~= self.wb_gain[i] then
                 self.wb_gain[i] = v
@@ -866,12 +986,10 @@ function BCASScreen:BuildWBPopup()
         value_btn:SetOnClick(function()
             gdrag.active = false
             TheFrontEnd:LockFocus(false)
-            if not gdrag.moved then
-                self:OpenEdit("gain" .. i, value_btn, value_text)
-            end
+            if not gdrag.moved then self:OpenEdit("gain" .. i, value_btn, value_text) end
         end)
 
-        local reset_btn = self:Chip(row, RST_X, 0, 26, 26, "R", true, nil, 12)
+        local reset_btn = self:Chip(row, RST_X, 0, 26, 26, "R", false, nil, 12)
         reset_btn:SetOnClick(function()
             self.wb_gain[i] = 1.0
             self:SyncFromGains()
@@ -882,51 +1000,25 @@ function BCASScreen:BuildWBPopup()
 
     -- 快捷预设
     for i, p in ipairs(STR.WB_PRESETS) do
-        self:Chip(self.wb_popup, -PANEL_W / 2 + 33 + (i - 1) * 72, -196, 66, 26, p.label, false, function()
+        self:Chip(self.wb_popup, -PANEL_W / 2 + 36 + (i - 1) * 72, -196, 66, 26, p.label, false, function()
             self.wb_gain = {p.v[1], p.v[2], p.v[3]}
             self:SyncFromGains()
-        end, 13)
+        end, 12)
     end
-    self:Chip(self.wb_popup, PANEL_W / 2 - 40, -196, 62, 26, STR.WB_RESET, false, function()
+    self:Chip(self.wb_popup, PANEL_W / 2 - 44, -196, 68, 26, STR.WB_RESET, false, function()
         self.wb_gain = {1.0, 1.0, 1.0}
         self:SyncFromGains()
-    end, 13)
+    end, 12)
 
-    -- 底部提示
-    local tip = self:Label(self.wb_popup, 0, -236, W - 40, 12, STR.WB_TIP, C.BROWN_SOFT, ANCHOR_MIDDLE)
-    tip:SetVAlign(ANCHOR_MIDDLE)
+    self:Label(self.wb_popup, 0, -238, W - 40, 11, STR.WB_TIP, C.TEXT_MUTED, ANCHOR_MIDDLE)
 end
 
-function BCASScreen:PopupRect(W, H)
-    local bg1 = self.wb_popup:AddChild(Image("images/global.xml", "square.tex"))
-    bg1:ScaleToSize(W + 4, H + 4)
-    bg1:SetTint(C.BROWN[R], C.BROWN[G], C.BROWN[B], 1)
-    local bg2 = self.wb_popup:AddChild(Image("images/global.xml", "square.tex"))
-    bg2:ScaleToSize(W, H)
-    bg2:SetTint(C.CREAM[R], C.CREAM[G], C.CREAM[B], 1)
-
-    local header = self.wb_popup:AddChild(Image("images/global.xml", "square.tex"))
-    header:ScaleToSize(W, 46)
-    header:SetPosition(0, H / 2 - 23)
-    header:SetTint(C.BROWN[R], C.BROWN[G], C.BROWN[B], 1)
-
-    self:Label(self.wb_popup, -W / 2 + 14, H / 2 - 23, 280, 17, STR.WB_TITLE, C.CREAM_TXT, ANCHOR_LEFT)
-    self:Label(self.wb_popup, 155, H / 2 - 23, 100, 13, STR.WB_SUB, C.OLIVE, ANCHOR_RIGHT)
-
-    local close = self:Chip(self.wb_popup, W / 2 - 46, H / 2 - 23, 64, 28, STR.WB_CLOSE, true, function()
-        self.wb_popup:Hide()
-    end, 14)
-    close:SetImageNormalColour(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
-    close.text:SetColour(C.CREAM_TXT[R], C.CREAM_TXT[G], C.CREAM_TXT[B], 1)
-end
-
--- 增益行输入框（0.55..1.85）
 function BCASScreen:MakeGainEdit(parent, i, value_text)
-    local edit = parent:AddChild(TextEdit(F_CLEAN, 15, "", {0.18, 0.137, 0.09, 1}))
+    local edit = parent:AddChild(TextEdit(F_CLEAN, 13, "", C.ESPRESSO))
     edit:SetPosition(VAL_X, 0)
-    edit:SetRegionSize(78, 26)
+    edit:SetRegionSize(52, 26)
     edit:SetHAlign(ANCHOR_MIDDLE)
-    edit:SetEditCursorColour(0.30, 0.42, 0.13, 1)
+    edit:SetEditCursorColour(C.OLIVE[R], C.OLIVE[G], C.OLIVE[B], 1)
     edit:SetCharacterFilter("0123456789.-")
     edit:SetPassControlToScreen(CONTROL_CANCEL, true)
     edit:Hide()
@@ -937,25 +1029,21 @@ function BCASScreen:MakeGainEdit(parent, i, value_text)
         after = function() self:SyncFromGains() end}
     edit.OnTextEntered = function() self:CommitEdit(tag) end
     local base_losefocus = edit.OnLoseFocus
-    edit.OnLoseFocus = function(w)
-        base_losefocus(w)
-        if self.active_edit == tag then
-            self:CloseEdit(tag, false)
-        end
+    edit.OnLoseFocus = function(wgt)
+        base_losefocus(wgt)
+        if self.active_edit == tag then self:CloseEdit(tag, false) end
     end
 end
 
--- 从 HSV 取色 -> 增益 -> Temp/Tint，刷新整个弹窗
 function BCASScreen:SyncWheel(sv_changed)
     local r, g, b = hsv2rgb(self.wb_h, self.wb_s, self.wb_v)
-    if self.wb_v < 0.04 then r, g, b = 1, 1, 1 end -- 近黑只改色相无意义
+    if self.wb_v < 0.04 then r, g, b = 1, 1, 1 end
     SetGainsFromColor(r, g, b)
     self.wb_gain = {GainsFromParams()}
     self:SyncWheelUI()
     self:MakeDirty()
 end
 
--- 增益被直接修改（标尺/预设/输入）-> Temp/Tint -> 刷新
 function BCASScreen:SyncFromGains()
     local gr, gg, gb = self.wb_gain[1], self.wb_gain[2], self.wb_gain[3]
     local T, Ti = State.GainToTempTint(gr, gg, gb)
@@ -968,14 +1056,11 @@ function BCASScreen:SyncFromGains()
     self:MakeDirty()
 end
 
--- 只刷 UI（不动参数）
 function BCASScreen:SyncWheelUI()
-    -- 预览 + HEX
     local cr, cg, cb = GainsToDisplay(self.wb_gain[1], self.wb_gain[2], self.wb_gain[3])
     self.wb_preview:SetTint(cr, cg, cb, 1)
     self.wb_hex:SetString(FmtHex(cr, cg, cb))
 
-    -- SV 方格重着色（跟随色相）
     for r_i = 0, SV_ROWS - 1 do
         for c_i = 0, SV_COLS - 1 do
             local cell = self.sv_cells[r_i * SV_COLS + c_i]
@@ -987,7 +1072,6 @@ function BCASScreen:SyncWheelUI()
         end
     end
 
-    -- 标记位置
     local hi = math.floor(self.wb_h * HUE_N + 0.5) % HUE_N
     local ang = hi / HUE_N * 2 * math.pi
     self.hue_marker:SetPosition(RING_CX + math.cos(ang) * RING_R, RING_CY + math.sin(ang) * RING_R)
@@ -1000,7 +1084,6 @@ function BCASScreen:SyncWheelUI()
         GRID_CY + (SV_ROWS * SV_CELL) / 2 - SV_CELL / 2 - row * SV_CELL)
     self.sv_marker:MoveToFront()
 
-    -- 增益行
     for i = 1, 3 do
         local entry = self.gain_rows[i]
         if entry ~= nil then
@@ -1014,7 +1097,6 @@ function BCASScreen:SyncWheelUI()
 end
 
 function BCASScreen:OpenWBPopup()
-    -- 从当前 Temp/Tint 反推增益与 HSV（外部改动也能正确显示）
     self.wb_gain = {GainsFromParams()}
     local cr, cg, cb = GainsToDisplay(self.wb_gain[1], self.wb_gain[2], self.wb_gain[3])
     self.wb_h, self.wb_s, self.wb_v = rgb2hsv(cr, cg, cb)
@@ -1023,7 +1105,7 @@ function BCASScreen:OpenWBPopup()
     self.wb_popup:MoveToFront()
 end
 
--- ==== 行为 =================================================================
+-- ==== 12. 生命周期与事件 ====================================================
 
 function BCASScreen:MakeDirty(dirty)
     self.dirty = dirty ~= nil and dirty or true
@@ -1039,9 +1121,7 @@ function BCASScreen:Cancel()
     if State.saved_params ~= nil then
         for key in pairs(State.VEC) do
             local v = State.saved_params[key]
-            if v ~= nil then
-                State.SetParam(key, v)
-            end
+            if v ~= nil then State.SetParam(key, v) end
         end
         State.SetEnabled(State.saved_enabled)
     end

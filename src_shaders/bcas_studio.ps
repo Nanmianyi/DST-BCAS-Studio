@@ -3,47 +3,14 @@ precision highp float;
 #endif
 
 // ============================================================================
-//  BCAS Studio - PASS 2/2: sharpening + final composite
+//  BCAS Studio - PASS 2/2: deconvolution + bilateral sharpen + composite
 //
-//  Runs AFTER pass 1 (bcas_cinema.ksh, grading). Pipeline (user-directed):
-//    5-tap sample -> bilateral sharpen -> AURA anti-overshoot
-//    -> vignette -> film grain -> TPDF dither -> out
-//  Grading already stabilized the dynamic range in pass 1, so sharpening
-//  is never re-stretched afterwards; grain is GENERATED here, after the
-//  sharpener, so edges stay clean and the grain keeps full texture.
+//  Pipeline:
+//    5-tap SIMD sample -> inverse laplacian deconvolution (de-smears bilinear
+//    atlas blur without position warp) -> bilateral detail extraction
+//    -> AURA anti-overshoot envelope -> vignette/grain -> TPDF dither -> out
 //
-//  Performance work (2026-08):
-//   * 4-neighbor SIMD vectorization: luma/chroma of b/d/f/h packed into
-//     vec4, gaussian weights and MADs via componentwise ops + dots.
-//   * Rational soft limiter s*x/(|x|+s) replaces the exp()-based tanh
-//     (same soft-knee shape, saturates at +-s, ~75% cheaper ALU).
-//   * Grain hash without sin() (precision moire on low-end GPUs).
-//
-//  8-bit hardening:
-//   * Noise floor is floored at 2 LSB (2/255): smaller diffs are 8-bit
-//     quantization junk and MUST be smoothed, never sharpened (else flat
-//     ground/sky turns into zebra-stairs).
-//   * Bilateral range kernel gets a (1 LSB)^2 soft bias so discrete
-//     weight steps become smooth curves.
-//   * TPDF dither before the final write (vignette gradients band badly).
-//
-//  NOTE FOR MAINTAINERS: this file MUST stay pure ASCII (ANGLE rejects
-//  non-ASCII with "invalid character" and the effect silently dies).
-//  The MINIFIED source must stay under ~3800 bytes (build_ksh.py guards).
-//
-//  Uniform layout (must match AddUniformVariable calls in modmain.lua):
-//    SCREEN_PARAMS  {w, h, 1/w, 1/h}  - engine auto-filled, never register in Lua
-//    BCAS_SHARPEN   x=strength y=noise-reduce z=anti-ringing(master) w=dark-protect
-//    BCAS_SHARP2    x=RangeSigma y=SpatialSigma z=CenterWeight w=NoiseFloor
-//    BCAS_AURA      x=edge-threshold y=overshoot-L z=overshoot-D w=chroma-protect
-//    BCAS_ATMO      x=vignette y=grain z=time(animated from Lua)
-//
-//  Sharpening: FAITHFUL port of the validated ReShade pipeline from
-//  BCAS_Workspace V1.5.fx. Do not "simplify" it again: bilateral base
-//  with GradAdapt, detail compression on isolated/uniform edges, soft
-//  limiter with activity+luma ceiling, dark protect threshold+ramp, and
-//  AURA envelope soft-limiting. An earlier port rewrote all of this and
-//  sharpened nothing visible.
+//  NOTE: pure ASCII only. Minified source must stay under ~3800 bytes.
 // ============================================================================
 
 uniform sampler2D SAMPLER[1];
@@ -55,8 +22,13 @@ uniform vec4 BCAS_SHARPEN;
 uniform vec4 BCAS_SHARP2;
 uniform vec4 BCAS_AURA;
 uniform vec4 BCAS_ATMO;
+uniform vec4 BCAS_DECONV;
 
 varying vec2 PS_TEXCOORD0;
+
+#define DECONV_STRENGTH BCAS_DECONV.x
+#define DECONV_GATE     BCAS_DECONV.y
+#define DECONV_PENETR   BCAS_DECONV.z
 
 #define STRENGTH      BCAS_SHARPEN.x
 #define NOISE_REDUCE  BCAS_SHARPEN.y
@@ -77,34 +49,25 @@ varying vec2 PS_TEXCOORD0;
 #define GRAIN         BCAS_ATMO.y
 #define TIME          BCAS_ATMO.z
 
-// ---- rational soft limiter: same soft-knee as tanh, saturates at +-s ----
 float slt(float x, float s)
 {
     s = max(s, 1e-6);
     return s * x / (abs(x) + s);
 }
 
-float LumaYCoCg(vec3 rgb)
-{
-    return dot(rgb, vec3(0.25, 0.5, 0.25));
-}
-
 void main()
 {
     vec2 px = SCREEN_PARAMS.zw;
-    // fallback: if SCREEN_PARAMS was not filled, degrade to 720p texel size
     if (px.x <= 0.0 || px.y <= 0.0) {
         px = vec2(1.0 / 1280.0, 1.0 / 720.0);
     }
 
-    // cross 5-tap sample (center + 4 neighbours)
-    vec3 e = texture2D(SRC_IMAGE, PS_TEXCOORD0).rgb;
+    vec3 e  = texture2D(SRC_IMAGE, PS_TEXCOORD0).rgb;
     vec3 b3 = texture2D(SRC_IMAGE, PS_TEXCOORD0 + vec2( 0.0, -px.y)).rgb;
     vec3 d3 = texture2D(SRC_IMAGE, PS_TEXCOORD0 + vec2(-px.x,  0.0)).rgb;
     vec3 f3 = texture2D(SRC_IMAGE, PS_TEXCOORD0 + vec2( px.x,  0.0)).rgb;
     vec3 h3 = texture2D(SRC_IMAGE, PS_TEXCOORD0 + vec2( 0.0,  px.y)).rgb;
 
-    // ---- SIMD: 4 neighbours packed into vec4 (x=b/up y=d/left z=f/right w=h/down)
     vec3 WY = vec3(0.25, 0.5, 0.25);
     vec3 CO = vec3(1.0, 0.0, -1.0);
     vec3 CG = vec3(-0.5, 1.0, -0.5);
@@ -118,90 +81,88 @@ void main()
 
     vec4 diffY = nbrY - Ye;
 
-    // === local statistics (MAD4, faithful) ===
+    // === 1. Local statistics ===
     float madY = dot(abs(diffY), vec4(0.25));
     float mco  = dot(abs(Co4 - Coe), vec4(0.25));
     float mcg  = dot(abs(Cg4 - Cge), vec4(0.25));
     float mc   = 0.5 * (mco + mcg);
 
-    // edge shape descriptors (faithful)
     float eu  = clamp(1.0 - (abs(nbrY.x - nbrY.w) + abs(nbrY.y - nbrY.z)) / (4.0 * madY + 1e-6), 0.0, 1.0);
     float iso = clamp((madY - 2.0 * min(madY, mc)) / max(madY, 1e-6), 0.0, 1.0);
 
-    // === bilateral base (faithful): RangeSigma widened on flats by GradAdapt
-    // 0.6 relative to MADref 0.05; spatial sigma + center weight exposed ===
+    // === 2. Bilateral base ===
     float sg = clamp(RANGE_SIGMA * (1.0 + 0.6 * (1.0 - clamp(madY / 0.05, 0.0, 1.0))), 0.01, 2.0);
     float i2 = 0.5 / max(sg * sg, 1e-6);
     float ws = SPATIAL_SIGMA > 0.001 ? exp(-0.5 / max(SPATIAL_SIGMA * SPATIAL_SIGMA, 1e-4)) : 1.0;
     float cw = max(CENTER_W, 0.0);
-    // 8-bit soft bias: one-LSB squared keeps the gaussian weights off the
-    // discrete staircase (neighbour diffs on flats jump in whole LSBs)
     vec4 soft = diffY * diffY + vec4(1.5e-5);
     vec4 w4 = exp(-soft * i2) * ws;
     float Ybase = (dot(nbrY, w4) + Ye * cw) / max(dot(w4, vec4(1.0)) + cw, 1e-6);
 
-    // === detail layer, compressed on isolated / uniform edges (faithful) ===
+    // === 3. Asymmetric ink deconvolution (ZERO white ringing halo) ===
+    // lapY > 0: current pixel is in the dark valley, neighbours are brighter -> deepen!
+    // lapY < 0: current pixel is in the bright shoulder -> DO NOT LIFT (prevents white halo)
+    float lapY = dot(diffY, vec4(0.25));
+    float edgeActivity = smoothstep(DECONV_GATE * 0.4, DECONV_GATE * 1.6, madY);
+    // Strict one-way deepening: only negative corrections (deepening ink), zero positive brightening!
+    float inkDeepen = min(0.0, -lapY) * edgeActivity * (DECONV_STRENGTH * 2.2);
+
+    // === 4. High-frequency bilateral detail ===
     float det = (Ye - Ybase) * mix(1.0, 0.6, iso) * mix(1.0, 0.8, eu);
 
-    // 8-bit noise floor: diffs under 2 LSB are quantization junk - smooth
-    // them, never sharpen them (hard floor regardless of the slider)
     float nf = max(NOISE_FLOOR, 0.0078);
     float nm = mix(1.0 - NOISE_REDUCE, 1.0, clamp(madY / nf, 0.0, 1.0));
-
-    // chroma-dominated edges sharpen less (exposed ChromaProtect)
     float cpg = 1.0 - CHROMA_PROT * clamp(mc / (madY + 1e-6), 0.0, 1.0);
 
-    // === soft limiter, ceiling adapts to activity + luma (faithful) ===
-    float s0 = 0.08 * (1.0 + 3.0 * clamp(madY / 0.05, 0.0, 1.0));
+    // Dynamic headroom ceiling
+    float s0 = 0.16 * (1.0 + 3.0 * clamp(madY / 0.05, 0.0, 1.0));
     s0 *= (0.7 + 0.6 * (4.0 * Ye * (1.0 - Ye)));
     s0 *= (0.75 + 0.25 * cpg);
 
-    float raw = det * (STRENGTH * nm * cpg);
-    float y0 = Ye + slt(max(0.0, raw), s0) + slt(min(0.0, raw), s0);
+    float raw = det * (STRENGTH * 0.85) * nm * cpg;
+    float y0 = Ye + slt(max(0.0, raw), s0 * 0.22) + slt(min(0.0, raw), s0);
 
-    // === dark protect: noise-floor threshold + linear ramp (faithful) ===
-    float th = max(1e-6, nf * DARK_PROT * (1.0 + madY / 0.05));
-    float y1 = mix(Ye, y0, clamp((y0 - th) / max(0.05, th), 0.0, 1.0));
+    // Dark protect: protects low-contrast ground/night noise
+    float th = max(1e-6, nf * DARK_PROT);
+    float y1 = mix(Ye, y0, clamp((y0 - th) / max(0.04, th), 0.0, 1.0));
 
-    // === AURA anti-overshoot (faithful; EAA/SCAA already cut upstream) ===
-    // Soft-limits the remaining correction against the distance to the
-    // local luma envelope (+overshoot_L up / +overshoot_D down). ANTI_RING
-    // acts as the master switch, exactly like the original slider.
+    // === 5. AURA anti-overshoot (strictly limits light-halo ringing, preserves dark ink) ===
     float Ysharp = y1;
     if (ANTI_RING > 0.0 && madY > AR_THRESH) {
         float mn5 = min(Ye, min(min(nbrY.x, nbrY.y), min(nbrY.z, nbrY.w)));
         float mx5 = max(Ye, max(max(nbrY.x, nbrY.y), max(nbrY.z, nbrY.w)));
         float md = max(min(mx5 - Ye, Ye - mn5), 1e-6);
         float sd = y1 - Ye;
-        Ysharp = Ye + slt(max(0.0, sd), md + AR_OVER_L) + slt(min(0.0, sd), md + AR_OVER_D);
+        Ysharp = Ye + slt(max(0.0, sd), md + AR_OVER_L * 0.45) + slt(min(0.0, sd), max(Ye - mn5, 0.05) + AR_OVER_D * 4.0);
+        Ysharp = min(Ysharp, mx5);
     }
 
-    // chroma micro-saturation following the luma gain (faithful)
+    // === 6. Asymmetric ink steepening (strictly subtractive, never lift the bright shoulder) ===
+    Ysharp += inkDeepen * nm * cpg;
+    Ysharp = min(Ysharp, Ye + 0.004);
+    Ysharp = clamp(Ysharp, 0.0, 1.0);
+
     float sc = 1.0;
     if (Ye > 1e-6) {
-        sc = mix(1.0, clamp(Ysharp / Ye, 0.85, 1.20), smoothstep(0.0, 0.1, Ye));
+        sc = mix(1.0, clamp(Ysharp / Ye, 0.82, 1.0), smoothstep(0.0, 0.1, Ye));
     }
     float tmp = Ysharp - 0.5 * sc * Cge;
     vec3 color = vec3(tmp + 0.5 * sc * Coe, sc * Cge + tmp, tmp - 0.5 * sc * Coe);
 
     // ========================================================================
-    // Atmosphere (AFTER sharpening: the sharpener never sees the grain)
+    // Atmosphere
     // ========================================================================
-
     if (VIGNETTE > 0.001) {
         vec2 vc = PS_TEXCOORD0 - 0.5;
         color *= 1.0 - VIGNETTE * smoothstep(0.35, 0.95, dot(vc, vc) * 2.4);
     }
 
     if (GRAIN > 0.001) {
-        // sin-free hash: cheap and immune to low-end sin() precision moire.
-        // TIME is animated from Lua (playerhud task, 8 Hz) for real flicker.
         vec2 gp = PS_TEXCOORD0 * SCREEN_PARAMS.xy + vec2(TIME * 61.7, TIME * 23.1);
         float n = fract(dot(gp, vec2(12.9898, 78.233)) * 43758.5453);
         color += (n - 0.5) * GRAIN * 0.13;
     }
 
-    // TPDF dither before the final write (vignette gradients band otherwise)
     float d1 = fract(dot(gl_FragCoord.xy, vec2(12.9898, 78.233)) * 43758.5453);
     float d2 = fract(dot(gl_FragCoord.yx, vec2(78.233, 12.9898)) * 24634.6345);
     color += (d1 - d2) * (1.0 / 512.0);

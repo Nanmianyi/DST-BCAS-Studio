@@ -1,0 +1,70 @@
+#if defined( GL_ES )
+precision highp float;
+#endif
+
+// ============================================================================
+//  BCAS Studio - PASS 3/4: glow composite A (pyramid core + mid, 2026-09 v2)
+//
+//  Glow source: the engine bloom channel buffer (Klei authors it per entity,
+//  so only fire / fireflies / lanterns / lightning ... emit - snow fields
+//  and noon sun never bloom). The pyramid head (kawase_pre) already applied
+//  the soft-knee prefilter; this pass merges the two tightest levels:
+//    SAMPLER[1] = CORE : Kawase stride 1 (keeps source sharpness)
+//    SAMPLER[2] = MID  : Kawase stride 2
+//  Long-tail pyramid weights (spread slider): spread=1 -> 0.15/0.25 for the
+//  soft look, spread=0 -> 0.40/0.30 for a tight hot core.
+//
+//  Blend: pure additive here. The wide/halo levels and the mild highlight
+//  compression (Reinhard shoulder) are applied by pass B (bcas_glow2), so
+//  the total stays bright but never harsh.
+//
+//  Warmth: the core keeps its authored hue; the mid level slides 1/3 of the
+//  way toward the sunset palette (warmth -1..1, luma roughly neutral).
+//
+//  NOTE FOR MAINTAINERS: this file MUST stay pure ASCII (ANGLE rejects
+//  non-ASCII with "invalid character" and the effect silently dies).
+//
+//  Uniform layout (must match AddUniformVariable calls in bcas_state.lua):
+//    BCAS_GLOW   x=intensity y=threshold z=knee w=warmth
+//    BCAS_GLOW2  x=spread y=glow saturation z=highlight compression
+//                w=halo breathing scalar (Lua)
+// ============================================================================
+
+uniform sampler2D SAMPLER[3];
+
+#define SRC_IMAGE   SAMPLER[0]
+#define GLOW_CORE   SAMPLER[1]
+#define GLOW_MID    SAMPLER[2]
+
+uniform vec4 BCAS_GLOW;
+uniform vec4 BCAS_GLOW2;
+
+varying vec2 PS_TEXCOORD0;
+
+float bcas_luma(vec3 c)
+{
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main()
+{
+    vec3 src  = texture2D(SRC_IMAGE, PS_TEXCOORD0.xy).rgb;
+    vec3 core = texture2D(GLOW_CORE, PS_TEXCOORD0.xy).rgb;
+    vec3 mid  = texture2D(GLOW_MID,  PS_TEXCOORD0.xy).rgb;
+
+    // pyramid weights: spread=1 long soft tail, spread=0 tight hot core
+    vec2 w = mix(vec2(0.40, 0.30), vec2(0.15, 0.25), BCAS_GLOW2.x);
+
+    // warmth: core keeps authored hue, mid leans toward the palette
+    vec3 pal = mix(vec3(0.90, 0.96, 1.0), vec3(1.0, 0.92, 0.82),
+                   BCAS_GLOW.w * 0.5 + 0.5);
+    mid *= mix(vec3(1.0), pal, 0.33);
+
+    // saturation shaping on the combined levels
+    vec3 bloom = core * w.x + mid * w.y;
+    float bl = bcas_luma(bloom);
+    bloom = mix(vec3(bl), bloom, BCAS_GLOW2.y);
+
+    // additive; wide/halo + highlight compression happen in pass B
+    gl_FragColor = vec4(src + bloom * BCAS_GLOW.x, 1.0);
+}

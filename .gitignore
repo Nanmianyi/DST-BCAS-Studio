@@ -29,3 +29,21 @@ BCAS-Studio/fonts/*.zip.orig
 # SteamCMD 上传工具与压缩包（非仓库内容）
 /steamcmd.zip
 /steamcmd_dist/
+
+# 会话工作区与本地素材（非仓库内容）
+/.zcode/
+/Snipaste_*.png
+/font.fnt
+/test_sarasa_sample.png
+/素材.zip
+/素材/
+/研究结果/
+
+# 图标源图与回验图（构建产物）
+BCAS-Studio/KB.jpg
+BCAS-Studio/preview.jpg
+BCAS-Studio/modicon_src.png
+BCAS-Studio/modicon_verify.png
+/docs/VIDEO_SCRIPT.md
+/星露谷光影.png
+/石头.png

@@ -23,12 +23,12 @@ char_pattern = re.compile(r'<char\s+id="(\d+)"\s+x="(\d+)"\s+y="(\d+)"\s+width="
 chars = char_pattern.findall(fnt_text)
 print(f"解析到字符总数: {len(chars)}", flush=True)
 
-print("[2/5] 加载更纱黑体母带 Sarasa UI SC SemiBold (Index 295)...", flush=True)
+print("[2/5] 加载思源黑体系字模母带 (Sarasa UI SC SemiBold) (Index 295)...", flush=True)
 font_size = 72
 font = ImageFont.truetype(TTC_PATH, font_size, index=SARASA_INDEX)
 
 W, H = 4096, 8192
-print(f"[3/5] 栅格化更纱黑体到 {W}x{H} 视网膜字模图集...", flush=True)
+print(f"[3/5] 栅格化思源黑体系字模到 {W}x{H} 视网膜字模图集...", flush=True)
 atlas = Image.new("L", (W, H), 0)
 draw = ImageDraw.Draw(atlas)
 
@@ -55,7 +55,7 @@ for ch_id_str, x_str, y_str, w_str, h_str, xoff_str, yoff_str, adv_str in chars:
 
 print(f"栅格化完成! 成功渲染: {rendered} 字, 耗时: {time.time() - t0:.2f}s", flush=True)
 
-print("[4/5] 生成更纱精密深焙描边图集...", flush=True)
+print("[4/5] 生成精密深焙描边图集...", flush=True)
 t_out = time.time()
 outline_atlas = atlas.filter(ImageFilter.MaxFilter(3))
 print(f"描边生成完成! 耗时: {time.time() - t_out:.2f}s", flush=True)
@@ -152,4 +152,4 @@ with zipfile.ZipFile(OUT_OUTLINE_ZIP, 'w', compression=zipfile.ZIP_DEFLATED) as 
     z.writestr('font.fnt', sarasa_fnt.encode('utf-8'))
     z.writestr('font.tex', outline_ktex)
 
-print("BCAS Studio 更纱黑体现代超精母带级字库构建大获全胜！", flush=True)
+print("BCAS Studio 思源黑体高清字库构建完成！", flush=True)

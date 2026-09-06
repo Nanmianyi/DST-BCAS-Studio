@@ -12,7 +12,7 @@ BCAS-Studio/                 ← Mod 本体（整体复制到 DST mods 目录即
 │   ├── bcas_sun_emitter.lua ← 动态太阳：日晷模型 / 剪影投影 / 透云光束
 │   └── bcas_ocean.lua       ← 海洋地皮调色（世界生成时烘焙）
 ├── shaders/                 ← 构建产物（bcas_cinema/studio/glow×5 .ksh，勿手改）
-├── fonts/                   ← 更纱黑体（Chinese++ 打包，见 ATTRIBUTION.txt）
+├── fonts/                   ← 思源黑体 85px 视网膜重铸版（见 ATTRIBUTION.txt）
 └── anim/                    ← 投影剪影动画（wilson_shad / wilsonbeefalo_shad）
 src_shaders/                 ← 全部 GLSL ES 源码
 ├── bcas_cinema.ps           ← PASS 1 电影调色引擎
@@ -24,7 +24,7 @@ tools/
 ├── build_ksh.py             ← GLSL → .ksh 组装器（minify + 条目表交叉校验）
 ├── ksh_parse.py             ← .ksh 解析 / 字节级 round-trip 校验
 ├── make_modicon.py          ← PNG → KTEX(DXT5 全 mip 链) 编码器 + 解码回验
-└── build_sarasa_font.py     ← 高清字体打包
+└── build_hanfont.py         ← 高清字体打包（栅格化 + 重铸 + 打包）
 docs/                        ← 架构 / 能力矩阵 / 构建指南 / 工坊文案
 ```
 

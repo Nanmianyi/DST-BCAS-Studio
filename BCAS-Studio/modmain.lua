@@ -20,10 +20,41 @@ end
 Assets = {
     Asset("SHADER", "shaders/bcas_studio.ksh"),
     Asset("SHADER", "shaders/bcas_cinema.ksh"),
+    Asset("SHADER", "shaders/bcas_glow.ksh"),
+    Asset("SHADER", "shaders/bcas_glow2.ksh"),
+    Asset("SHADER", "shaders/bcas_kawase_pre.ksh"),
+    Asset("SHADER", "shaders/bcas_kawase2.ksh"),
+    Asset("SHADER", "shaders/bcas_kawase4.ksh"),
+    Asset("SHADER", "shaders/bcas_kawase8.ksh"),
+    Asset("ANIM", "anim/lightrays.zip"),
+    Asset("ANIM", "anim/wilson_shad.zip"),
+    Asset("ANIM", "anim/wilsonbeefalo_shad.zip"),
 }
 
 local State = require "bcas_state"
+local SunSystem = require "bcas_sun_emitter"
+local OceanLook = require "bcas_ocean"
 State.boot_preset = GetModConfigData("PRESET") or "standard"
+-- Ocean TILE colours + TUNING.OCEAN_SHADER must be patched before the
+-- world is generated (gamelogic reads them once). HUD init is too late.
+OceanLook.Apply(true)
+
+-- 原生 Bloom 开关接管（2026-09 v2，尽早安装）：
+-- 引擎在玩家改画质设置 / 进世界时经 PostProcessor:SetBloomEnabled 反复
+-- 重开原生辉光。钩子包装该方法（见 bcas_state.HookNativeBloom）：
+-- 我们辉光接管期间强制关官方辉光，关掉我们后恢复玩家的原生偏好。
+-- 顶层安装失败也没关系：State.InitShader（AddModShadersInit 时）会重试。
+State.HookNativeBloom()
+
+-- 原版滤镜接管（滤镜RR 3115280970 移植，2026-09）：低SAN保色 / 失真消除
+-- / 积雪上限 / 过滤风沙 四个实时开关，全部可逆包装（见
+-- bcas_state.HookVanillaFilters）。同样由 InitShader 兜底重试。
+-- ⚠ AddPrefabPostInit / AddClassPostConstruct 是 modutil.lua 注入"模组
+-- 环境"（env.xxx）的函数，不是游戏全局：bcas_state 经 require 加载跑在
+-- 游戏全局的严格环境里，rawget(_G) 永远拿不到（2026-09 实测：积雪/风沙
+-- 两钩子因此静默失效），必须先经 ProvideModHooks 显式传入。
+State.ProvideModHooks(AddPrefabPostInit, AddClassPostConstruct)
+State.HookVanillaFilters()
 
 -- ==========================================================================
 -- 高清字体整合（思源黑体，SIL OFL 1.1，见 fonts/ATTRIBUTION.txt；
@@ -168,7 +199,102 @@ local function IsHUDActive()
     return screen ~= nil and screen.name == "HUD"
 end
 
+
+
+
+-- 全生物全地物长影工厂（洞穴自动静默，地表全量覆盖）
+
+AddPlayerPostInit(function(inst)
+    inst:DoTaskInTime(0.1, function()
+        if inst:IsValid() and SunSystem ~= nil then
+            SunSystem.Attach(inst)
+        end
+    end)
+end)
+
+-- Trees get the "tree" tag after SetPrefabName in their own PostInit, so
+-- attach on entitywake (and a short delay) rather than only at spawn.
+local TREE_PREFABS = {
+    "evergreen", "evergreen_sparse", "evergreen_short", "evergreen_normal", "evergreen_tall",
+    "evergreen_sparse_short", "evergreen_sparse_normal", "evergreen_sparse_tall",
+    "deciduoustree", "deciduoustree_short", "deciduoustree_normal", "deciduoustree_tall",
+    "deciduoustree_burnt", "deciduoustree_stump",
+    "twiggytree", "twiggy_short", "twiggy_normal", "twiggy_tall", "twiggy_old",
+    "marsh_tree", "moon_tree", "moon_tree_short", "moon_tree_normal", "moon_tree_tall",
+}
+
+local function AttachLater(inst, delay)
+    inst:DoTaskInTime(delay or 0.15, function()
+        if inst:IsValid() and SunSystem ~= nil then
+            SunSystem.AttachEntity(inst)
+        end
+    end)
+    inst:DoTaskInTime(1.0, function()
+        if inst:IsValid() and SunSystem ~= nil then
+            SunSystem.AttachEntity(inst)
+        end
+    end)
+    inst:ListenForEvent("entitywake", function()
+        if inst:IsValid() and SunSystem ~= nil then
+            SunSystem.AttachEntity(inst)
+        end
+    end)
+end
+
+for _i, name in ipairs(TREE_PREFABS) do
+    AddPrefabPostInit(name, AttachLater)
+end
+
+local WATER_PREFABS = { "hotspring" }
+for _i, name in ipairs(WATER_PREFABS) do
+    AddPrefabPostInit(name, function(inst)
+        inst:DoTaskInTime(0.2, function()
+            if inst:IsValid() and SunSystem ~= nil then
+                SunSystem.AttachWater(inst)
+            end
+        end)
+    end)
+end
+
+local function OnWorldEntitySpawn(inst)
+    if GLOBAL.TheWorld and GLOBAL.TheWorld:HasTag("cave") then return end
+    if inst.AnimState == nil or inst.Transform == nil then return end
+    if inst:HasTag("player") then return end
+    if inst:HasTag("FX") or inst:HasTag("INLIMBO") or inst:HasTag("DECOR") then return end
+
+    inst:DoTaskInTime(0.15, function()
+        if not inst:IsValid() or SunSystem == nil then return end
+        if SunSystem.ShouldHaveShadow and SunSystem.ShouldHaveShadow(inst) then
+            SunSystem.AttachEntity(inst)
+        elseif SunSystem.IsMover(inst) then
+            SunSystem.AttachEntity(inst)
+        end
+    end)
+end
+
+AddPrefabPostInitAny(OnWorldEntitySpawn)
+
 AddClassPostConstruct("screens/playerhud", function(self)
+    -- 挂载主角 3D 动态太阳长影（SetMainCharacter 注入时确保必定触发）
+    local old_SetMainCharacter = self.SetMainCharacter
+    self.SetMainCharacter = function(hud, maincharacter, ...)
+        if old_SetMainCharacter ~= nil then
+            old_SetMainCharacter(hud, maincharacter, ...)
+        end
+        if maincharacter ~= nil then
+            SunSystem.Attach(maincharacter)
+        end
+    end
+    if self.owner ~= nil then
+        SunSystem.Attach(self.owner)
+    end
+
+    -- 启动全局高性能太阳阴影批处理调度器
+    SunSystem.Init()
+    OceanLook.Apply((State.params.OceanOn or 1) > 0.5)
+
+    -- 全局太阳阴影由 SunSystem 统一管理
+
     -- 进世界保险式重钉（修复"第一次进世界效果不启用"）。
     -- 首次进世界时着色器编译/建链存在时序竞态（第二次进世界才生效的老毛病），
     -- Reassert 幂等且开销为零，进世界后前 30 秒内每 3 秒重钉一次兜底。
@@ -182,15 +308,37 @@ AddClassPostConstruct("screens/playerhud", function(self)
         end
     end, 2)
 
-    -- 颗粒动画：TIME uniform 以 8Hz 刷新，胶片颗粒才会像胶片一样闪动
-    -- （静止的 TIME 只是一层死噪点）。仅当颗粒 > 0 时才下发，零额外开销。
+    -- 动画统一驱动（8Hz，Lua 算好标量，GPU 零额外开销）：
+    -- 1) 颗粒：TIME uniform 驱动胶片颗粒闪动（静止 TIME 只是一层死噪点）。
+    -- 2) 辉光光晕呼吸：慢速多频正弦合成 0.92..1.08 标量，经 BCAS_GLOW2.w
+    --    只调制光晕层——光源核心保持稳定，"活光"感不显廉价（光影绘卷式）。
     self.inst:DoPeriodicTask(0.125, function()
-        -- 退世界时引擎会把 PostProcessor 置 nil，守卫住任务空窗期
-        if PostProcessor == nil then return end
-        if (State.params.Grain or 0) > 0 and State.handles.BCAS_ATMO ~= nil then
+        -- 必须 GLOBAL.PostProcessor：mod 环境启动时拷到的是 nil 空壳，
+        -- 裸 PostProcessor 永远读不到引擎后来赋的真对象。
+        local PP = GLOBAL.PostProcessor
+        if PP == nil then return end
+        -- GetTime 是游戏全局函数（mainfunctions.lua），TheSim 没有这个方法。
+        local t = GLOBAL.GetTime()
+        if State.handles.BCAS_ATMO ~= nil
+            and ((State.params.Grain or 0) > 0
+                or ((State.params.OceanOn or 1) > 0.5 and State.enabled ~= false)) then
             local v = State.PackUniform("BCAS_ATMO")
-            PostProcessor:SetUniformVariable(
-                State.handles.BCAS_ATMO, v[1], v[2], GLOBAL.TheSim:GetTime() % 64, v[4])
+            PP:SetUniformVariable(
+                State.handles.BCAS_ATMO, v[1], v[2], t % 64, v[4])
+        end
+        if State.handles.BCAS_GLOW2 ~= nil then
+            State.flicker = 1.0 + 0.05 * math.sin(t * 1.3) + 0.03 * math.sin(t * 2.9 + 1.7)
+            local v = State.PackUniform("BCAS_GLOW2")
+            PP:SetUniformVariable(
+                State.handles.BCAS_GLOW2, v[1], v[2], v[3], v[4])
+        end
+        -- 太阳在屏幕上的落点：驱动 cinema 天光方向 + glow2 丁达尔/遮挡描边。
+        local su, sv = SunSystem.GetSunScreenUV()
+        State.sun_u, State.sun_v = su, sv
+        if State.handles.BCAS_EXTRA ~= nil then
+            local v = State.PackUniform("BCAS_EXTRA")
+            PP:SetUniformVariable(
+                State.handles.BCAS_EXTRA, v[1], v[2], v[3], v[4])
         end
     end, 1)
 

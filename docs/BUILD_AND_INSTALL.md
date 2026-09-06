@@ -1,71 +1,84 @@
 # 构建与安装指南
 
-## 安装（直接用）
+## 安装（玩家）
 
-1. 把整个 `BCAS-Studio` 文件夹复制到游戏 mods 目录：
-   `J:\SteamLibrary\steamapps\common\Don't Starve Together\mods\BCAS-Studio`
-   （本仓库可能已经帮你复制好，见下文"当前状态"）。
-2. 启动 DST → 主菜单「模组」→ 找到「BCAS Studio 画质增强」→ 勾选启用 → 应用。
+1. 把整个 `BCAS-Studio/` 文件夹复制到游戏的 mods 目录：
+   `...\SteamLibrary\steamapps\common\Don't Starve Together\mods\BCAS-Studio`
+2. 启动 DST → 主菜单「模组」→ 勾选「BCAS Studio 画质增强」→ 应用
+   （建议配置里预设选「standard 特调方案」、高清字体保持开启）。
 3. 进入世界后：
-   - `P` 开/关滤镜
-   - `Home` 打开设置面板（与 ReShade 同键位，可在 mod 配置改）
-   - `PgDn` 保存并关闭面板（`ESC` 放弃更改并回滚）
+   - `Home` 打开画质工作室面板（键位可在 mod 配置改）
+   - `PgDn` 保存并关闭面板（`ESC` 放弃更改并回滚快照）
+   - `P` 快速开/关整条后处理管线
+4. 面板顶部三套一键预设：**# 特调方案**（作者定版）· **# 轻量画质** · **# 电影胶片**。
 
 ## 验证是否加载成功
 
-看日志 `…\Don't Starve Together\client_log.txt`，搜索 `BCAS`：
+看日志 `...\Klei\DoNotStarveTogether\client_log.txt`，搜索 `BCAS`：
 
 ```
 [BCAS] 后处理效果注册成功 (id=…)
+[BCAS] uniform BCAS_GRADE_A handle = …
 [BCAS] 已载入保存的设置
 ```
 
-若出现 `[BCAS] 错误：bcas_studio.ksh 注册失败`，再向上翻引擎的着色器编译报错行。
+## 从源码构建着色器
 
-## 重新构建着色器
+本 Mod 的 ksh 不需要外部编译器：`tools/build_ksh.py` 把 GLSL ES 源码
+直接组装为引擎可加载的 `.ksh` 容器。
 
-改了 `src_shaders/bcas_studio.ps` 之后：
-
+```bash
+python tools/build_ksh.py          # 构建 src_shaders/ 下全部着色器
+python tools/build_ksh.py 源.ps 输出.ksh   # 单独构建一个
+python tools/make_modicon.py       # 模组图标 → KTEX(DXT5 全 mip 链)
+python tools/build_sarasa_font.py  # 高清字体打包
 ```
-python tools/build_ksh.py            # 默认输入输出，含 GLSL↔条目表交叉校验
-python tools/ksh_parse.py "BCAS-Studio/shaders/*.ksh"   # 字节级自检
-```
 
-依赖：Python 3（无任何第三方库）。老版 ShaderCompiler/Cg 工具链**不需要**，
-其产出的旧容器格式与现役引擎不兼容（这正是上一版失败的原因，详见
-`docs/CAPABILITIES.md` 第 3 节）。
+产物直接写入 `BCAS-Studio/shaders/`，构建后把 `BCAS-Studio/` 复制到
+游戏 mods 目录（或使用目录联接）即可生效。
 
-## 改参数/加滑条
+### 构建管线要点（踩坑沉淀，改代码前必读）
 
-三处同步（详见 `docs/ARCHITECTURE.md` 的 uniform 契约）：
-GLSL 声明 → `build_ksh.py` 的 `ENTRIES` → `bcas_state.lua` 的 `VEC`，
-然后在 `bcas_screen.lua` 的 `ROWS` 加一行 `{key = "新参数"}` 即可。
+- **ksh 容器**：`[名称][条目表][vs 源][ps 源][尾块]`。尾块 =
+  `[vs 引用数][索引...][ps 引用数][索引...]`，索引指向条目表——
+  自定义 VS 的 uniform 必须登记进 vs_refs。
+- **后处理 pass 有 ~4096 字节源码缓冲限制**：GLSL 必须经
+  `minify_glsl` 压成单行 + NUL 尾，超线会静默编译失败（注册成功但无效果）。
+- **实体 effect handle 路线无此限制**：多行 CRLF + NUL 尾即可。
+- **uniform 必须在源码中真实使用**：只声明不使用会被编译器优化掉，
+  引擎查 uniform 索引得 0xFFFFFFFF 直接原生断言闪退。
+- **KTEX 纹理布局**：`[8B 头][全部 mip 元数据依次][全部 mip 数据依次]`，
+  元数据与数据绝不交错；mip 链必须完整到 1×1，断链 / 交错都会
+  `HWTexture::DeserializeTexture failed (0x501)`。
+- **GLSL 源码纯 ASCII**：ANGLE 编译器拒绝任何非 ASCII 字符（含注释）。
+- **实体 effect 的 SetXXXEffect 接口只吃 VFS 绝对路径**：
+  传裸相对路径会触发引擎资源句柄原生断言（pcall 拦不住），
+  必须先过 `resolvefilepath`。
 
-## 排错速查
+### 常见故障
 
-| 现象 | 排查 |
+| 症状 | 原因与处置 |
 | --- | --- |
-| 效果注册成功但画面毫无变化 | 在日志里搜 `Error compiling shader`。ANGLE（GLSL ES，2013 年老编译器）有两个已知雷：① 源码含任何非 ASCII 字符 → `invalid character`；② **`in`/`out` 参数限定符 → `'in' : syntax error`**。两者都会静默失效（注册/排序/启用照常返回 true）。`build_ksh.py` 已强制 ASCII 校验；参数限定符一律不用（输出用返回值/vec2 打包） |
-| 注册/启用返回 false | 日志搜 `BCAS`，看 `插入渲染链` 与 `启用效果` 两行的返回值；启动后会自动打印完整状态（`BCAS.Info()` 可随时手动再打） |
-| 模组列表里没有它 | modinfo.lua 语法错误（看 client_log.txt 的 mod 加载报错） |
-| 启用后无变化 | 日志搜 `BCAS`；确认非专用服务器；按 P 确认滤镜处于开启态 |
-| 锐化无感但调色有效 | `SCREEN_PARAMS` 未被填充（理论不应发生，zoomblur 同机制在用）；日志反馈 + 用 `reference/` 里 lunacy/zoomblur 做对照实验 |
-| 画面过锐/有光晕 | 面板降「锐化强度」或升「抗振铃」 |
-| 想彻底恢复默认 | 删除 `文档\Klei\DoNotStarveTogether\client_save\bcas_studio` 设置文件后重启；面板里每个滑条右侧也有单独重置小圆钮 |
+| 面板一开就闪退 | Lua 字符串字面量里混入真实换行（`unfinished string`），改用 `\n` 转义 |
+| 进世界后贴图黑块/报 0x501 | KTEX 布局或 mip 链不完整，见上 |
+| 效果注册成功但画面无变化 | 后处理源码超 ~4096 字节被截断，压缩源码 |
+| 开着 mod 冷启动必崩 | 字体 fallback 挂载过早（须在引擎 LoadFonts 之后，见 modmain 注释） |
 
-## 已知风险与后续路线
+## 目录结构
 
-1. **风险（低）**：`SCREEN_PARAMS` 是引擎魔法值，机制与 `postprocess_zoomblur.ksh`
-   完全一致，但未在实机验证本 mod 本身。退化行为安全（见上表）。
-2. **下一步（可选）**：
-   - 利用 `components/colourcube.lua` 的 `overridecolourcube` 事件做季节 LUT 微调；
-   - 颗粒动画：Lua 侧以低频（如 10Hz）`SetUniformVariable(TIME)`，代价可忽略；
-   - 若要锐化 HUD：不存在官方途径（HUD 在后处理链之后），只能叠 ReShade——本 mod 定位即替代它。
-
-## 参考材料清单（reference/）
-
-- `dst_scripts/`、`dst_shaders/`：本机游戏解包（权威 API 依据）
-- `workshop-2485714729-ColorAdjustments/`：pxl_42 的成品 mod（管线姿势范本）
-- `reshade/`、`reshade-shaders/`：ReShade 源码与官方滤镜库（算法对照）
-- `ktools/`：KTEX 工具（若后续做 LUT/贴图资产用）
-- `glsl_extracted/`：引擎各后处理着色器的 GLSL 提取件（方言范本）
+```
+BCAS-Studio/                 ← Mod 本体
+├── modinfo.lua              ← 元信息 + 启动配置（预设/高清字体/热键）
+├── modmain.lua              ← 官方钩子接入、热键、面板入口、字体整合
+├── scripts/
+│   ├── bcas_state.lua       ← 参数状态机：40+ 参数 / 预设 / 持久化（单一数据源）
+│   ├── bcas_screen.lua      ← 画质工作室面板（7 页签 + 白平衡色轮弹窗）
+│   ├── bcas_sun_emitter.lua ← 动态太阳：日晷模型 / 剪影投影 / 透云光束
+│   └── bcas_ocean.lua       ← 海洋地皮调色（世界生成烘焙）
+├── shaders/                 ← 构建产物（.ksh，勿手改）
+├── fonts/                   ← 更纱黑体（SIL OFL，见 ATTRIBUTION.txt）
+└── anim/                    ← 投影剪影动画
+src_shaders/                 ← 全部 GLSL ES 源码（cinema/studio/glow×5）
+tools/                       ← build_ksh / ksh_parse / make_modicon 等
+docs/                        ← 架构 / 能力矩阵 / 本文件 / 工坊文案
+```

@@ -3,55 +3,16 @@ precision highp float;
 #endif
 
 // ============================================================================
-//  BCAS Studio - PASS 1/2: cinematic color engine
-//
-//  Pipeline (user-directed): grade FIRST so the dynamic range is stable
-//  before sharpening; atmosphere moves to pass 2 so grain is generated
-//  after the sharpener (the sharpener never sees or amplifies grain).
-//  Chain: bcas_cinema (this) -> bcas_studio (sharpen + vignette/grain).
-//
-//  8-bit hardening here:
-//   * ACES linearization uses the sRGB EOTF (linear toe) instead of a raw
-//     pow(x, 2.2), which crushes the first ~16 dark levels of an 8-bit
-//     buffer into a single value (black-hole noise patches).
-//   * TPDF dither (+-0.5 LSB, triangle) right before writing the 8-bit
-//     intermediate target: kills the banding contours that strong grading
-//     tears into quantized steps.
-//
-//  NOTE FOR MAINTAINERS: this file MUST stay pure ASCII (ANGLE rejects
-//  non-ASCII with "invalid character" and the effect silently dies).
-//  The MINIFIED source must stay under ~3800 bytes (build_ksh.py guards).
-//
-//  Uniform layout (must match AddUniformVariable calls in modmain.lua):
-//    SCREEN_PARAMS  {w, h, 1/w, 1/h}  - engine auto-filled, never register in Lua
-//    BCAS_GRADE_A   x=exposureEV y=temp z=tint(green-magenta) w=saturation(global)
-//    BCAS_GRADE_B   x=vibrance y=contrast z=lightness w=gamma
-//    BCAS_EXTRA     x=ACES mix
-//    BCAS_CDL_S     xyz=CDL slope (RGB)   w=secondary CDL enable
-//    BCAS_CDL_O     xyz=CDL offset (RGB)  w=highlight desaturate
-//    BCAS_CDL_P     xyz=CDL power  (RGB)
-//    BCAS_SEC_S     xyz=secondary slope (RGB)
-//    BCAS_SEC_O     xyz=secondary offset (RGB)  w=original mix
-//    BCAS_SEC_P     xyz=secondary power (RGB)
-//
-//  CDL (from the validated BCAS_Workspace V1.5.fx):
-//    out = pow(saturate(x * slope + offset), power)
-//  Grading is display-domain (our chain has no linear section); the fx
-//  applied CDL pre-tonemap in linear - close enough for taste knobs.
+//  BCAS Studio - PASS 1/2: cinema grading engine + Global Directional Sun Fill
 // ============================================================================
 
 uniform sampler2D SAMPLER[1];
 
 #define SRC_IMAGE        SAMPLER[0]
 
-// NOTE: do NOT declare SCREEN_PARAMS in this pass. It is unused here (the
-// atmosphere pass owns the pixel-size math), the GLSL compiler strips
-// unused uniforms, and if the ksh entry table still lists it the engine
-// gets index 0xFFFFFFFF and native-asserts to desktop (2026-08, tested).
-// Rule: the entry table = actually-used uniforms only.
 uniform vec4 BCAS_GRADE_A;
 uniform vec4 BCAS_GRADE_B;
-uniform vec4 BCAS_EXTRA;
+uniform vec4 BCAS_EXTRA;    // x=filmic y=sun_fill z=sun_u w=sun_v
 uniform vec4 BCAS_CDL_S;
 uniform vec4 BCAS_CDL_O;
 uniform vec4 BCAS_CDL_P;
@@ -72,6 +33,8 @@ varying vec2 PS_TEXCOORD0;
 #define GAMMA         BCAS_GRADE_B.w
 
 #define FILMIC        BCAS_EXTRA.x
+#define SUN_FILL      BCAS_EXTRA.y
+#define SUN_UV        BCAS_EXTRA.zw
 
 #define SLOPE         BCAS_CDL_S.xyz
 #define SEC_ON        BCAS_CDL_S.w
@@ -83,15 +46,12 @@ varying vec2 PS_TEXCOORD0;
 #define ORIGINAL_MIX  BCAS_SEC_O.w
 #define SEC_POWER     BCAS_SEC_P.xyz
 
-// CDL (faithful): out = pow(saturate(x * slope + offset), power)
 vec3 ApplyCDL(vec3 x, vec3 slope, vec3 offset, vec3 power)
 {
     x = clamp(x * slope + offset, 0.0, 1.0);
     return pow(max(x, vec3(1e-6)), power);
 }
 
-// sRGB EOTF with a linear toe: pow(1/255, 2.2) collapses the first ~16
-// dark levels of an 8-bit buffer to ~0; the toe keeps them alive.
 vec3 ToLinear(vec3 c)
 {
     vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
@@ -115,30 +75,35 @@ void main()
     vec3 color = texture2D(SRC_IMAGE, PS_TEXCOORD0).rgb;
     vec3 orig = color;
 
-    // exposure (EV)
     color *= exp2(EXPOSURE_EV);
 
-    // white balance: temp (orange-blue) + tint (green-magenta), gains
-    // normalized to keep luma neutral
     vec3 wb = vec3(exp2(0.20 * WB_TEMP), exp2(0.12 * WB_TINT), exp2(-0.20 * WB_TEMP));
     color *= wb * (3.0 / (wb.r + wb.g + wb.b + 1e-6));
 
-    // CDL primary, then blend in the secondary by its enable flag
     vec3 cdl = ApplyCDL(color, SLOPE, OFFSET, POWER);
     vec3 cdl2 = ApplyCDL(cdl, SEC_SLOPE, SEC_OFFSET, SEC_POWER);
     color = mix(cdl, cdl2, clamp(SEC_ON, 0.0, 1.0));
 
-    // lightness (additive)
     color += LIGHTNESS;
-
-    // contrast (pivot 0.5)
     color = (color - 0.5) * (1.0 + CONTRAST) + 0.5;
 
-    // gamma (display-domain slider)
     color = pow(max(color, vec3(0.0)), vec3(1.0 / max(GAMMA, 0.01)));
 
-    // filmic curve (ACES fitted) in real linear light:
-    // sRGB-EOTF linearize (toe-protected) -> curve -> re-encode -> mix
+    // ========================================================================
+    // Global Directional Sun Fill (Top-Left Sun Lighting)
+    // ========================================================================
+    if (SUN_FILL > 0.001) {
+        float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        // Soft ambient directional light gradient from top-left, never rotates with camera
+        float sun_grad = clamp(1.35 - (PS_TEXCOORD0.x * 0.55 + PS_TEXCOORD0.y * 0.60), 0.0, 1.0);
+        sun_grad = sun_grad * sun_grad;
+        vec3 sun_tint = vec3(1.14, 1.05, 0.92);
+        color = mix(color, color * sun_tint + vec3(0.05, 0.035, 0.015) * sun_grad, SUN_FILL * sun_grad * 0.65);
+        float hl_mask = smoothstep(0.40, 0.85, luma);
+        color += vec3(0.08, 0.06, 0.03) * (hl_mask * SUN_FILL * 0.40);
+        color += (SUN_UV.x + SUN_UV.y) * 0.0;
+    }
+
     if (FILMIC > 0.001) {
         vec3 lin = ToLinear(clamp(color, 0.0, 1.0));
         vec3 num = lin * (2.51 * lin + 0.03);
@@ -146,9 +111,6 @@ void main()
         color = mix(color, ToGamma(clamp(num / den, 0.0, 1.0)), FILMIC);
     }
 
-    // saturation group (faithful to the fx CCE):
-    // vibrance protects already-saturated px, WL weights midtones,
-    // highlight desaturate pulls hot spots back toward white.
     float yt = 0.25 * color.r + 0.5 * color.g + 0.25 * color.b;
     float ct = color.g - 0.5 * (color.r + color.b);
     float co = color.r - color.b;
@@ -160,12 +122,8 @@ void main()
     satFactor *= 1.0 - HighlightMask(dot(color, vec3(0.2126, 0.7152, 0.0722))) * HL_DESAT;
     color = mix(vec3(yt), color, satFactor);
 
-    // original mix (0 = fully processed, 1 = raw input)
     color = mix(color, orig, clamp(ORIGINAL_MIX, 0.0, 1.0));
 
-    // TPDF dither, +-0.5 LSB triangle: the graded output is written to an
-    // 8-bit intermediate target; without dither the stretched steps show
-    // up as banding contours (and pass 2 would sharpen the stair edges).
     float d1 = fract(dot(gl_FragCoord.xy, vec2(12.9898, 78.233)) * 43758.5453);
     float d2 = fract(dot(gl_FragCoord.yx, vec2(78.233, 12.9898)) * 24634.6345);
     color += (d1 - d2) * (1.0 / 512.0);

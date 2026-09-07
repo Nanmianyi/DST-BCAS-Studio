@@ -86,6 +86,10 @@ end
 
 -- 重新开启：给世界存量实体一次性补挂剪影（O(n) 单帧，实体已按条件过滤）。
 -- 没有这一步，开关回 ON 后只有新刷实体有影子，存量树/建筑要等 sleep/wake。
+-- ShouldHaveShadow 必须前置声明：函数体在其定义之前引用它，若不做局部
+-- 前向声明，闭包会退化为全局查找——strict.lua 环境下运行时报错（3.6.1
+-- 的 OFF 向崩溃同源，这次是 ON 向：拨回 ON 的瞬间必炸）。
+local ShouldHaveShadow
 local function RescanAttachAll()
     local Ents = _G.Ents
     if Ents == nil then return end
@@ -154,7 +158,7 @@ local function IsMover(ent)
     return false
 end
 
-local function ShouldHaveShadow(ent)
+local function ShouldHaveShadowImpl(ent)
     if ent == nil or not ent:IsValid() then return false end
     if ent._isshadow then return false end
     if NO_SHADOW_PREFABS[ent.prefab] then return false end
@@ -178,6 +182,7 @@ local function ShouldHaveShadow(ent)
     end
     return false
 end
+ShouldHaveShadow = ShouldHaveShadowImpl
 
 local function GetSunParams()
     local W = _G.TheWorld
@@ -352,6 +357,38 @@ local function CopyLeaves(pa, sa, shadow, force)
     end
 end
 
+-- Equipment swap slots the body's AnimState can carry. Mirrored symbol-by-
+-- symbol with GetSymbolOverride (reads the AnimState's own override table --
+-- C++ state, valid whoever set it: server onequip, replica, or engine).
+local SWAP_SYMBOLS = {
+    "swap_object", "swap_hat", "swap_hat_open", "swap_hat_snow",
+    "swap_hat_rain", "swap_hat_top", "swap_body", "swap_body_open",
+    "swap_body_short", "swap_body_tall", "swap_arm",
+}
+
+-- Mirror every equipment override + the skin build from the body's AnimState.
+-- Skin = an override build applied engine-side on the client (SetPlayerSkin
+-- netvar); GetSkinBuild() reads what is actually rendered, which on DLC
+-- characters (wortox/wurt/wanda/walter) is the only reliable source -- their
+-- GetBuild() can return the base build while a skin is showing.
+local function SyncOverrides(pa, sa, shadow)
+    if pa == nil or sa == nil or pa.GetSymbolOverride == nil then return end
+    for i = 1, #SWAP_SYMBOLS do
+        local sym = SWAP_SYMBOLS[i]
+        local b, s = pa:GetSymbolOverride(sym)
+        local kb, ks = "_ovb_" .. sym, "_ovs_" .. sym
+        if shadow[kb] ~= b or shadow[ks] ~= s then
+            shadow[kb] = b
+            shadow[ks] = s
+            if b ~= nil then
+                sa:OverrideSymbol(sym, b, s or sym)
+            else
+                sa:ClearOverrideSymbol(sym)
+            end
+        end
+    end
+end
+
 local function CopyAnim(pa, sa, shadow, force, src_ent)
     if pa == nil or sa == nil then return end
 
@@ -380,7 +417,18 @@ local function CopyAnim(pa, sa, shadow, force, src_ent)
         end
     end
 
+    -- Build: skin build wins when present. Skins swap the whole body art via
+    -- an override build (engine-applied, networked); GetBuild() alone showed
+    -- the base skin even with a DLC skin equipped ("still the original-skin
+    -- shadow" report). GetSkinBuild() exists on every AnimState (used by
+    -- entityscript itself); fall back to GetBuild for unskinned entities.
     local build = pa.GetBuild and pa:GetBuild()
+    if pa.GetSkinBuild ~= nil then
+        local sb = pa:GetSkinBuild()
+        if sb ~= nil and sb ~= "" then
+            build = sb
+        end
+    end
     if shadow._is_birch then
         build = build or "tree_leaf_trunk_build"
     end
@@ -388,6 +436,12 @@ local function CopyAnim(pa, sa, shadow, force, src_ent)
         shadow._last_build = build
         sa:SetBuild(build)
         shadow._last_leaf = nil
+    end
+    -- Equipment/skin overrides AFTER SetBuild: SetBuild wipes OverrideSymbol.
+    -- Per-frame mirroring is a player-only privilege (animals never carry
+    -- gear); everything else re-mirrors on force (attach / event resync).
+    if shadow._is_player or force then
+        SyncOverrides(pa, sa, shadow)
     end
     -- Leaves AFTER SetBuild: SetBuild wipes OverrideSymbol.
     CopyLeaves(pa, sa, shadow, force)
@@ -432,7 +486,15 @@ local function CopyAnim(pa, sa, shadow, force, src_ent)
             anim_hash = shadow._last_anim
         end
     else
-        name = DetectAnimName(pa, shadow)
+        -- 哈希快路径：clip 哈希未变时跳过 DetectAnimName 的 40+ 次
+        -- IsCurrentAnimation 全表扫描（每影每帧 40 次 C 调用 → 0 次）。
+        -- anim_hash 已在函数顶部取过一次。
+        if anim_hash ~= nil and anim_hash == shadow._last_anim_hash then
+            name = nil
+        else
+            name = DetectAnimName(pa, shadow)
+            shadow._last_anim_hash = anim_hash
+        end
     end
     -- Restart ONLY on a genuine clip change. force refreshes bank/build/leaves
     -- but must NEVER replay the same clip: animover/locomote storms were
@@ -459,11 +521,15 @@ local function CopyAnim(pa, sa, shadow, force, src_ent)
             shadow._last_anim = anim_hash
             shadow._last_frame = nil
         end
+        if anim_hash ~= nil then
+            shadow._last_anim_hash = anim_hash
+        end
     elseif anim_hash and anim_hash ~= shadow._last_anim then
         pcall(sa.PlayAnimation, sa, anim_hash, true)
         shadow._last_anim = anim_hash
         shadow._last_anim_name = nil
         shadow._last_frame = nil
+        shadow._last_anim_hash = anim_hash
     end
         CopyFrame(pa, sa, shadow, shadow._is_mover == true)
     end
@@ -496,7 +562,12 @@ local function ApplyPose(shadow, ent, scale_y, rot, r, g, b, a, follow)
             sa:SetScale(flip and -1 or 1, 1)
         end
     else
-        shadow.Transform:SetPosition(0, 0.002, 0)
+        -- 静态影子挂在父实体下（SetParent），本地坐标恒定；逐帧
+        -- SetPosition(0,0.002,0) 是每帧×几百静态的浪费，设一次即可。
+        if not shadow._pos_done then
+            shadow._pos_done = true
+            shadow.Transform:SetPosition(0, 0.002, 0)
+        end
     end
     shadow.Transform:SetScale(hs, scale_y * hf * hs, hs)
     if rot ~= shadow._last_rot then
@@ -517,6 +588,98 @@ local function ApplyPose(shadow, ent, scale_y, rot, r, g, b, a, follow)
     end
 end
 
+-- 事件监听一次性绑定：closure 动态读 ent._bcas_shadow。影子会随实体
+-- sleep 休眠销毁、wake 重建（性能边界），静态注册会导致监听器随
+-- 挂载循环无限累积（每次 attach 加一组）。绑定与挂载解耦：远距静态
+-- 被距离门挡掉时也已绑定，实体唤醒（玩家靠近）时由 wake 分支补挂。
+local function BindShadowListeners(ent)
+    if ent._bcas_bound == true then return end
+    ent._bcas_bound = true
+
+    local function drop_bound()
+        local sh = ent._bcas_shadow
+        if sh ~= nil then
+            dynamic_shadows[sh] = nil
+            static_shadows[sh] = nil
+            if sh:IsValid() then
+                sh:Remove()
+            end
+            ent._bcas_shadow = nil
+        end
+    end
+    ent:ListenForEvent("onremove", drop_bound)
+
+    -- 休眠（远离玩家）即弃影子、还原本体原生投影；唤醒时再补挂。
+    -- 影子实体数量被压到玩家周边活跃实体规模。玩家实体从不 sleep，
+    -- 此分支天然只命中树/建筑/生物。
+    ent:ListenForEvent("entitysleep", function()
+        if ent:IsValid() and not ent:HasTag("player") then
+            drop_bound()
+            if ent.DynamicShadow ~= nil then
+                pcall(ent.DynamicShadow.Enable, ent.DynamicShadow, true)
+            end
+        end
+    end)
+
+    local function sync_now()
+        if not ent:IsValid() then return end
+        local sh = ent._bcas_shadow
+        if sh == nil or not sh:IsValid() then return end
+        if ParentHidden(ent) then
+            sh:Hide()
+            return
+        end
+        sh:Show()
+        CopyAnim(ent.AnimState, sh.AnimState, sh, true, ent)
+        ent:DoTaskInTime(0, function()
+            if ent:IsValid() then
+                local sh2 = ent._bcas_shadow
+                if sh2 ~= nil and sh2:IsValid() then
+                    CopyAnim(ent.AnimState, sh2.AnimState, sh2, true, ent)
+                end
+            end
+        end)
+    end
+    ent:ListenForEvent("picked", sync_now)
+    ent:ListenForEvent("worked", sync_now)
+    ent:ListenForEvent("workfinished", sync_now)
+    ent:ListenForEvent("harvested", sync_now)
+    ent:ListenForEvent("onignite", sync_now)
+    ent:ListenForEvent("onextinguish", sync_now)
+    -- NO animover/animqueueover listeners: they fire after every sub-clip and
+    -- force-restarted clips (rabbit walk replays). Frame scrubbing in the
+    -- scheduler already keeps motion in sync; newstate covers clip switches.
+    ent:ListenForEvent("newstate", sync_now)
+    if ent:HasTag("player") then
+        -- Equipment / skin changes: force a full re-mirror (SetBuild wipes
+        -- overrides, so the splat must re-apply swap symbols after any
+        -- wardrobe/equip change; unequip must clear the old swap).
+        ent:ListenForEvent("equip", sync_now)
+        ent:ListenForEvent("unequip", sync_now)
+        ent:ListenForEvent("ms_playerchangeclothing", sync_now)
+        ent:ListenForEvent("skinmaxchanged", sync_now)
+    end
+
+    -- Wake: no shadow -> (re)attach; tree shadow -> phase lock via
+    -- CopyFrame only (replays here were the old wake-resync hitch);
+    -- everything else -> force re-copy.
+    ent:ListenForEvent("entitywake", function()
+        if not ent:IsValid() then return end
+        if ent:HasTag("player") then return end
+        local sh = ent._bcas_shadow
+        if sh == nil or not sh:IsValid() then
+            SunSystem.AttachShadowToEntity(ent)
+            return
+        end
+        if ent:HasTag("tree") then
+            CopyFrame(ent.AnimState, sh.AnimState, sh, false)
+        else
+            sh:Show()
+            CopyAnim(ent.AnimState, sh.AnimState, sh, true, ent)
+        end
+    end)
+end
+
 function SunSystem.AttachShadowToEntity(ent)
     if not master_enabled or not shadows_enabled then
         return
@@ -534,13 +697,30 @@ function SunSystem.AttachShadowToEntity(ent)
         end
         ent._bcas_shadow = nil
     end
+    BindShadowListeners(ent)
+    -- 影子是纯客户端视觉实体：dedicated 服务端（ThePlayer == nil）不创建、
+    -- 不调度，服务端零实体零开销。各客户端各自为可视范围创建本地剪影。
+    local ThePlayer = _G.ThePlayer
+    if ThePlayer == nil then
+        return
+    end
+    local is_player = ent:HasTag("player")
+    local is_mover = is_player or IsMover(ent)
+    -- 远距静态先不挂：树/建筑此刻 asleep，实体唤醒（玩家靠近）时由一次性
+    -- wake 监听补挂，static_shadows 从全图规模压到玩家周边规模。
+    if not is_mover and ThePlayer:IsValid() and ThePlayer.Transform ~= nil
+        and ent.Transform ~= nil then
+        local ex, _, ez = ent.Transform:GetWorldPosition()
+        local px, _, pz = ThePlayer.Transform:GetWorldPosition()
+        local dx, dz = ex - px, ez - pz
+        if dx * dx + dz * dz > STATIC_HIDE_SQ * 4 then
+            return
+        end
+    end
 
     if ent.DynamicShadow ~= nil then
         pcall(ent.DynamicShadow.Enable, ent.DynamicShadow, false)
     end
-    local is_player = ent:HasTag("player")
-    local is_mover = is_player or IsMover(ent)
-    local is_tree_static = not is_mover and ent:HasTag("tree")
 
     local shadow = CreateEntity()
     shadow.entity:AddTransform()
@@ -581,9 +761,6 @@ function SunSystem.AttachShadowToEntity(ent)
     pcall(shadow.AnimState.Hide, shadow.AnimState, "mouseover")
     if is_mover then
         shadow.Transform:SetNoFaced()
-        -- Player must never sleep: otherwise the splat vanishes after a
-        -- camera pan / chunk swap until the entity wakes again.
-        shadow.entity:SetCanSleep(false)
     else
         shadow.Transform:SetEightFaced()
         shadow.entity:SetParent(ent.entity)
@@ -596,73 +773,8 @@ function SunSystem.AttachShadowToEntity(ent)
 
     ent._bcas_shadow = shadow
     shadow._parent_ent = ent
-    local function drop()
-        dynamic_shadows[shadow] = nil
-        static_shadows[shadow] = nil
-        if shadow:IsValid() then
-            shadow:Remove()
-        end
-        if ent._bcas_shadow == shadow then
-            ent._bcas_shadow = nil
-        end
-    end
-    ent:ListenForEvent("onremove", drop)
 
-    local function sync_now()
-        if not ent:IsValid() or not shadow:IsValid() then return end
-        if ParentHidden(ent) then
-            shadow:Hide()
-            return
-        end
-        shadow:Show()
-        CopyAnim(ent.AnimState, shadow.AnimState, shadow, true, ent)
-        ent:DoTaskInTime(0, function()
-            if ent:IsValid() and shadow:IsValid() then
-                CopyAnim(ent.AnimState, shadow.AnimState, shadow, true, ent)
-            end
-        end)
-    end
-    ent:ListenForEvent("picked", sync_now)
-    ent:ListenForEvent("worked", sync_now)
-    ent:ListenForEvent("workfinished", sync_now)
-    ent:ListenForEvent("harvested", sync_now)
-    ent:ListenForEvent("onignite", sync_now)
-    ent:ListenForEvent("onextinguish", sync_now)
-    -- NO animover/animqueueover listeners: they fire after every sub-clip and
-    -- force-restarted clips (rabbit walk replays). Frame scrubbing in the
-    -- scheduler already keeps motion in sync; newstate covers clip switches.
-    if is_mover then
-        ent:ListenForEvent("newstate", sync_now)
-    end
-    if not is_mover then
-        if is_tree_static then
-            -- Trees: one-shot PHASE LOCK on wake, never a replay. The splat
-            -- never sleeps (SetCanSleep(false)) so it kept swaying while the
-            -- tree entity slept -> drift. CopyAnim here would RESTART the
-            -- clip (the old "wake resync reads as a hitch"); CopyFrame only
-            -- SetFrames to the body's current frame: one invisible snap at
-            -- the screen edge where wakes actually happen.
-            ent:ListenForEvent("entitywake", function()
-                if ent:IsValid() and shadow:IsValid() then
-                    CopyFrame(ent.AnimState, shadow.AnimState, shadow, false)
-                end
-            end)
-        else
-            ent:ListenForEvent("entitywake", function()
-                if ent:IsValid() and shadow:IsValid() then
-                    CopyAnim(ent.AnimState, shadow.AnimState, shadow, true, ent)
-                end
-            end)
-        end
-    else
-        ent:ListenForEvent("entitywake", function()
-            if shadow:IsValid() then
-                shadow:Show()
-                CopyAnim(ent.AnimState, shadow.AnimState, shadow, true, ent)
-            end
-        end)
-    end
-
+    -- 挂载即首次全量同步：bank/build/皮肤 build/装备 override/当前 clip
     CopyAnim(ent.AnimState, shadow.AnimState, shadow, true, ent)
     if shadow._is_birch or shadow._is_twiggy then
         ent:DoTaskInTime(0.3, function()
@@ -958,9 +1070,8 @@ local function StartGlobalScheduler()
                         if dist_sq <= NEAR_SQ or shadow._is_player then
                             nearby_movers = nearby_movers + 1
                         end
-                        if ent.DynamicShadow ~= nil then
-                            pcall(ent.DynamicShadow.Enable, ent.DynamicShadow, false)
-                        end
+                        -- 原生投影只在挂载/休眠两个时机切换，逐帧 pcall
+                        -- Enable(false) 是 30Hz×N 实体的纯浪费。
 
                         -- Player + nearby movers: full anim name+percent every tick.
                         -- Far crowd: percent only, name on budget. Idle snap never skipped

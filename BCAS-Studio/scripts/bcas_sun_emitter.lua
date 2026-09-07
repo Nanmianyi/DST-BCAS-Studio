@@ -26,6 +26,28 @@ local ocean_enabled = true
 local shafts_amount = 1.0
 local master_enabled = true
 
+
+local SHADOW_MAX_LENGTH = 2.4
+local SHADOW_MIN_LENGTH = 0.8
+local TWICE_MAX = 2.0 * SHADOW_MAX_LENGTH
+local DUSK_HYPOT = math.sqrt(SHADOW_MAX_LENGTH * SHADOW_MAX_LENGTH + SHADOW_MIN_LENGTH * SHADOW_MIN_LENGTH)
+local DUSK_ROTATION = math.deg(math.atan(SHADOW_MAX_LENGTH / SHADOW_MIN_LENGTH))
+local FADE = 10 / 480
+local NEAR_SQ = 40 * 40
+local FAR_SQ = 62 * 62
+local STATIC_HIDE_SQ = 46 * 46
+local STATIC_NEAR_SQ = 18 * 18
+local STATIC_MID_SQ = 30 * 30
+
+local dynamic_shadows = setmetatable({}, { __mode = "k" })
+local static_shadows = setmetatable({}, { __mode = "k" })
+local water_fx = setmetatable({}, { __mode = "k" })
+local shaft_ents = {}
+-- 静态影子近距花名册：0.5s 任务重建（≤46u），逐帧任务只扫它做姿态插值，
+-- 避免每帧 pairs 全量静态表（几百个）+ GetWorldPosition 的开销。
+local static_roster = {}
+local roster_n = 0
+
 local function DropAllShadowEntities()
     for shadow, ent in pairs(dynamic_shadows) do
         if shadow:IsValid() then
@@ -76,26 +98,6 @@ local function RescanAttachAll()
     end
 end
 
-local SHADOW_MAX_LENGTH = 2.4
-local SHADOW_MIN_LENGTH = 0.8
-local TWICE_MAX = 2.0 * SHADOW_MAX_LENGTH
-local DUSK_HYPOT = math.sqrt(SHADOW_MAX_LENGTH * SHADOW_MAX_LENGTH + SHADOW_MIN_LENGTH * SHADOW_MIN_LENGTH)
-local DUSK_ROTATION = math.deg(math.atan(SHADOW_MAX_LENGTH / SHADOW_MIN_LENGTH))
-local FADE = 10 / 480
-local NEAR_SQ = 40 * 40
-local FAR_SQ = 62 * 62
-local STATIC_HIDE_SQ = 46 * 46
-local STATIC_NEAR_SQ = 18 * 18
-local STATIC_MID_SQ = 30 * 30
-
-local dynamic_shadows = setmetatable({}, { __mode = "k" })
-local static_shadows = setmetatable({}, { __mode = "k" })
-local water_fx = setmetatable({}, { __mode = "k" })
-local shaft_ents = {}
--- 静态影子近距花名册：0.5s 任务重建（≤46u），逐帧任务只扫它做姿态插值，
--- 避免每帧 pairs 全量静态表（几百个）+ GetWorldPosition 的开销。
-local static_roster = {}
-local roster_n = 0
 
 local HEIGHT_SCALES = {
     cookpot = 0.50, icebox = 0.50, researchlab = 0.85, researchlab2 = 0.85,

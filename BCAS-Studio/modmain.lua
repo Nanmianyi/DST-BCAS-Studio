@@ -34,6 +34,12 @@ Assets = {
 local State = require "bcas_state"
 local SunSystem = require "bcas_sun_emitter"
 local OceanLook = require "bcas_ocean"
+
+local ENABLE_LIGHTING = GetModConfigData("LIGHTING") ~= "off"
+if not ENABLE_LIGHTING then
+    SunSystem.SetMasterEnabled(false)
+end
+
 State.boot_preset = GetModConfigData("PRESET") or "standard"
 -- Ocean TILE colours + TUNING.OCEAN_SHADER must be patched before the
 -- world is generated (gamelogic reads them once). HUD init is too late.
@@ -205,6 +211,7 @@ end
 -- 全生物全地物长影工厂（洞穴自动静默，地表全量覆盖）
 
 AddPlayerPostInit(function(inst)
+    if not ENABLE_LIGHTING then return end
     inst:DoTaskInTime(0.1, function()
         if inst:IsValid() and SunSystem ~= nil then
             SunSystem.Attach(inst)
@@ -224,6 +231,7 @@ local TREE_PREFABS = {
 }
 
 local function AttachLater(inst, delay)
+    if not ENABLE_LIGHTING then return end
     inst:DoTaskInTime(delay or 0.15, function()
         if inst:IsValid() and SunSystem ~= nil then
             SunSystem.AttachEntity(inst)
@@ -248,6 +256,7 @@ end
 local WATER_PREFABS = { "hotspring" }
 for _i, name in ipairs(WATER_PREFABS) do
     AddPrefabPostInit(name, function(inst)
+        if not ENABLE_LIGHTING then return end
         inst:DoTaskInTime(0.2, function()
             if inst:IsValid() and SunSystem ~= nil then
                 SunSystem.AttachWater(inst)
@@ -257,6 +266,7 @@ for _i, name in ipairs(WATER_PREFABS) do
 end
 
 local function OnWorldEntitySpawn(inst)
+    if not ENABLE_LIGHTING then return end
     if GLOBAL.TheWorld and GLOBAL.TheWorld:HasTag("cave") then return end
     if inst.AnimState == nil or inst.Transform == nil then return end
     if inst:HasTag("player") then return end
@@ -281,16 +291,18 @@ AddClassPostConstruct("screens/playerhud", function(self)
         if old_SetMainCharacter ~= nil then
             old_SetMainCharacter(hud, maincharacter, ...)
         end
-        if maincharacter ~= nil then
+        if maincharacter ~= nil and ENABLE_LIGHTING then
             SunSystem.Attach(maincharacter)
         end
     end
-    if self.owner ~= nil then
+    if self.owner ~= nil and ENABLE_LIGHTING then
         SunSystem.Attach(self.owner)
     end
 
     -- 启动全局高性能太阳阴影批处理调度器
-    SunSystem.Init()
+    if ENABLE_LIGHTING then
+        SunSystem.Init()
+    end
     OceanLook.Apply((State.params.OceanOn or 1) > 0.5)
 
     -- 全局太阳阴影由 SunSystem 统一管理

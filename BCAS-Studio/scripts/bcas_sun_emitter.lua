@@ -24,6 +24,43 @@ local SunSystem = {}
 local shadows_enabled = true
 local ocean_enabled = true
 local shafts_amount = 1.0
+local master_enabled = true
+
+local function DropAllShadowEntities()
+    for shadow, ent in pairs(dynamic_shadows) do
+        if shadow:IsValid() then
+            shadow:Remove()
+        end
+        if ent and ent:IsValid() and ent._bcas_shadow == shadow then
+            ent._bcas_shadow = nil
+        end
+        if ent and ent:IsValid() and ent.DynamicShadow ~= nil then
+            pcall(ent.DynamicShadow.Enable, ent.DynamicShadow, true)
+        end
+        dynamic_shadows[shadow] = nil
+    end
+    for shadow, ent in pairs(static_shadows) do
+        if shadow:IsValid() then
+            shadow:Remove()
+        end
+        if ent and ent:IsValid() and ent._bcas_shadow == shadow then
+            ent._bcas_shadow = nil
+        end
+        static_shadows[shadow] = nil
+    end
+    for i = 1, #shaft_ents do
+        local e = shaft_ents[i]
+        if e and e:IsValid() then
+            if e.Light then e.Light:Enable(false) end
+            e:Remove()
+        end
+        shaft_ents[i] = nil
+    end
+    for i = 1, #static_roster do
+        static_roster[i] = nil
+    end
+    roster_n = 0
+end
 
 local SHADOW_MAX_LENGTH = 2.4
 local SHADOW_MIN_LENGTH = 0.8
@@ -465,6 +502,9 @@ local function ApplyPose(shadow, ent, scale_y, rot, r, g, b, a, follow)
 end
 
 function SunSystem.AttachShadowToEntity(ent)
+    if not master_enabled or not shadows_enabled then
+        return
+    end
     if not ShouldHaveShadow(ent) then
         return
     end
@@ -481,10 +521,6 @@ function SunSystem.AttachShadowToEntity(ent)
 
     if ent.DynamicShadow ~= nil then
         pcall(ent.DynamicShadow.Enable, ent.DynamicShadow, false)
-    end
-
-    if not shadows_enabled then
-        return
     end
     local is_player = ent:HasTag("player")
     local is_mover = is_player or IsMover(ent)
@@ -876,6 +912,9 @@ local function StartGlobalScheduler()
     EnsureShafts()
 
     W:DoPeriodicTask(0, function()
+        if not master_enabled or not shadows_enabled then
+            return
+        end
         tick = tick + 1
         local scale_y, rot, a, r, g, b = GetSunParams()
         local player = _G.ThePlayer
@@ -996,6 +1035,9 @@ local function StartGlobalScheduler()
 
     local static_tick = 0
     W:DoPeriodicTask(0.5, function()
+        if not master_enabled or not shadows_enabled then
+            return
+        end
         static_tick = static_tick + 1
         local _scale_y, _rot, a = GetSunParams()
         local player = _G.ThePlayer
@@ -1077,9 +1119,20 @@ function SunSystem.Init()
     StartGlobalScheduler()
 end
 
+function SunSystem.SetMasterEnabled(enabled)
+    master_enabled = enabled == true
+    if not master_enabled then
+        DropAllShadowEntities()
+    end
+end
+
+function SunSystem.IsMasterEnabled()
+    return master_enabled
+end
+
 function SunSystem.SetShadowsEnabled(enabled)
     shadows_enabled = enabled == true
-    if not shadows_enabled then
+    if not shadows_enabled or not master_enabled then
         for shadow, ent in pairs(dynamic_shadows) do
             if shadow:IsValid() then shadow:Hide() end
             if ent and ent:IsValid() and ent.DynamicShadow ~= nil then
@@ -1150,6 +1203,8 @@ return {
     GetSunParams = GetSunParams,
     IsMover = IsMover,
     ShouldHaveShadow = ShouldHaveShadow,
+    SetMasterEnabled = SunSystem.SetMasterEnabled,
+    IsMasterEnabled = SunSystem.IsMasterEnabled,
     SetShadowsEnabled = SunSystem.SetShadowsEnabled,
     SetOceanEnabled = SunSystem.SetOceanEnabled,
     SetShaftsAmount = SunSystem.SetShaftsAmount,

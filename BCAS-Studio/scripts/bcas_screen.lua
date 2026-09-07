@@ -112,14 +112,14 @@ local STR = {
         GlowKnee = "辉光软膝 KNEE", GlowSpread = "辉光扩散 SPREAD",
         GlowCompress = "高光压缩 COMPRESS",
         VanillaGrade = "官方调色强度 GRADE",
-        SunFill = "太阳全局光 SUN-FILL", GodRays = "透云光束 SUN-SHAFTS", ShadowsOn = "地面投影 SHADOWS", OceanOn = "海水波光 OCEAN", GlowTail = "光晕长尾 GLOW-TAIL", LightWrap = "光包裹 LIGHT-WRAP", GlowRim = "轮廓光 GLOW-RIM",
+        SunFill = "太阳全局光 SUN-FILL", GodRays = "透云光束 SUN-SHAFTS", LightingMaster = "光影总开关 LIGHTING", ShadowsOn = "地面投影 SHADOWS", OceanOn = "海水波光 OCEAN", GlowTail = "光晕长尾 GLOW-TAIL", LightWrap = "光包裹 LIGHT-WRAP", GlowRim = "轮廓光 GLOW-RIM",
     },
     SHARP_NOTE = "双边自适应锐化：仅作用于游戏世界，HUD 界面不受影响；抗振铃(AURA)可消除白边。",
     WB_LAUNCH  = "# 白平衡 · 光学色彩轮 (点击展开调色仪)",
     WB_TIP     = "取色直接映射为 RGB 增益，等效于专业影视级 CDL 斜率校准。",
     ATMO_NOTE  = "环境氛围：暗角压暗四边、胶片颗粒增添质感；官方调色可控制原版季节滤镜强度。",
     GLOW_NOTE  = "金字塔柔光：沿游戏自带光源柔化发散，软膝控制起点，长尾权重使光晕温暖宽广。",
-    GLOW2_NOTE = "地面投影随日晷。波光改的是海洋地块，绿洲般通透粼粼。\n⚠ 水面配色烘在世界生成：改动 OCEAN 需重进世界生效。",
+    GLOW2_NOTE = "光影总开关 LIGHTING 拨 OFF 即彻底释放全部光影开销。地面投影随日晷。波光改的是海洋地块，绿洲般通透粼粼。\n⚠ 水面配色烘在世界生成：改动 OCEAN 需重进世界生效。",
     WB_TITLE   = "# 光学色轮 / 白平衡",
     WB_SUB     = "// CDL SPECTRUM ANALYZER",
     WB_CLOSE   = "完成校准",
@@ -146,12 +146,12 @@ local TAB_ROWS = {
            "DistortFree", "SnowCap", "SandFilter", "VanillaGrade"},
     [6] = {"BloomOn", "GlowIntensity", "GlowThreshold", "GlowKnee",
            "GlowSpread", "GlowWarmth", "GlowSat", "GlowCompress"},
-    [7] = {"ShadowsOn", "OceanOn", "SunFill", "GodRays", "GlowRim", "GlowTail", "LightWrap"},
+    [7] = {"LightingMaster", "ShadowsOn", "OceanOn", "SunFill", "GodRays", "GlowRim", "GlowTail", "LightWrap"},
 }
 
 local BOOL_KEYS = { ColourCubeOn = true, BloomOn = true,
     SanityColourOn = true, DistortFree = true, SandFilter = true,
-    ShadowsOn = true, OceanOn = true }
+    ShadowsOn = true, OceanOn = true, LightingMaster = true }
 
 -- ==== 3. 颜色数学 ===========================================================
 

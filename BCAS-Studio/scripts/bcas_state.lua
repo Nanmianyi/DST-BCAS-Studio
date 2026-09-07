@@ -169,6 +169,7 @@ local VEC = {
     -- == 增强功能独立总控开关 (不占uniform) ==
     ShadowsOn  = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
     OceanOn    = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
+    LightingMaster = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
 }
 State.VEC = VEC
 
@@ -340,6 +341,9 @@ function State.ApplyEnhancements()
     local SunSystem = _G.package.loaded["bcas_sun_emitter"]
     if SunSystem == nil then return end
     local master = State.enabled ~= false
+    if State.params.LightingMaster ~= nil and SunSystem.SetMasterEnabled ~= nil then
+        SunSystem.SetMasterEnabled((State.params.LightingMaster or 1) > 0.5)
+    end
     if SunSystem.SetShadowsEnabled ~= nil then
         SunSystem.SetShadowsEnabled(master and (State.params.ShadowsOn or 1) > 0.5)
     end
@@ -676,7 +680,7 @@ function State.SetParam(key, value)
     State.ApplyEnhancements()
         return
     end
-    if key == "ShadowsOn" or key == "OceanOn" or key == "GodRays" then
+    if key == "ShadowsOn" or key == "OceanOn" or key == "GodRays" or key == "LightingMaster" then
         State.ApplyEnhancements()
         if key == "GodRays" then
             State.ApplyUniform(meta.uniform)

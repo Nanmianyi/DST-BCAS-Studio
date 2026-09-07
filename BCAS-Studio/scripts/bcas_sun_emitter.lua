@@ -62,6 +62,20 @@ local function DropAllShadowEntities()
     roster_n = 0
 end
 
+-- 重新开启：给世界存量实体一次性补挂剪影（O(n) 单帧，实体已按条件过滤）。
+-- 没有这一步，开关回 ON 后只有新刷实体有影子，存量树/建筑要等 sleep/wake。
+local function RescanAttachAll()
+    local Ents = _G.Ents
+    if Ents == nil then return end
+    for _, ent in pairs(Ents) do
+        if ent ~= nil and ent:IsValid() and ent.AnimState ~= nil and ent.Transform ~= nil then
+            if ent:HasTag("player") or ShouldHaveShadow(ent) then
+                SunSystem.AttachShadowToEntity(ent)
+            end
+        end
+    end
+end
+
 local SHADOW_MAX_LENGTH = 2.4
 local SHADOW_MIN_LENGTH = 0.8
 local TWICE_MAX = 2.0 * SHADOW_MAX_LENGTH
@@ -1120,9 +1134,13 @@ function SunSystem.Init()
 end
 
 function SunSystem.SetMasterEnabled(enabled)
-    master_enabled = enabled == true
+    enabled = enabled == true
+    if master_enabled == enabled then return end  -- 翻转守卫：幂等调用零成本
+    master_enabled = enabled
     if not master_enabled then
         DropAllShadowEntities()
+    else
+        RescanAttachAll()
     end
 end
 

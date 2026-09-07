@@ -36,6 +36,7 @@ local SunSystem = require "bcas_sun_emitter"
 local OceanLook = require "bcas_ocean"
 
 local ENABLE_LIGHTING = GetModConfigData("LIGHTING") ~= "off"
+State.LightingHardOff = not ENABLE_LIGHTING
 if not ENABLE_LIGHTING then
     SunSystem.SetMasterEnabled(false)
 end

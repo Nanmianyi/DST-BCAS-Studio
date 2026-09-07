@@ -61,8 +61,10 @@
 | --- | --- |
 | 日晷模型太阳 | 单一解析式输出影长/旋角/透明度/色温，全局共享 |
 | 剪影地面投影 | 角色 + 大型地物，动画/皮肤/骑乘跟随，逐帧相位同步 |
+| 全角色/皮肤/装备镜像 | 影子 build 跟随 GetSkinBuild（DLC 角色 wortox/wurt/wanda/walter 与皮肤体系全部正确）；装备 override 逐符号镜像（swap_object 手杖 / swap_hat 帽子 / swap_body 衣服），equip/unequip/换肤事件强刷——AnimState 的 C++ 状态直接可读，不依赖调用方 |
 | 全天扫动 | 白天无级扫动、黄昏拉长、满月月光影（染蓝）、雨雪衰减 |
-| 帧预算调度 | 移动实体逐帧 / 静态实体距离分层错峰，夜晚洞穴零开销 |
+| 实体规模边界 | 纯客户端实体（dedicated 服务端零开销）；entitysleep 弃影子 + 还原原生投影、entitywake 补挂；远距静态距离门（92u）——影子实体数 = 玩家周边活跃规模 |
+| 帧预算调度 | 移动实体逐帧 / 静态实体距离分层错峰；clip 哈希快路径（稳态每影每帧 0 次 IsCurrentAnimation 扫描）；监听器一次性绑定（closure 动态取引用，杜绝 sleep/wake 循环累积） |
 | 太阳全局光 | 屏幕空间太阳位置驱动天光方向（SunFill） |
 | 水面波光 | 温泉等水体引擎光源点缀（AttachWaterFX） |
 

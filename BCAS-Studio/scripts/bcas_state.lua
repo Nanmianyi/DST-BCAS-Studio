@@ -341,8 +341,15 @@ function State.ApplyEnhancements()
     local SunSystem = _G.package.loaded["bcas_sun_emitter"]
     if SunSystem == nil then return end
     local master = State.enabled ~= false
-    if State.params.LightingMaster ~= nil and SunSystem.SetMasterEnabled ~= nil then
-        SunSystem.SetMasterEnabled((State.params.LightingMaster or 1) > 0.5)
+    if SunSystem.SetMasterEnabled ~= nil then
+        if State.LightingHardOff then
+            -- mod 配置 LIGHTING=off 是硬关断：预设/存档/面板都压不过它，
+            -- 面板行被同步压回 OFF，视觉与实际一致
+            State.params.LightingMaster = 0
+            SunSystem.SetMasterEnabled(false)
+        else
+            SunSystem.SetMasterEnabled((State.params.LightingMaster or 1) > 0.5)
+        end
     end
     if SunSystem.SetShadowsEnabled ~= nil then
         SunSystem.SetShadowsEnabled(master and (State.params.ShadowsOn or 1) > 0.5)

@@ -127,23 +127,14 @@ SHADERS = [
         ],
     },
     {
-        # 辉光合成 A：核心 + 中环
+        # 辉光合成（v3 单 pass 合并 A+B）：src + 核心环 + 中环 + 宽环 + 光晕
+        # 五路采样一次完成，含长尾呼吸/光包裹/轮廓光/水面碎金/Reinhard 压缩。
+        # SAMPLER[1..4] 由 Lua 侧按 AddSampler 调用顺序绑定四级金字塔输出。
         'name': 'bcas_glow',
         'ps': os.path.join(ROOT, 'src_shaders', 'bcas_glow.ps'),
         'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_glow.ksh'),
         'entries': [
-            dict(name='SAMPLER', type=TYPE_SAMPLER2D, a=0, arraylen=3),
-            V('BCAS_GLOW'),
-            V('BCAS_GLOW2'),
-        ],
-    },
-    {
-        # 辉光合成 B：宽环 + 光晕 + 暖色 + 压缩 + 光影科学(长尾/光包裹/轮廓光/丁达尔神光)
-        'name': 'bcas_glow2',
-        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_glow2.ps'),
-        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_glow2.ksh'),
-        'entries': [
-            dict(name='SAMPLER', type=TYPE_SAMPLER2D, a=0, arraylen=3),
+            dict(name='SAMPLER', type=TYPE_SAMPLER2D, a=0, arraylen=5),
             V('SCREEN_PARAMS'),
             V('BCAS_GLOW'),
             V('BCAS_GLOW2'),
@@ -151,53 +142,6 @@ SHADERS = [
             V('BCAS_ATMO'),
             V('BCAS_EXTRA'),
         ],
-    },
-    {
-        # 海面折射 mesh（AnimState 实体 effect handle，非后处理）。
-        # 条目表 = 原版 anim.ksh 同款（引擎按名字下发矩阵/光照/海洋纹理）。
-        # 源码保持多行 CRLF + NUL 尾（光影包 anim_ocean_surface.ksh 互证：
-        # 实体路径引擎读到 NUL 为止，~19KB 源码可正常编译，无 4KB 缓冲问题）。
-        'name': 'bcas_ocean_surface',
-        'entity': True,
-        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_ocean_surface.ps'),
-        'vs': os.path.join(ROOT, 'src_shaders', 'bcas_ocean_surface.vs'),
-        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_ocean_surface.ksh'),
-        'entries': [
-            M4('MatrixP'),
-            M4('MatrixV'),
-            M4('MatrixW'),
-            V('TIMEPARAMS'),
-            V('FLOAT_PARAMS', 3),
-            S('SAMPLER', 5),
-            V('LIGHTMAP_WORLD_EXTENTS'),
-            M4('COLOUR_XFORM'),
-            V('PARAMS', 3),
-            V('OCEAN_BLEND_PARAMS'),
-            V('OCEAN_WORLD_EXTENTS'),
-        ],
-        # 尾块 = [vs引用数][索引...][ps引用数][索引...]（研究结果/03 文档 §2）
-        'vs_refs': [0, 1, 2],
-        'ps_refs': [3, 4, 5, 6, 7, 8, 9, 10],
-    },
-    {
-        # 隐藏原版海浪贴片（WaveComponent:SetWaveEffect 换装）。
-        # 条目表与光影包 waves_invisible.ksh 互证：WavesOffset 是
-        # count=32 / ncomps=0 的 vec2 数组条目，ps_refs 为空（纯 discard）。
-        'name': 'bcas_waves_invisible',
-        'entity': True,
-        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_waves_hide.ps'),
-        'vs': os.path.join(ROOT, 'src_shaders', 'bcas_waves_hide.vs'),
-        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_waves_invisible.ksh'),
-        'entries': [
-            M4('MatrixP'),
-            M4('MatrixV'),
-            M4('MatrixW'),
-            V('WavesUp', 3),
-            V('WavesRepeat', 3),
-            dict(name='WavesOffset', type=TYPE_VEC2, a=0, count=32, ncomps=0, zeros=[]),
-        ],
-        'vs_refs': [0, 1, 2, 3, 4, 5],
-        'ps_refs': [],
     },
 ]
 

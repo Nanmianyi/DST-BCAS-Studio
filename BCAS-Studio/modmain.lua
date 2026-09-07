@@ -128,6 +128,14 @@ if ENABLE_HDFONT then
         GLOBAL.CHATFONT = "normalfont"
         GLOBAL.HEADERFONT = "normalfont"
         GLOBAL.CHATFONT_OUTLINE = "normalfont"
+        -- v3.6.3：补齐此前遗漏的四个字体常量——NUMBERFONT/SMALLNUMBERFONT
+        -- 是设置页、加载页数字与标签的主力字体（原版 stint-ucr 50px 字模
+        -- 拉伸必糊，中文再 fallback 到低清字体雪上加霜），正是用户反馈的
+        -- "设置/加载字体模糊"根因；两个 NPC 对话字体顺手覆盖。
+        GLOBAL.NUMBERFONT = "normalfont"
+        GLOBAL.SMALLNUMBERFONT = "normalfont"
+        GLOBAL.TALKINGFONT_HERMIT = "normalfont_outline"
+        GLOBAL.TALKINGFONT_TRADEIN = "normalfont_outline"
 
         -- BCAS 面板专用：浅底 UI 一律无描边（bcas_screen 读取，未注入时回落 UIFONT）
         -- strict.lua 会拦截"函数体内给未声明新全局赋值"（main chunk 例外），

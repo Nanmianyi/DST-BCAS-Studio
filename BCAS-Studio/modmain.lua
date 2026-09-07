@@ -21,7 +21,6 @@ Assets = {
     Asset("SHADER", "shaders/bcas_studio.ksh"),
     Asset("SHADER", "shaders/bcas_cinema.ksh"),
     Asset("SHADER", "shaders/bcas_glow.ksh"),
-    Asset("SHADER", "shaders/bcas_glow2.ksh"),
     Asset("SHADER", "shaders/bcas_kawase_pre.ksh"),
     Asset("SHADER", "shaders/bcas_kawase2.ksh"),
     Asset("SHADER", "shaders/bcas_kawase4.ksh"),
@@ -353,7 +352,7 @@ AddClassPostConstruct("screens/playerhud", function(self)
             PP:SetUniformVariable(
                 State.handles.BCAS_GLOW2, v[1], v[2], v[3], v[4])
         end
-        -- 太阳在屏幕上的落点：驱动 cinema 天光方向 + glow2 丁达尔/遮挡描边。
+        -- 太阳在屏幕上的落点：驱动 cinema 天光方向 + glow 丁达尔/遮挡描边。
         local su, sv = SunSystem.GetSunScreenUV()
         State.sun_u, State.sun_v = su, sv
         if State.handles.BCAS_EXTRA ~= nil then

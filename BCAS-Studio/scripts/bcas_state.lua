@@ -24,10 +24,10 @@ local State = {
     effect_id = nil,      -- studio（锐化）
     effect2_id = nil,     -- cinema（调色）
     glow_id = nil,        -- glow A（辉光合成：核心+中环）
-    glow2_id = nil,       -- glow B（辉光合成：宽环+光晕+压缩）
+    glow2_id = nil,       -- 已废弃：v3 单合成 pass（保留字段兼容存档诊断）
     glow_samplers = nil,  -- 辉光金字塔 4 级 SamplerEffect id（诊断用）
     flicker = 1.0,        -- 光晕呼吸标量（Lua 8Hz 计算，BCAS_GLOW2.w）
-    sun_u = 0.22,         -- 太阳屏幕 UV.x（cinema/glow2 共用 BCAS_EXTRA.z）
+    sun_u = 0.22,         -- 太阳屏幕 UV.x（cinema/glow 共用 BCAS_EXTRA.z）
     sun_v = 0.14,         -- 太阳屏幕 UV.y（BCAS_EXTRA.w）
     handles = {},         -- uniform 名 -> 句柄
     enabled = true,
@@ -156,7 +156,7 @@ local VEC = {
     -- （0=完全原色 ~ 1=官方原版，包装器按此缩放 SetColourCubeLerp(0,·)）
     VanillaGrade   = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
 
-    -- == 光影科学 v3.2（glow2 / BCAS_GLOW3）==
+    -- == 光影科学 v3.2（BCAS_GLOW3，glow 合成 pass）==
     -- 光晕长尾：光晕最外层四阶抬升，辉光向夜空长尾消散而非数码截断
     GlowTail   = {uniform = "BCAS_GLOW3", comp = 1, min = 0, max = 1,   default = 1.0},
     -- 光包裹：暖光晕按暗部掩码沁入阴影（空气散射，软化光圈硬边）
@@ -183,8 +183,7 @@ local EFFECT_UNIFORMS = {
         "BCAS_SEC_S", "BCAS_SEC_O", "BCAS_SEC_P",
     },
     studio = {"BCAS_SHARPEN", "BCAS_SHARP2", "BCAS_AURA", "BCAS_ATMO", "BCAS_DECONV"},
-    glow = {"BCAS_GLOW", "BCAS_GLOW2"},
-    glow2 = {"BCAS_GLOW", "BCAS_GLOW2", "BCAS_GLOW3", "BCAS_ATMO", "BCAS_EXTRA"},
+    glow = {"BCAS_GLOW", "BCAS_GLOW2", "BCAS_GLOW3", "BCAS_ATMO", "BCAS_EXTRA", "SCREEN_PARAMS"},
 }
 
 -- 白平衡 RGB 增益（调色窗虚拟旋钮）：不占 uniform，数学映射到 Temp/Tint。
@@ -648,8 +647,15 @@ function State.ApplyBloom()
     if PostProcessor == nil or State.glow_id == nil then return end
     local on = State.GlowOverrideActive()
     PostProcessor:EnablePostProcessEffect(State.glow_id, on)
-    if State.glow2_id ~= nil then
-        PostProcessor:EnablePostProcessEffect(State.glow2_id, on)
+    -- 金字塔四级 sampler 逐级断电（v3）：此前辉光关闭时四个 1/4 分辨率
+    -- pass 仍在每帧空跑。引擎绑定表原生方法，pcall 防老版本签名差异。
+    if State.glow_samplers ~= nil then
+        for i = 1, 4 do
+            local sid = State.glow_samplers[i]
+            if sid ~= nil then
+                pcall(PostProcessor.SetSamplerEffectState, PostProcessor, sid, on)
+            end
+        end
     end
     if PostProcessorEffects ~= nil and PostProcessorEffects.Bloom ~= nil then
         if on then
@@ -813,20 +819,39 @@ end
 -- 填充，只需经 SetEffectUniformVariables 绑定（同引擎 blur 链做法），
 -- 绝不能 AddUniformVariable；预滤级额外绑 BCAS_GLOW（与合成共用句柄，
 -- 引擎 OVERLAY_BLEND 先例）。
+-- 注册辉光管线（2026-09 v3 单合成 pass）：一个全分辨率合成 + 4 级 1/4
+-- 分辨率 Kawase。
+-- 采样链输入 = 引擎辉光缓冲（SamplerEffectBase.BloomSampler，Klei 按实体
+-- 写入的辉光源，引擎每帧照常填充、与原生 Bloom 效果的开关无关——光影绘卷
+-- 已实测），逐级经 SamplerEffectBase.Shader 级联：
+--   级 1 = 软膝预滤 + Kawase 步长 1（= 金字塔 CORE，预滤后才模糊）
+--   级 2/3/4 = Kawase 步长 2/4/8（MID / WIDE / HALO，每级仅 4 taps）
+-- 合成 pass（bcas_glow.ksh v3）SAMPLER[1..4] 依次绑四级金字塔输出，
+-- SAMPLER[0] = 链路输入（studio 输出），一次完成旧 A+B 全部合成
+-- （权重/暖色/饱和塑形与旧两 pass 数学等价：饱和塑形对 bloom 线性）。
+-- 性能：合成 2 pass -> 1 pass（全分辨率少一个 RT 往返）；4 级 × 4 taps
+--   @ 1/4 分辨率 ≈ 每像素 1 tap 的原生分辨率开销。
+-- 关闭真零开销：EnablePostProcessEffect 停合成 + SetSamplerEffectState
+--   逐级停金字塔（引擎绑定表原生方法，v3 新接入——此前辉光关闭时四级
+--   sampler 仍在每帧空跑）。
+-- 不碰 SetBloomSamplerParams：保持引擎默认 0.25 分辨率 RGB 辉光缓冲。
+-- 注意 ksh 是 sampler 效果：SAMPLER_PARAMS 魔法 uniform 由引擎按 RT 自动
+-- 填充，只需经 SetEffectUniformVariables 绑定（同引擎 blur 链做法），
+-- 绝不能 AddUniformVariable；预滤级额外绑 BCAS_GLOW（与合成共用句柄，
+-- 引擎 OVERLAY_BLEND 先例）。
 local function RegisterGlowChain()
     local glow_id = RegisterPass("shaders/bcas_glow.ksh", EFFECT_UNIFORMS.glow)
-    local glow2_id = RegisterPass("shaders/bcas_glow2.ksh", EFFECT_UNIFORMS.glow2)
-    if glow_id == nil or glow2_id == nil then
+    if glow_id == nil then
         print("[BCAS] 错误：glow 合成 pass 注册失败！辉光不可用，请查日志更早的编译报错。")
-        return nil, nil
+        return nil
     end
     if SamplerEffectBase == nil or SamplerSizes == nil or SamplerColourMode == nil
         or FILTER_MODE == nil or MIP_FILTER_MODE == nil or UniformVariables == nil
         or UniformVariables.SAMPLER_PARAMS == nil then
-        -- 引擎全局量缺失：合成 pass 留着也无害（SAMPLER[1]/[2] 无输入 =
+        -- 引擎全局量缺失：合成 pass 留着也无害（SAMPLER[1..4] 无输入 =
         -- 辉光 0 = 加法混合原样直通），但功能不完整，提示并降级
         print("[BCAS] 警告：SamplerEffect 引擎全局量缺失，辉光金字塔未创建")
-        return glow_id, glow2_id
+        return glow_id
     end
     local chain = {
         {path = "shaders/bcas_kawase_pre.ksh", base = SamplerEffectBase.BloomSampler, prefilter = true},
@@ -859,21 +884,14 @@ local function RegisterGlowChain()
         samplers[i] = sid
         prev = sid
     end
-    -- 金字塔绑定：A 合成 <- core+mid；B 合成 <- wide+halo
-    if samplers[1] ~= nil then
-        PostProcessor:AddSampler(glow_id, SamplerEffectBase.Shader, samplers[1])
-    end
-    if samplers[2] ~= nil then
-        PostProcessor:AddSampler(glow_id, SamplerEffectBase.Shader, samplers[2])
-    end
-    if samplers[3] ~= nil then
-        PostProcessor:AddSampler(glow2_id, SamplerEffectBase.Shader, samplers[3])
-    end
-    if samplers[4] ~= nil then
-        PostProcessor:AddSampler(glow2_id, SamplerEffectBase.Shader, samplers[4])
+    -- 金字塔绑定：合成 pass 的 SAMPLER[1..4] 依次吃四级输出
+    for i = 1, 4 do
+        if samplers[i] ~= nil then
+            PostProcessor:AddSampler(glow_id, SamplerEffectBase.Shader, samplers[i])
+        end
     end
     State.glow_samplers = samplers
-    return glow_id, glow2_id
+    return glow_id
 end
 
 function State.InitShader()
@@ -891,12 +909,13 @@ function State.InitShader()
     if State.effect2_id == nil then
         print("[BCAS] 警告：cinema pass 注册失败，仅有锐化生效")
     end
-    State.glow_id, State.glow2_id = RegisterGlowChain()
+    State.glow_id = RegisterGlowChain()
+    State.glow2_id = nil
     -- 只写参数，不在这里启用（启用统一放在 SortAndStart，对齐引擎时序）
     State.ApplyPreset(State.boot_preset, false)
     State.enabled = true
     print("[BCAS] 后处理效果注册成功 (id=" .. tostring(State.effect_id) .. "," .. tostring(State.effect2_id)
-        .. ",glowA=" .. tostring(State.glow_id) .. ",glowB=" .. tostring(State.glow2_id) .. ")")
+        .. ",glow=" .. tostring(State.glow_id) .. ") 合成单pass v3")
 end
 
 function State.SortAndStart()
@@ -922,16 +941,12 @@ function State.SortAndStart()
         print("[BCAS] 插入锐化链 After(cinema) -> " .. tostring(rs))
     end
     -- 辉光合成插在 studio 之后（链尾）：作用于最终画面，辉光层永不被
-    -- 锐化或二次调色。A(核心+中环) 在前、B(宽环+光晕+压缩) 在后，B 的
-    -- SAMPLER[0] 自动取 A 的输出。MoonPulse（月暴）在引擎排序里位于
-    -- 我们之后，其事件效果叠在辉光上，可接受。
+    -- 锐化或二次调色。v3 单合成 pass：SAMPLER[0] 自动取链路输入
+    -- （studio 输出），SAMPLER[1..4] = 四级金字塔。MoonPulse（月暴）
+    -- 在引擎排序里位于我们之后，其事件效果叠在辉光上，可接受。
     if State.glow_id ~= nil then
         local rg = PostProcessor:SetPostProcessEffectAfter(State.glow_id, State.effect_id)
-        print("[BCAS] 插入辉光A链 After(studio) -> " .. tostring(rg))
-    end
-    if State.glow2_id ~= nil then
-        local rg = PostProcessor:SetPostProcessEffectAfter(State.glow2_id, State.glow_id)
-        print("[BCAS] 插入辉光B链 After(辉光A) -> " .. tostring(rg))
+        print("[BCAS] 插入辉光链 After(studio) -> " .. tostring(rg))
     end
 
     local rc_en = PostProcessor:EnablePostProcessEffect(State.effect_id, true)
@@ -1001,7 +1016,7 @@ function State.Info()
     print("[BCAS] effect_id = " .. tostring(State.effect_id))
     print("[BCAS] effect2_id = " .. tostring(State.effect2_id))
     print("[BCAS] glow_id(A) = " .. tostring(State.glow_id))
-    print("[BCAS] glow2_id(B) = " .. tostring(State.glow2_id))
+    print("[BCAS] glow 合成 v3（单 pass）= " .. tostring(State.glow_id))
     if State.glow_samplers ~= nil then
         print("[BCAS] glow 金字塔 = " .. table.concat(State.glow_samplers, ","))
     end

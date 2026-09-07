@@ -94,7 +94,7 @@ v3.6.0（V6）：动态全局太阳光影与透云光束实装；反卷积墨线
 完整技术文档：https://github.com/Nanmianyi/DST-BCAS-Studio
 ]]
 author = "楠眠已"
-version = "3.6.1"
+version = "3.6.2"
 
 icon_atlas = "modicon.xml"
 icon = "modicon.tex"

@@ -1,0 +1,34 @@
+#if defined( GL_ES )
+precision highp float;
+#endif
+
+// ============================================================================
+//  BCAS Studio - bloom mip downsample (one pyramid level)
+//
+//  A plain 2x2 bilinear box downsample: four taps at half a SOURCE texel.
+//  SAMPLER_PARAMS.zw is the source texel size (engine fills it per sampler
+//  RT), so this is an exact half-resolution box - no sparse taps, which is
+//  what produced the old Kawase block/streak artifacts at large strides.
+//
+//  The same shader is used at every pyramid level; only the render target
+//  size differs (set from Lua).
+//
+//  NOTE FOR MAINTAINERS: pure ASCII only (ANGLE rejects anything else).
+// ============================================================================
+
+uniform sampler2D SAMPLER[1];
+uniform vec4 SAMPLER_PARAMS;
+
+varying vec2 PS_TEXCOORD0;
+
+void main()
+{
+    vec2 o = SAMPLER_PARAMS.zw * 0.5;
+
+    vec3 c = texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2( o.x,  o.y)).rgb
+           + texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2(-o.x,  o.y)).rgb
+           + texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2( o.x, -o.y)).rgb
+           + texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2(-o.x, -o.y)).rgb;
+
+    gl_FragColor = vec4(c * 0.25, 1.0);
+}

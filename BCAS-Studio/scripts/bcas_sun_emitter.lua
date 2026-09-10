@@ -126,6 +126,15 @@ local NO_SHADOW_PREFABS = {
 local NO_SHADOW_TAGS = {
     "FX", "DECOR", "INLIMBO", "pond", "watersource", "boat",
     "antlion_sinkhole", "shadowcreature", "nightmarecreature",
+    -- 水生生物不打地面影子（在水里投影太违和）：鱼/龙虾/饼干切割机等
+    "swimming", "oceanfish", "pondfish", "fish", "cookiecutter",
+    "wobster", "waterplant", "aquatic", "oceanfishinghookable",
+}
+
+-- 部分水生生物没有专属 tag，用 prefab 名兜底（shark/wobster/lobster/...）
+local NO_SHADOW_PREFAB_HINTS = {
+    "fish", "lobster", "wobster", "cookiecutter", "shark",
+    "starfish", "jellyfish", "waterplant", "crabking",
 }
 
 local WATER_PREFABS = {
@@ -164,6 +173,15 @@ local function ShouldHaveShadowImpl(ent)
     if NO_SHADOW_PREFABS[ent.prefab] then return false end
     if ent:HasTag("boulder") then return false end
     if HasAnyTag(ent, NO_SHADOW_TAGS) then return false end
+    -- 水生生物（无专属 tag 的用 prefab 名兜底）一律不投影
+    local _pf = ent.prefab
+    if type(_pf) == "string" then
+        for i = 1, #NO_SHADOW_PREFAB_HINTS do
+            if string.find(_pf, NO_SHADOW_PREFAB_HINTS[i], 1, true) then
+                return false
+            end
+        end
+    end
     if ent:HasTag("inventoryitem") and not IsMover(ent) then return false end
     if ent.Transform == nil or ent.AnimState == nil then return false end
     if ent:HasTag("player") or IsMover(ent) then return true end
@@ -357,14 +375,373 @@ local function CopyLeaves(pa, sa, shadow, force)
     end
 end
 
--- Equipment swap slots the body's AnimState can carry. Mirrored symbol-by-
--- symbol with GetSymbolOverride (reads the AnimState's own override table --
--- C++ state, valid whoever set it: server onequip, replica, or engine).
+-- DLC 角色影子的正解（2026-09-09，抄自工坊 3794362938 DST Shadows 的成熟
+-- 实现）：**不猜任何 build 名**。每帧把 sa:GetBuild() 镜像到影子（SetBuild
+-- 不打断动画），皮肤 build 用 ss:SetSkin(skin, base_build) 镜像——DLC 角色
+-- （wurt/wortox/wormwood/wanda/walter）的基础美术全走皮肤系统，GetBuild()
+-- 报 "wilson"（共享 bank 的基础 build），美术本体在 GetSkinBuild() 里，
+-- 影子必须同样走 SetSkin 才能立起来。此前 SetBuild(角色名) 静默失败的
+-- 根因：皮肤 build 不经 SetSkin 路径不渲染。
+
+-- Equipment swap slots the body's AnimState can carry. Used ONLY by the
+-- non-player path (SyncOverrides below): animals don't change gear, so
+-- GetSymbolOverride readback is enough for them. Players go through
+-- SyncPlayerEquipment (replica + skin table) instead.
+
 local SWAP_SYMBOLS = {
     "swap_object", "swap_hat", "swap_hat_open", "swap_hat_snow",
     "swap_hat_rain", "swap_hat_top", "swap_body", "swap_body_open",
     "swap_body_short", "swap_body_tall", "swap_arm",
 }
+
+-- 2026-09 装备镜像重建（照抄工坊 3794362938 DST Shadows 的实现）：
+--   * 带皮肤的手持/护甲由引擎经 OverrideItemSkinSymbol（皮肤表）上装，
+--     该表无任何读回——GetSymbolOverride 只能看到普通表，普通表在换装时
+--     冻结，这就是"影子拿上一次的工具/开局空手"的根因；
+--   * 权威客户端数据源 = 装备实体本身：item:GetSkinBuild() 给皮肤 build，
+--     手持物的 swap 数据在 components.floater.swap_data（sym_name/sym_build）；
+--   * 槽位符号约定：HANDS -> "swap_object"，其余 -> "swap_"..槽名；
+--   * 服务器卸下手持物时不清 swap_object 覆盖（只切 ARM 图层），所以
+--     "空手"判定必须走 inventory replica，并且影子要自己切 ARM_carry/
+--     ARM_normal 图层；
+--   * 皮肤装备占用的符号进 reserved 集，普通表镜像跳过，避免被 nil 清掉。
+local PLAYER_EQUIP_SYMBOLS = {
+    "swap_hat", "swap_body", "swap_body_tall", "swap_face", "swap_hands",
+    "swap_lantern", "swap_compass", "swap_umbrella", "swap_oar", "swap_fishingrod",
+    "swap_net", "swap_torch", "swap_shield", "swap_spear", "swap_staffs", "swap_slingshot",
+    "swap_trident", "swap_bedroll", "swap_balloon", "swap_antler_red", "swap_klaus_antler",
+    "swap_light", "swap_flower", "swap_mushroom", "swap_rope", "swap_saddle", "swap_boulder",
+    "swap_chain", "swap_statue", "swap_remote", "swap_offering", "swap_rack", "swap_dumbbell",
+    "swap_deploytoss_object", "swap_fan", "swap_gem", "swap_moon", "swap_pocket_scale_body",
+    "swap_spear_wathgrithr_lightning", "swap_lucy_axe", "swap_neck_collar", "swap_object_bernie",
+    "swap_toad_frozen", "swap_goo", "swap_float", "swap_frozen", "swap_food", "swap_cooked",
+    "swap_spice", "swap_garnish", "swap_follow", "swap_item", "swap_item2", "swap_normal",
+    "swap_number", "swap_number1", "swap_card", "swap_card1", "swap_suit", "swap_suit1",
+    "swap_band_btm", "swap_band_top", "swap_chain_link", "swap_chain_lock", "swap_hattop",
+    "swap_goosplat", "swap_dried", "swap_grown", "swap_handle", "swap_plate", "swap_frame",
+    "swap_meter", "swap_scarecrow_face",
+}
+
+local function GetItemEquipSkinData(item, slot_sym)
+    -- 原版姿势（torch/hats 等 prefab 的 onequip 照抄）：
+    --   手持: owner:OverrideItemSkinSymbol("swap_object", skin_build, "swap_"..prefab, GUID, "swap_"..prefab)
+    --   帽子/护甲: owner:OverrideItemSkinSymbol("swap_hat"/"swap_body", skin_build, "swap_hat"/"swap_body", GUID, fname)
+    -- 第三参是皮肤 build 内部的【源符号名】。此前误传 item.AnimState:GetBuild()
+    -- （那是个 build 名不是符号名），引擎在皮肤 build 里找不到该符号 →
+    -- 皮肤手持物永远空气。手持物绝大多数符合 "swap_"..prefab 规律。
+    if slot_sym ~= "swap_object" then
+        return slot_sym, slot_sym
+    end
+    local sym = item ~= nil and item.prefab ~= nil and ("swap_" .. item.prefab) or nil
+    if sym == nil or sym == "" then
+        return slot_sym, slot_sym
+    end
+    return sym, sym
+end
+
+-- 衣物部位符号（聚合自原版 scripts/clothing.lua 的 CLOTHING.symbol_overrides）。
+-- 上衣/裤子/手套等衣物皮肤由引擎 skinner 经 OverrideSkinSymbol 覆盖在身体
+-- 部位符号上，GetSymbolOverride 可读回；SetSkin(skin_build) 只带角色皮肤
+-- 不带衣物——不镜像这些符号影子就永远"穿着空气"。
+local CLOTHING_SYMBOLS = {
+    "arm_lower", "arm_lower_cuff", "arm_skin", "arm_upper", "arm_upper_skin",
+    "foot", "hand", "hand_idle_wormwood", "hand_wickerbottom",
+    "leg", "skirt", "tail", "torso", "torso_pelvis",
+}
+
+-- 手持/帽子等核心符号的写入日志（临时诊断，量少直接打）。
+local function LogSwapWrite(shadow, tag, sym, b, s)
+    if sym ~= "swap_object" and sym ~= "swap_hat" and sym ~= "swap_body" then return end
+    shadow._swap_logs = (shadow._swap_logs or 0) + 1
+    if shadow._swap_logs <= 10 then
+        print("[BCAS] 影子写入[" .. tag .. "] " .. sym .. " <- " .. tostring(b) .. "," .. tostring(s))
+    end
+end
+
+local function SyncPlayerEquipment(source, pa, sa, shadow)
+    local inv = source.replica ~= nil and source.replica.inventory or nil
+
+    -- SetBuild/SetSkin 会清空影子整个覆盖表：脏标记必须在节流 gate 之前
+    -- 消费——被抹掉的那一帧就立刻全量重涂，绝不留空窗。
+    if shadow._eq_dirty then
+        shadow._eq_dirty = nil
+        shadow._equip_cache = nil
+        shadow._sym_cache = nil
+        shadow._cloth_cache = nil
+    end
+
+    -- 覆盖类扫描节流：5 帧扫一次（与参考 3794362938 的
+    -- shadow_override_scan_interval=5 一致），大幅减轻逐符号压力
+    local counter = (shadow._equip_counter or 0) + 1
+    shadow._equip_counter = counter
+    if counter % 5 ~= 1 then return end
+
+    local eq_cache = shadow._equip_cache or {}
+    shadow._equip_cache = eq_cache
+    local sym_cache = shadow._sym_cache or {}
+    shadow._sym_cache = sym_cache
+    local cloth_cache = shadow._cloth_cache or {}
+    shadow._cloth_cache = cloth_cache
+
+    -- 1) 带皮肤装备（武器、帽子、护甲等）：GetSymbolOverride 读不回 OverrideItemSkinSymbol，
+    -- 改从 inventory replica 权威直接读取实体 + 皮肤 build，用 OverrideItemSkinSymbol 打到影子上。
+    -- 被占用的槽符号进入 reserved 集合，防止被普通表的 nil 覆盖掉。
+    local reserved = {}
+    local skinned_equips = nil
+    if inv ~= nil and inv.GetEquippedItem ~= nil then
+        local slots = _G.EQUIPSLOTS or { HANDS = "hands", HEAD = "head", BODY = "body" }
+        for eslot, slot_name in pairs(slots) do
+            local item = inv:GetEquippedItem(slot_name)
+            local skin_build = item ~= nil and item.GetSkinBuild ~= nil and item:GetSkinBuild() or nil
+            if skin_build ~= nil and skin_build ~= "" and item.GUID ~= nil then
+                local slot_sym = (slot_name == "hands") and "swap_object" or ("swap_" .. slot_name)
+                skinned_equips = skinned_equips or {}
+                skinned_equips[slot_name] = { item = item, sym = slot_sym, skin = skin_build }
+                reserved[slot_sym] = true
+            end
+        end
+    end
+
+    -- 写入/清理皮肤装备覆盖
+    if skinned_equips ~= nil then
+        for eslot, data in pairs(skinned_equips) do
+            local base_build, build_symbol = GetItemEquipSkinData(data.item, data.sym)
+            local last = eq_cache[eslot]
+            if last == nil or last.guid ~= data.item.GUID or last.skin ~= data.skin
+                or last.base ~= (base_build or "") or last.bsym ~= (build_symbol or data.sym) then
+                -- 顺序照原版 unequip→equip：先清旧普通覆盖，再写皮肤覆盖
+                -- （若 ClearOverrideSymbol 会连带清皮肤覆盖，先清后写才安全；
+                -- 反过来则会把刚写上的皮肤立刻清掉 = 换帽"弹回/消失"）。
+                if sym_cache[data.sym] ~= nil then
+                    sym_cache[data.sym] = nil
+                    LogSwapWrite(shadow, "换皮肤先清", data.sym, nil, nil)
+                    sa:ClearOverrideSymbol(data.sym)
+                end
+                -- 成功才更新缓存——失败保留空缺，下一轮自动重试
+                -- （旧版先写缓存再 pcall，失败被吞后永不重试）。
+                local ok, err = pcall(sa.OverrideItemSkinSymbol, sa, data.sym, data.skin,
+                    build_symbol or data.sym, data.item.GUID, base_build or "")
+                if ok then
+                    eq_cache[eslot] = {
+                        sym = data.sym, guid = data.item.GUID, skin = data.skin,
+                        base = base_build or "", bsym = build_symbol or data.sym,
+                    }
+                    LogSwapWrite(shadow, "皮肤", data.sym, data.skin, build_symbol or data.sym)
+                else
+                    -- 引擎拒绝（GUID 验权等）→ 降级：普通覆盖直接挂皮肤 swap
+                    -- build（GetSkinBuild() 返回的就是原版 OverrideItemSkinSymbol
+                    -- 第二参的 swap build；符号名仍是 "swap_"..prefab / 槽符号）。
+                    local fs = data.sym == "swap_object" and ("swap_" .. tostring(data.item.prefab)) or data.sym
+                    local hb = (data.skin ~= nil and data.skin ~= "") and data.skin or fs
+                    if hb ~= nil and hb ~= "" then
+                        eq_cache[eslot] = {
+                            sym = data.sym, guid = data.item.GUID, skin = data.skin,
+                            base = "fallback:" .. hb, bsym = fs,
+                        }
+                        LogSwapWrite(shadow, "皮肤降级", data.sym, hb, fs)
+                        sa:OverrideSymbol(data.sym, hb, fs)
+                    elseif shadow._skin_err_logged ~= true then
+                        shadow._skin_err_logged = true
+                        print("[BCAS] OverrideItemSkinSymbol 失败: " .. tostring(err)
+                            .. " sym=" .. tostring(data.sym) .. " skin=" .. tostring(data.skin)
+                            .. " bsym=" .. tostring(build_symbol or data.sym)
+                            .. " base=" .. tostring(base_build) .. " guid=" .. tostring(data.item.GUID))
+                    end
+                end
+            end
+        end
+    end
+    for eslot, last in pairs(eq_cache) do
+        if skinned_equips == nil or skinned_equips[eslot] == nil then
+            eq_cache[eslot] = nil
+            pcall(sa.ClearOverrideSymbol, sa, last.sym)
+        end
+    end
+
+    -- 2) 普通装备镜像（照抄 3794362938 成熟实现）：从原角色的 pa:GetSymbolOverride 读回！
+    -- 原版斧头/手杖/木甲装备时，服务端把 swap_axe/swap_cane/armor_wood 写进了原角色的普通覆盖表。
+    -- pa:GetSymbolOverride(sym) 能正确读出真实的 swap build 与 symbol！
+    local function MirrorOne(sym)
+        if reserved[sym] then return end
+        if pa.GetSymbolOverride == nil then return end
+        local sb, ssym = pa:GetSymbolOverride(sym)
+        local last = sym_cache[sym]
+        if sb ~= nil then
+            if last == nil or last[1] ~= sb or last[2] ~= ssym then
+                sym_cache[sym] = { sb, ssym }
+                LogSwapWrite(shadow, "槽位", sym, sb, ssym or sym)
+                sa:OverrideSymbol(sym, sb, ssym or sym)
+            end
+        elseif last ~= nil then
+            sym_cache[sym] = nil
+            LogSwapWrite(shadow, "清除", sym, nil, nil)
+            sa:ClearOverrideSymbol(sym)
+        end
+    end
+
+    -- 镜像所有身体/帽子等装备槽符号
+    for i = 1, #PLAYER_EQUIP_SYMBOLS do
+        MirrorOne(PLAYER_EQUIP_SYMBOLS[i])
+    end
+
+    -- 2b) 衣物部位镜像（"穿着空气"修复，照抄 3794362938 MirrorSkinSymbols）：
+    -- 引擎 skinner 把衣物皮肤用 OverrideSkinSymbol 覆盖在身体部位符号上
+    -- （torso/arm_upper/leg/foot...），GetSymbolOverride 可读回。注意必须
+    -- 用 OverrideSkinSymbol 复刻——普通 OverrideSymbol 对皮肤部位不渲染。
+    for i = 1, #CLOTHING_SYMBOLS do
+        local sym = CLOTHING_SYMBOLS[i]
+        local sb, ssym = pa:GetSymbolOverride(sym)
+        local last = cloth_cache[sym]
+        if sb ~= nil and sb ~= "" then
+            if last == nil or last[1] ~= sb or last[2] ~= ssym then
+                cloth_cache[sym] = { sb, ssym }
+                pcall(sa.OverrideSkinSymbol, sa, sym, sb, ssym or sym)
+            end
+        elseif last ~= nil then
+            cloth_cache[sym] = nil
+            pcall(sa.ClearOverrideSymbol, sa, sym)
+        end
+    end
+
+    -- 3) 手持装备判定（权威）：
+    -- 服务器卸下手持物时不会清除 swap_object 覆盖（只切 ARM 图层），
+    -- 所以不能单靠 swap_object 判断。本地玩家用 inventory replica（权威，卸载立即生效）。
+    local has_hand_item = false
+    if source == _G.ThePlayer then
+        has_hand_item = inv ~= nil and inv:GetEquippedItem(_G.EQUIPSLOTS ~= nil and _G.EQUIPSLOTS.HANDS or "hands") ~= nil
+    else
+        has_hand_item = (pa.GetSymbolOverride ~= nil and pa:GetSymbolOverride("swap_object") ~= nil) or (reserved["swap_object"] == true)
+    end
+
+    -- swap_object 手持物【item-driven 自实现】（2026-09-09 定案）：
+    -- 读回方案被证伪——参考 mod 3794362938 自己的手部就是空气，v3.6.4 读回
+    -- 也时灵时不灵。原版 onequip 写的覆盖完全可从背包实体直接推导：
+    --   工具/武器 prefab 构造时 SetBuild("swap_axe")，onequip 写
+    --   OverrideSymbol("swap_object", "swap_axe", "swap_axe")——即
+    --   build=实体AnimState build，symbol="swap_"..prefab。
+    -- 带皮肤武器走上面步骤 1 的 OverrideItemSkinSymbol（reserved 排除）。
+    if reserved["swap_object"] then
+        -- 皮肤手持由步骤 1 的 OverrideItemSkinSymbol 管理
+    elseif has_hand_item then
+        local hand = nil
+        if inv ~= nil and inv.GetEquippedItem ~= nil then
+            hand = inv:GetEquippedItem(_G.EQUIPSLOTS ~= nil and _G.EQUIPSLOTS.HANDS or "hands")
+        end
+        local written = false
+        if hand ~= nil and hand.prefab ~= nil then
+            -- 原版 onequip 的权威数据源 = floater.swap_data.sym_build / sym_name
+            -- （axe.lua: { sym_build="swap_axe", sym_name="swap_axe" }）。
+            -- 物品实体自身的 build 是【背包图标 build】（"axe"），不是手持 build
+            -- （"swap_axe"）——旧代码拿 GetBuild() 当手持 build 去比对，工具因此
+            -- 被判成"皮肤物品"、走 OverrideItemSkinSymbol 的错路 = 影子拿空气。
+            -- 手杖/火把的背包 build 恰好就是 swap_*，所以它们能显示、工具不能。
+            local swd = hand.components ~= nil and hand.components.floater ~= nil
+                and hand.components.floater.swap_data or nil
+            local swap_build = (swd ~= nil and swd.sym_build)
+                or ("swap_" .. tostring(hand.prefab))
+            local sym_name = (swd ~= nil and swd.sym_name) or swap_build
+            local skin = hand.GetSkinBuild ~= nil and hand:GetSkinBuild() or nil
+            if swap_build ~= nil and swap_build ~= "" then
+                local last = sym_cache["swap_object"]
+                if skin ~= nil and skin ~= "" then
+                    -- 带皮肤手持：引擎皮肤表路径（先清普通残留再写皮肤覆盖）
+                    if last == nil or last[1] ~= skin or last[2] ~= sym_name then
+                        sym_cache["swap_object"] = { skin, sym_name }
+                        pcall(sa.ClearOverrideSymbol, sa, "swap_object")
+                        local ok, err = pcall(sa.OverrideItemSkinSymbol, sa, "swap_object",
+                            skin, sym_name, hand.GUID, swap_build)
+                        LogSwapWrite(shadow, ok and "手持皮肤" or "手持皮肤拒绝",
+                            "swap_object", skin, sym_name .. " err=" .. tostring(err))
+                        if not ok then
+                            sa:OverrideSymbol("swap_object", swap_build, sym_name)
+                        end
+                    end
+                else
+                    -- 原皮手持（工具/武器/火把）：完全复刻原版
+                    -- owner.AnimState:OverrideSymbol("swap_object", swap_build, sym_name)
+                    if last == nil or last[1] ~= swap_build or last[2] ~= sym_name then
+                        sym_cache["swap_object"] = { swap_build, sym_name }
+                        pcall(sa.ClearOverrideSymbol, sa, "swap_object")
+                        LogSwapWrite(shadow, "手持", "swap_object", swap_build, sym_name)
+                        sa:OverrideSymbol("swap_object", swap_build, sym_name)
+                    end
+                end
+                written = true
+            end
+        end
+        if not written and pa.GetSymbolOverride ~= nil then
+            -- 实体信息拿不到时退回读回方案（双值接收，不能写成 and/or 链）
+            local sb, ssym = pa:GetSymbolOverride("swap_object")
+            if sb ~= nil then
+                local last = sym_cache["swap_object"]
+                if last == nil or last[1] ~= sb or last[2] ~= ssym then
+                    sym_cache["swap_object"] = { sb, ssym }
+                    LogSwapWrite(shadow, "手持读回", "swap_object", sb, ssym or "swap_object")
+                    sa:OverrideSymbol("swap_object", sb, ssym or "swap_object")
+                end
+            end
+        end
+    elseif sym_cache["swap_object"] ~= nil then
+        sym_cache["swap_object"] = nil
+        sa:ClearOverrideSymbol("swap_object")
+    end
+
+    -- 4) 手臂图层：有手部装备 → Show ARM_carry / Hide ARM_normal；否则反之。
+    if has_hand_item ~= shadow._arm_carry then
+        shadow._arm_carry = has_hand_item
+        if has_hand_item then
+            sa:Show("ARM_carry")
+            sa:Hide("ARM_normal")
+        else
+            sa:Hide("ARM_carry")
+            sa:Show("ARM_normal")
+        end
+    end
+
+    -- 5) 装备探针（临时诊断，发布前移除）：equip/unequip 事件触发一轮，
+    --    把"源读回→占用→写入缓存→影子状态"全链路打进 client_log，
+    --    一次测试实锤"空气手持/帽子弹回"的断链点。
+    if shadow._diag_next then
+        shadow._diag_next = nil
+        local function rb(sym)
+            if pa.GetSymbolOverride == nil then return "noapi" end
+            local b, s = pa:GetSymbolOverride(sym)
+            return tostring(b) .. "|" .. tostring(s)
+        end
+        local parts = {}
+        if inv ~= nil and inv.GetEquippedItem ~= nil then
+            local slots = _G.EQUIPSLOTS or { HANDS = "hands", HEAD = "head", BODY = "body" }
+            for _, slot_name in pairs(slots) do
+                local ok_i, it = pcall(inv.GetEquippedItem, inv, slot_name)
+                if ok_i and it ~= nil then
+                    local sn = it.GetSkinName ~= nil and tostring(it:GetSkinName()) or "?"
+                    local sk = it.GetSkinBuild ~= nil and tostring(it:GetSkinBuild()) or "?"
+                    local bd = it.AnimState ~= nil and it.AnimState.GetBuild ~= nil
+                        and tostring(it.AnimState:GetBuild()) or "?"
+                    parts[#parts + 1] = slot_name .. "=" .. tostring(it.prefab)
+                        .. " 皮肤:" .. sn .. "/" .. sk .. " 实体build:" .. bd
+                end
+            end
+        end
+        local res, eqc, syc = {}, {}, {}
+        for k in pairs(reserved) do res[#res + 1] = k end
+        for k, v in pairs(eq_cache) do
+            eqc[#eqc + 1] = k .. ":" .. tostring(v.skin or v.guid) .. "@" .. tostring(v.sym)
+        end
+        for k, v in pairs(sym_cache) do syc[#syc + 1] = k .. ":" .. tostring(v[1]) end
+        print(string.format(
+            "[BCAS] 探针[%s]: 读回 obj=(%s) hat=(%s) body=(%s) | 占用={%s} | 背包: %s"
+            .. " | sym缓存: %s | eq缓存: %s | 影build=%s 影skin=%s",
+            tostring(source == _G.ThePlayer and "本地" or "远端"),
+            rb("swap_object"), rb("swap_hat"), rb("swap_body"),
+            table.concat(res, ","),
+            #parts > 0 and table.concat(parts, " ;; ") or "空手",
+            table.concat(syc, ","),
+            table.concat(eqc, ","),
+            tostring(sa.GetBuild ~= nil and sa:GetBuild() or "?"),
+            tostring(sa.GetSkinBuild ~= nil and sa:GetSkinBuild() or "?")))
+    end
+end
 
 -- Mirror every equipment override + the skin build from the body's AnimState.
 -- Skin = an override build applied engine-side on the client (SetPlayerSkin
@@ -373,17 +750,23 @@ local SWAP_SYMBOLS = {
 -- GetBuild() can return the base build while a skin is showing.
 local function SyncOverrides(pa, sa, shadow)
     if pa == nil or sa == nil or pa.GetSymbolOverride == nil then return end
+    -- swap_object/hat/body for PLAYERS now come from the replica (above);
+    -- plain-table mirroring of those would resurrect stale data. Non-player
+    -- entities (no replica) still mirror everything from the plain table.
+    local skip_core = shadow._is_player == true
     for i = 1, #SWAP_SYMBOLS do
         local sym = SWAP_SYMBOLS[i]
-        local b, s = pa:GetSymbolOverride(sym)
-        local kb, ks = "_ovb_" .. sym, "_ovs_" .. sym
-        if shadow[kb] ~= b or shadow[ks] ~= s then
-            shadow[kb] = b
-            shadow[ks] = s
-            if b ~= nil then
-                sa:OverrideSymbol(sym, b, s or sym)
-            else
-                sa:ClearOverrideSymbol(sym)
+        if not (skip_core and (sym == "swap_object" or sym == "swap_hat" or sym == "swap_body")) then
+            local b, s = pa:GetSymbolOverride(sym)
+            local kb, ks = "_ovb_" .. sym, "_ovs_" .. sym
+            if shadow[kb] ~= b or shadow[ks] ~= s then
+                shadow[kb] = b
+                shadow[ks] = s
+                if b ~= nil then
+                    sa:OverrideSymbol(sym, b, s or sym)
+                else
+                    sa:ClearOverrideSymbol(sym)
+                end
             end
         end
     end
@@ -393,9 +776,11 @@ local function CopyAnim(pa, sa, shadow, force, src_ent)
     if pa == nil or sa == nil then return end
 
     -- Bank: hash first (workshop 3794362938). Name fallback for older clients.
+    -- 引擎态对比（影子 sa:GetBankHash vs 源 pa:GetBankHash）：force 不再
+    -- 绕过对比，事件风暴（newstate/equip → sync_now）不会反复重放 SetBank。
     if pa.GetBankHash and sa.GetBankHash then
         local bank_hash = pa:GetBankHash()
-        if bank_hash and (force or bank_hash ~= shadow._last_bank_hash) then
+        if bank_hash and bank_hash ~= sa:GetBankHash() then
             sa:SetBank(bank_hash)
             shadow._last_bank_hash = bank_hash
             shadow._last_bank = nil
@@ -417,130 +802,100 @@ local function CopyAnim(pa, sa, shadow, force, src_ent)
         end
     end
 
-    -- Build: skin build wins when present. Skins swap the whole body art via
-    -- an override build (engine-applied, networked); GetBuild() alone showed
-    -- the base skin even with a DLC skin equipped ("still the original-skin
-    -- shadow" report). GetSkinBuild() exists on every AnimState (used by
-    -- entityscript itself); fall back to GetBuild for unskinned entities.
+    -- Build + 皮肤 build 镜像（2026-09-09，方案照抄工坊 3794362938）：
+    -- **引擎态对比**：SetBuild 只在影子实际 build 与源不一致时执行。
+    -- 此前 force 时无条件 SetBuild——newstate/equip 事件风暴每次都把影子
+    -- 覆盖表整个抹掉，装备符号反复蒸发（"空气装备"直接根源之一）。
+    -- GetBuild() 直接镜像（SetBuild 不打断动画），皮肤 build 用
+    -- SetSkin(skin, base) 镜像。DLC 角色基础美术在皮肤系统里，影子只有
+    -- 走同样的 SetSkin 才能渲染出正确轮廓——SetBuild(角色名) 会静默失败
+    -- （皮肤 build 不经 SetSkin 路径不渲染，"DLC 影子消失"回归的根因）。
     local build = pa.GetBuild and pa:GetBuild()
-    if pa.GetSkinBuild ~= nil then
-        local sb = pa:GetSkinBuild()
-        if sb ~= nil and sb ~= "" then
-            build = sb
-        end
-    end
-    if shadow._is_birch then
-        build = build or "tree_leaf_trunk_build"
-    end
-    if build and (force or build ~= shadow._last_build) then
+    if build ~= nil and build ~= sa:GetBuild() then
         shadow._last_build = build
         sa:SetBuild(build)
         shadow._last_leaf = nil
+        -- SetBuild 清空影子覆盖表：标记装备扫描强制重涂
+        shadow._eq_dirty = true
     end
-    -- Equipment/skin overrides AFTER SetBuild: SetBuild wipes OverrideSymbol.
-    -- Per-frame mirroring is a player-only privilege (animals never carry
-    -- gear); everything else re-mirrors on force (attach / event resync).
-    if shadow._is_player or force then
+    if pa.GetSkinBuild ~= nil and sa.SetSkin ~= nil then
+        local sb = pa:GetSkinBuild()
+        if sb ~= nil and sb ~= "" then
+            -- 源驱动对比（2026-09-10 装备空气第二根因）：引擎对 skin build
+            -- 有内部归一化，SetSkin 的入参与 GetSkinBuild 的回读值可能永不相
+            -- 等——逐帧引擎对比恒为"变了"→ 每帧 SetSkin → 每帧清空覆盖表 →
+            -- 装备符号刚涂上就被抹（"拿空气"+重涂那帧"切换闪一下"）。改为
+            -- 只对比源上一次的皮肤值：源真换肤才 SetSkin；失败最多重试 3 次。
+            if sb ~= shadow._last_skin or (shadow._skin_tries or 0) < 3 then
+                if sb ~= shadow._last_skin then
+                    shadow._last_skin = sb
+                    shadow._skin_tries = 0
+                end
+                shadow._skin_tries = (shadow._skin_tries or 0) + 1
+                shadow._skin_sets = (shadow._skin_sets or 0) + 1
+                if shadow._is_player and shadow._skin_sets == 10 then
+                    print("[BCAS] 哨兵: 影子SetSkin已累计10次 源skin="
+                        .. tostring(sb) .. " 影回读=" .. tostring(sa:GetSkinBuild())
+                        .. "（若持续增长说明回读不匹配，装备会被每帧抹除）")
+                end
+                pcall(sa.SetSkin, sa, sb, build or "")
+                shadow._eq_dirty = true
+            end
+            shadow._had_skin = true
+        elseif shadow._had_skin then
+            -- 皮肤卸下：重放基础 build 还原（SetBuild 同样清覆盖表 → 脏标记）
+            shadow._had_skin = nil
+            shadow._last_skin = nil
+            shadow._skin_tries = 0
+            if build ~= nil then
+                sa:SetBuild(build)
+                shadow._last_build = build
+                shadow._last_leaf = nil
+                shadow._eq_dirty = true
+            end
+        end
+    end
+    -- Equipment/skin overrides AFTER SetBuild/SetSkin: 二者都会清 OverrideSymbol。
+    -- 玩家走装备槽权威镜像（皮肤表 + replica，见 SyncPlayerEquipment 注释）；
+    -- 非玩家仍用普通表镜像（动物不换装），force 时全量重刷。
+    if shadow._is_player then
+        SyncPlayerEquipment(src_ent, pa, sa, shadow)
+    elseif force then
         SyncOverrides(pa, sa, shadow)
     end
     -- Leaves AFTER SetBuild: SetBuild wipes OverrideSymbol.
     CopyLeaves(pa, sa, shadow, force)
 
-    -- Trees: mirror the tree's own stage clip from inst.anims. Wake idles
-    -- are IGNORED (body plays idle then pushes sway; switching splat to idle
-    -- and back is what made trees flicker between stages). Unknown clips
-    -- keep the current splat instead of guessing.
-    local is_tree = src_ent ~= nil and src_ent:IsValid() and not shadow._is_player
-        and (shadow._is_birch or shadow._is_twiggy or src_ent:HasTag("tree"))
-    local name
-    local anim_hash = pa.GetCurrentAnimationHash and pa:GetCurrentAnimationHash()
-    if is_tree then
-        local an = src_ent.anims
-        if an ~= nil and pa.IsCurrentAnimation then
-            local keys = { "stump", "burnt", "burning", "chop_burnt",
-                "idle_chop_burnt", "chop", "fallleft", "fallright",
-                "sway1", "sway2" }
-            for i = 1, #keys do
-                local nm = an[keys[i]]
-                if nm and pa:IsCurrentAnimation(nm) then
-                    name = nm
-                    break
-                end
-            end
-        end
-        if name == nil then
-            local detected = DetectAnimName(pa, shadow)
-            if detected ~= nil and not string.find(detected, "idle", 1, true) then
-                name = detected
-            end
-        end
-        -- Follow the body's CURRENT sway variant (sway1 vs sway2). The two
-        -- variants have different rhythms: locking one while the body plays
-        -- the other makes the splat drift in and out of phase with its tree,
-        -- which reads as constant jerking. Frame-scrub in the static
-        -- scheduler keeps the phase locked.
-        if name == nil then
-            -- Wake idle / unknown one-shot: hold the current splat AND pin
-            -- the hash so the fallback below cannot yank it to idle (that
-            -- sway->idle->sway yank was the per-wake stutter).
-            anim_hash = shadow._last_anim
-        end
-    else
-        -- 哈希快路径：clip 哈希未变时跳过 DetectAnimName 的 40+ 次
-        -- IsCurrentAnimation 全表扫描（每影每帧 40 次 C 调用 → 0 次）。
-        -- anim_hash 已在函数顶部取过一次。
-        if anim_hash ~= nil and anim_hash == shadow._last_anim_hash then
-            name = nil
-        else
-            name = DetectAnimName(pa, shadow)
-            shadow._last_anim_hash = anim_hash
-        end
-    end
-    -- Restart ONLY on a genuine clip change. force refreshes bank/build/leaves
-    -- but must NEVER replay the same clip: animover/locomote storms were
-    -- making stopped rabbits re-run and tree splats pop between stages.
-    -- Anti-flap (the recurring "shadow flickers between tree stages" bug):
-    -- periodic re-detection must not rapid-fire clip switches if anything
-    -- unexpected flaps; hold the current splat for 1.5s between switches.
-    -- Event sync (force=true: picked/worked/ignite) bypasses the gate.
-    if name ~= nil and is_tree and force ~= true
-        and shadow._last_switch_t ~= nil then
-        local now = _G.GetTime ~= nil and _G.GetTime() or 0
-        if (now - shadow._last_switch_t) < 1.5 then
-            name = nil
-            anim_hash = shadow._last_anim
-        end
-    end
-    if name ~= nil then
-        if name ~= shadow._last_anim_name then
-            if is_tree then
-                shadow._last_switch_t = _G.GetTime ~= nil and _G.GetTime() or 0
-            end
-            sa:PlayAnimation(name, LOOP_ANIMS[name] == true or is_tree)
-            shadow._last_anim_name = name
+    -- 动画镜像：以【引擎哈希】为准——比较"影子当前动画哈希"与"源当前动画哈希"，
+    -- 不同就按源哈希重放。不再猜动画名（旧的 DetectAnimName 只认 mover 名表，
+    -- 会把 picked / idle_dead / 树桩这些植物与树木状态漏掉），也不再用
+    -- _last_anim_name + anti-flap 缓存（那套在状态间来回写会让影子定格或横跳）。
+    -- 直接对比影子自身的哈希是自纠正的：PlayAnimation 没生效时下一轮还会重试。
+    local anim_hash = pa.GetCurrentAnimationHash and pa:GetCurrentAnimationHash() or nil
+    if anim_hash ~= nil then
+        local sa_hash = sa.GetCurrentAnimationHash and sa:GetCurrentAnimationHash() or nil
+        if sa_hash ~= anim_hash then
+            pcall(sa.PlayAnimation, sa, anim_hash, true)
             shadow._last_anim = anim_hash
+            shadow._last_anim_hash = anim_hash
+            shadow._last_anim_name = nil
             shadow._last_frame = nil
         end
-        if anim_hash ~= nil then
-            shadow._last_anim_hash = anim_hash
-        end
-    elseif anim_hash and anim_hash ~= shadow._last_anim then
-        pcall(sa.PlayAnimation, sa, anim_hash, true)
-        shadow._last_anim = anim_hash
-        shadow._last_anim_name = nil
-        shadow._last_frame = nil
-        shadow._last_anim_hash = anim_hash
     end
-        CopyFrame(pa, sa, shadow, shadow._is_mover == true)
+    CopyFrame(pa, sa, shadow, shadow._is_mover == true)
     end
 
 local function ParentHidden(ent)
     if not ent:IsValid() then return true end
     if ent:HasTag("INLIMBO") then return true end
     if ent.IsInLimbo and ent:IsInLimbo() then return true end
-    local ok, vis = pcall(function()
-        return ent.entity:IsVisible()
-    end)
+    -- 直接 pcall(f, e)：旧写法 pcall(function() ... end) 每次调用都新建一个
+    -- 闭包，逐帧 × 几百个影子 = 持续 GC 压力（卡顿来源之一）。传函数+参数
+    -- 不分配闭包，行为一致。
+    local e = ent.entity
+    local f = e ~= nil and e.IsVisible or nil
+    if f == nil then return false end
+    local ok, vis = pcall(f, e)
     return ok and vis == false
 end
 
@@ -569,20 +924,33 @@ local function ApplyPose(shadow, ent, scale_y, rot, r, g, b, a, follow)
             shadow.Transform:SetPosition(0, 0.002, 0)
         end
     end
-    shadow.Transform:SetScale(hs, scale_y * hf * hs, hs)
-    if rot ~= shadow._last_rot then
+
+    -- 量化姿态输入（性能）：太阳约 1.2 度/秒，逐帧对微小增量刷 SetScale/
+    -- SetRotation/SetMultColour 是纯引擎调用浪费（几百个影子 × 每帧 3 次）。
+    -- 1/8 度、约 0.8% 缩放、1/64 透明度的台阶肉眼不可察，却能砍掉数倍调用。
+    local rotq = math.floor(rot * 8.0 + 0.5)
+    local syq  = math.floor(scale_y * hf * hs * 128.0 + 0.5)
+    local aq   = math.floor(a * 64.0 + 0.5)
+    local rq   = math.floor(r * 64.0 + 0.5)
+
+    if syq ~= shadow._last_syq then
+        shadow._last_syq = syq
+        shadow.Transform:SetScale(hs, scale_y * hf * hs, hs)
+    end
+    if rotq ~= shadow._last_rotq then
+        shadow._last_rotq = rotq
         shadow.Transform:SetRotation(rot)
     end
-    if a <= 0.01 then
+    if aq <= 0 then
         if shadow._last_a ~= 0 then
             shadow._last_a = 0
+            shadow._last_aq = 0
             sa:SetMultColour(0, 0, 0, 0)
         end
         return
     end
-    if scale_y ~= shadow._last_sy or rot ~= shadow._last_rot
-        or a ~= shadow._last_a or r ~= shadow._last_r then
-        shadow._last_sy, shadow._last_rot = scale_y, rot
+    if aq ~= shadow._last_aq or rq ~= shadow._last_rq then
+        shadow._last_aq, shadow._last_rq = aq, rq
         shadow._last_a, shadow._last_r = a, r
         sa:SetMultColour(r, g, b, a)
     end
@@ -630,11 +998,14 @@ local function BindShadowListeners(ent)
             return
         end
         sh:Show()
+        -- 事件驱动的强制重同步：清装备扫描节流计数，5 帧内立刻全量重涂
+        sh._equip_counter = 0
         CopyAnim(ent.AnimState, sh.AnimState, sh, true, ent)
         ent:DoTaskInTime(0, function()
             if ent:IsValid() then
                 local sh2 = ent._bcas_shadow
                 if sh2 ~= nil and sh2:IsValid() then
+                    sh2._equip_counter = 0
                     CopyAnim(ent.AnimState, sh2.AnimState, sh2, true, ent)
                 end
             end
@@ -654,9 +1025,15 @@ local function BindShadowListeners(ent)
         -- Equipment / skin changes: force a full re-mirror (SetBuild wipes
         -- overrides, so the splat must re-apply swap symbols after any
         -- wardrobe/equip change; unequip must clear the old swap).
-        ent:ListenForEvent("equip", sync_now)
-        ent:ListenForEvent("unequip", sync_now)
-        ent:ListenForEvent("ms_playerchangeclothing", sync_now)
+        -- _diag_next：只对装备类事件开一轮探针（临时诊断，发布前移除）。
+        local function sync_now_diag()
+            local sh = ent._bcas_shadow
+            if sh ~= nil and sh:IsValid() then sh._diag_next = true end
+            sync_now()
+        end
+        ent:ListenForEvent("equip", sync_now_diag)
+        ent:ListenForEvent("unequip", sync_now_diag)
+        ent:ListenForEvent("ms_playerchangeclothing", sync_now_diag)
         ent:ListenForEvent("skinmaxchanged", sync_now)
     end
 
@@ -732,6 +1109,7 @@ function SunSystem.AttachShadowToEntity(ent)
     shadow._isshadow = true
     shadow._is_player = is_player
     shadow._is_mover = is_mover
+    shadow._prefab = ent.prefab
     local prefab = ent.prefab or ""
     shadow._is_birch = ent:HasTag("deciduoustree") or ent:HasTag("birchnut")
         or (type(prefab) == "string" and string.find(prefab, "deciduous", 1, true) ~= nil)
@@ -845,6 +1223,13 @@ end
 
 local SHAFT_COUNT = 3
 
+-- GROUND ids (constants.lua): ROAD=2, SAVANNA=5, GRASS=6, DESERT_DIRT=31.
+-- These palettes sit near-white under sun; shaft Light + patch stack on
+-- them clipped to pure white (user report). Halve the shaft on these only.
+local BRIGHT_GROUND_TILES = {
+    [2] = true, [5] = true, [6] = true, [31] = true,
+}
+
 local function SunDirXZ()
     local scale_y, rot = GetSunParams()
     local rad = (rot + 180) * DEGREES
@@ -926,6 +1311,8 @@ end
 
 local function ApplyShaftVisual(e, vis, rot)
     e._vis = vis
+    -- 亮地块压制系数更严格：防止浅色麦田/草地/白地块反光过曝
+    local damp = e._bright_tile and 0.30 or 0.65
     if vis <= 0.01 then
         e:Hide()
         e.Light:Enable(false)
@@ -934,9 +1321,12 @@ local function ApplyShaftVisual(e, vis, rot)
     end
     e:Show()
     e.Transform:SetRotation(rot or 0)
-    e.AnimState:SetMultColour(1.0, 0.94, 0.84, 0.55 * vis)
-    e.Light:SetIntensity(0.38 * vis)
-    e.Light:SetRadius(4 + 6 * vis)
+    -- 光柱本身整体降低透明度（0.45 -> 0.28），颜色加深为温暖琥珀金，拒绝惨白！
+    e.AnimState:SetMultColour(1.05, 0.90, 0.70, 0.28 * vis * damp)
+    -- 额外附加点光源亮度大幅下调（0.30 -> 0.15），彻底消除和本体光晕“左脚踩右脚”的过度叠加！
+    e.Light:SetIntensity(0.15 * vis * damp)
+    e.Light:SetColour(255 / 255, 220 / 255, 160 / 255) -- 纯粹柔和暖金光
+    e.Light:SetRadius(3 + 4 * vis)
     e.Light:Enable(true)
 end
 
@@ -976,6 +1366,17 @@ local function UpdateShafts(dt)
                     if tx ~= nil then
                         e._tx, e._tz = tx, tz
                         e.Transform:SetPosition(tx, 0, tz)
+                        -- Bright-tile probe at spawn (Map:GetTileAtPoint):
+                        -- savanna/grass/road/desert read as bright palettes
+                        -- and clip under the patch + Light stack.
+                        local map = W.Map
+                        e._bright_tile = false
+                        if map ~= nil and map.GetTileAtPoint ~= nil then
+                            local ok, tile = pcall(map.GetTileAtPoint, map, tx, 0, tz)
+                            if ok and tile ~= nil and BRIGHT_GROUND_TILES[tile] then
+                                e._bright_tile = true
+                            end
+                        end
                         ShowRandomRays(e)
                         e._phase = "in"
                         e._life = 0
@@ -996,7 +1397,8 @@ local function UpdateShafts(dt)
                     e._life = 0
                 end
             elseif phase == "hold" then
-                local vis = (0.82 + 0.18 * math.sin(e._life * 0.55 + i)) * math.min(1, amount)
+                -- 彻底关闭太阳光柱的呼吸晃动！锁定恒定沉稳光照，杜绝忽明忽暗像呼吸灯！
+                local vis = math.min(1, amount)
                 if e._tx then
                     e.Transform:SetPosition(e._tx, 0, e._tz)
                 end
@@ -1124,13 +1526,24 @@ local function StartGlobalScheduler()
                                 end
                             end
                         end
-                        CopyAnim(ent.AnimState, shadow.AnimState, shadow, false, ent)
+                        -- 远处群体按 mover_budget 节流 CopyAnim（引擎读回贵）：
+                        -- 近处与玩家逐帧；拥挤时（mover_budget=2/4）远的每
+                        -- 2/4 帧一次。姿态仍逐帧（ApplyPose 已量化）、位置
+                        -- 跟随不停，视觉无差。
+                        local is_far = (not shadow._is_player) and dist_sq > NEAR_SQ
+                        if (not is_far)
+                            or ((tick + (shadow._budget_offset or 0)) % mover_budget == 0) then
+                            CopyAnim(ent.AnimState, shadow.AnimState, shadow, false, ent)
+                        end
 
                         ApplyPose(shadow, ent, scale_y, rot, r, g, b, a, true)
                     end
                 end
             else
                 dynamic_shadows[shadow] = nil
+                -- 父实体已失效（被移除/换 prefab）：影子实体一并销毁，
+                -- 否则残留一具"砍了还在"的鬼影。
+                if shadow:IsValid() then shadow:Remove() end
             end
         end
 
@@ -1203,21 +1616,26 @@ local function StartGlobalScheduler()
                         -- clip-only check would strand the splat on the old
                         -- stage); the 1.5s anti-flap gate inside CopyAnim
                         -- caps the old stage-flicker failure mode.
-                        if ent:HasTag("tree") then
-                            local pa = ent.AnimState
-                            local clip_changed = shadow._last_anim_name ~= nil
-                                and pa.IsCurrentAnimation ~= nil
-                                and not pa:IsCurrentAnimation(shadow._last_anim_name)
-                            local build_changed = pa.GetBuild ~= nil
-                                and pa:GetBuild() ~= shadow._last_build
-                            if clip_changed or build_changed then
-                                CopyAnim(pa, shadow.AnimState, shadow, false, ent)
-                            elseif shadow._last_anim_name ~= nil
-                                and (static_tick + shadow._budget_offset) % 8 == 0 then
-                                -- Gentle 4s drift re-lock (single SetFrame,
-                                -- no replay): corrects post-sleep drift.
-                                CopyFrame(pa, shadow.AnimState, shadow, false)
-                            end
+                        -- 复发检测对所有静态影子（不只树）：草/树枝/浆果被
+                        -- 采集→枯萎→再生 会换 clip（picked/withered 不在 mover
+                        -- 表里，靠 CopyAnim 的 hash 回放分支镜像）或换 build；
+                        -- 树也会换阶段 build。只比 hash/build（廉价），变了才
+                        -- CopyAnim。此前只有 tree 分支做这件事，所以植物被采后
+                        -- 影子永远停在枝繁叶茂态（历史遗留 bug）。
+                        local pa = ent.AnimState
+                        local sa2 = shadow.AnimState
+                        -- 自纠正：直接比"影子当前动画哈希"与"源当前动画哈希"
+                        -- （不再依赖缓存字段，PlayAnimation 没生效时下一轮自动重试）
+                        local hash_diff = pa.GetCurrentAnimationHash ~= nil
+                            and sa2.GetCurrentAnimationHash ~= nil
+                            and pa:GetCurrentAnimationHash() ~= sa2:GetCurrentAnimationHash()
+                        local build_changed = pa.GetBuild ~= nil
+                            and pa:GetBuild() ~= shadow._last_build
+                        if hash_diff or build_changed then
+                            CopyAnim(pa, sa2, shadow, false, ent)
+                        elseif (static_tick + shadow._budget_offset) % 8 == 0 then
+                            -- Gentle 4s drift re-lock (single SetFrame, no replay)
+                            CopyFrame(pa, sa2, shadow, false)
                         end
                         if shadow._is_birch
                             and (static_tick + shadow._budget_offset) % 16 == 0 then
@@ -1227,6 +1645,8 @@ local function StartGlobalScheduler()
                 end
             else
                 static_shadows[shadow] = nil
+                -- 同上：砍掉的树/被铲植物，父实体没了就销毁影子实体
+                if shadow:IsValid() then shadow:Remove() end
             end
         end
         for i = roster_n + 1, #static_roster do

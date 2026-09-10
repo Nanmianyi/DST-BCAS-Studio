@@ -21,18 +21,29 @@ Assets = {
     Asset("SHADER", "shaders/bcas_studio.ksh"),
     Asset("SHADER", "shaders/bcas_cinema.ksh"),
     Asset("SHADER", "shaders/bcas_glow.ksh"),
-    Asset("SHADER", "shaders/bcas_kawase_pre.ksh"),
-    Asset("SHADER", "shaders/bcas_kawase2.ksh"),
-    Asset("SHADER", "shaders/bcas_kawase4.ksh"),
-    Asset("SHADER", "shaders/bcas_kawase8.ksh"),
+    Asset("SHADER", "shaders/bcas_bloom_pre.ksh"),
+    Asset("SHADER", "shaders/bcas_bloom_d1.ksh"),
+    Asset("SHADER", "shaders/bcas_bloom_d2.ksh"),
+    Asset("SHADER", "shaders/bcas_bloom_d3.ksh"),
     Asset("ANIM", "anim/lightrays.zip"),
     Asset("ANIM", "anim/wilson_shad.zip"),
     Asset("ANIM", "anim/wilsonbeefalo_shad.zip"),
+    -- 海面波光层：跟随摄像机的贴地 quad，程序化法线 + 太阳镜面高光
+    -- （见 scripts/bcas_glint.lua / src_shaders/bcas_glint.ps）
+    Asset("ANIM", "anim/pbr_water.zip"),
+    Asset("SHADER", "shaders/bcas_glint.ksh"),
 }
 
 local State = require "bcas_state"
 local SunSystem = require "bcas_sun_emitter"
 local OceanLook = require "bcas_ocean"
+local Glint = require "bcas_glint"
+
+-- 海面波光（水面 caustics 高光层；不动原版海洋渲染，可独立开关）
+local GLINT_LEVELS = { soft = 0.6, standard = 1.0, bright = 1.6 }
+Glint.Apply(AddPrefabPostInit,
+    GetModConfigData("OCEANGLINT") == "on",
+    GLINT_LEVELS[GetModConfigData("OCEANGLINT_LEVEL") or "standard"] or 1.0)
 
 local ENABLE_LIGHTING = GetModConfigData("LIGHTING") ~= "off"
 State.LightingHardOff = not ENABLE_LIGHTING
@@ -41,6 +52,15 @@ if not ENABLE_LIGHTING then
 end
 
 State.boot_preset = GetModConfigData("PRESET") or "standard"
+-- MERGED_PASS 探针（4096 上限实验）：仅在配置为 on 时把 6.5KB 源码的
+-- bcas_merged.ksh 插进资产表 —— Asset 声明即加载，引擎读 ksh 源码用定长
+-- 缓冲，超限直接炸，与链路是否注册无关，所以默认必须不声明。
+State.merged_pass = GetModConfigData("MERGED_PASS") == "on"
+if State.merged_pass then
+    -- 内置默认：调色+锐化+辉光合并为单个全分辨率 pass（架构优化，2 -> 1）。
+    -- 引擎实测喂给编译器的是完整源码（历史 ~4096 限制为误判），7.5KB 可跑。
+    table.insert(Assets, Asset("SHADER", "shaders/bcas_merged_glow.ksh"))
+end
 -- Ocean TILE colours + TUNING.OCEAN_SHADER must be patched before the
 -- world is generated (gamelogic reads them once). HUD init is too late.
 OceanLook.Apply(true)
@@ -110,6 +130,11 @@ if ENABLE_HDFONT then
         TheSim:LoadFont(MODROOT_ .. "fonts/normal.zip", "normalfont")
         TheSim:LoadFont(MODROOT_ .. "fonts/normal_outline.zip", "normalfont_outline")
 
+        -- v3.8.1 字体定版：fonts/normal.zip、normal_outline.zip = 工坊
+        -- 1418746242（Chinese++）的 zip 原样照搬（fnt+tex 成对，多年实机
+        -- 验证零毛病）。此前自铸字模太细淡，自研"增强+小字模"路线两轮
+        -- 都引入游戏内乱码（对第三方 tex 的块排布理解有盲区，解码-回写
+        -- 不安全），整体弃用——只搬不修，接线模式与 CN++ 完全一致。
         -- 与原 mod 相同的字重分配：outline 系走描边字体，正文/按钮走普通字体
         GLOBAL.DEFAULTFONT = "normalfont_outline"
         GLOBAL.DIALOGFONT = "normalfont_outline"
@@ -126,7 +151,7 @@ if ENABLE_HDFONT then
         GLOBAL.TALKINGFONT_WORMWOOD = "normalfont_outline"
         GLOBAL.CHATFONT = "normalfont"
         GLOBAL.HEADERFONT = "normalfont"
-        GLOBAL.CHATFONT_OUTLINE = "normalfont"
+        GLOBAL.CHATFONT_OUTLINE = "normalfont_outline"
         -- v3.6.3：补齐此前遗漏的四个字体常量——NUMBERFONT/SMALLNUMBERFONT
         -- 是设置页、加载页数字与标签的主力字体（原版 stint-ucr 50px 字模
         -- 拉伸必糊，中文再 fallback 到低清字体雪上加霜），正是用户反馈的
@@ -141,6 +166,12 @@ if ENABLE_HDFONT then
         -- 必须 rawset 绕过 __newindex；读取方 bcas_screen 用 rawget(_G, ...) 对应。
         GLOBAL.rawset(GLOBAL, "BCAS_FONT_CLEAN", "normalfont")
     end
+
+    -- ⚠ 字体历史（2026-09-09/10）：自铸字模细淡 → 自研"增强+42px 小字模"
+    -- 两轮都在游戏内乱码，全部弃用。加载页小字（CHATFONT_OUTLINE@25/
+    -- HEADERFONT@35）曾想用 AddClassPostConstruct 换回原版字体修模糊，也
+    -- 两炸黑屏（构造沙箱环境连 GetFont/pcall 都不可见）。最终定版 = 整包
+    -- 照搬工坊 1418746242 的字体 zip（上方 ApplyHDFonts），只搬不修。
 
     -- fallback 链（DEFAULT_FALLBACK_TABLE）引用的 fallback_font / controllers /
     -- emoji 等字体由引擎在 GlobalInit→LoadFonts() 里加载，时机晚于 modmain。
@@ -347,7 +378,8 @@ AddClassPostConstruct("screens/playerhud", function(self)
                 State.handles.BCAS_ATMO, v[1], v[2], t % 64, v[4])
         end
         if State.handles.BCAS_GLOW2 ~= nil then
-            State.flicker = 1.0 + 0.05 * math.sin(t * 1.3) + 0.03 * math.sin(t * 2.9 + 1.7)
+            -- 彻底关闭呼吸灯正弦晃动！省去计算，光照保持绝对沉稳舒适不闪烁！
+            State.flicker = 1.0
             local v = State.PackUniform("BCAS_GLOW2")
             PP:SetUniformVariable(
                 State.handles.BCAS_GLOW2, v[1], v[2], v[3], v[4])

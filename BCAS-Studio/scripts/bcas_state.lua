@@ -23,8 +23,12 @@ uniform 数量无 4 个限制（pxl_42 实测绑了 9 个，之前的断言是�
 local State = {
     effect_id = nil,      -- studio（锐化）
     effect2_id = nil,     -- cinema（调色）
-    glow_id = nil,        -- glow A（辉光合成：核心+中环）
+    glow_id = nil,        -- 辉光合成/金字塔挂载的目标 effect
     glow2_id = nil,       -- 已废弃：v3 单合成 pass（保留字段兼容存档诊断）
+    merged_has_glow = false, -- merged 单 pass 是否已含辉光合成（bcas_merged_glow）
+    glow_folded = false,  -- 辉光是否折叠进主 pass（true 时 glow_id == effect_id）
+    merged_pass = false,  -- 实验开关：调色+锐化合并单 pass（MERGED_PASS modinfo）
+    merged_id = nil,      -- 合并 pass 效果 id（实验成功时替代 cinema+studio）
     glow_samplers = nil,  -- 辉光金字塔 4 级 SamplerEffect id（诊断用）
     flicker = 1.0,        -- 光晕呼吸标量（Lua 8Hz 计算，BCAS_GLOW2.w）
     sun_u = 0.22,         -- 太阳屏幕 UV.x（cinema/glow 共用 BCAS_EXTRA.z）
@@ -59,13 +63,13 @@ local SAVE_FILE = "bcas_studio"
 -- uniform = nil 的参数不下发着色器（如 ColourCubeOn，走引擎开关）
 local VEC = {
     -- == 锐化核心 (studio / BCAS_SHARPEN) ==
-    Strength    = {uniform = "BCAS_SHARPEN", comp = 1, min = 0,    max = 8,    default = 5.0},
-    NoiseReduce = {uniform = "BCAS_SHARPEN", comp = 2, min = 0,    max = 1,    default = 0.6},
-    AntiRinging = {uniform = "BCAS_SHARPEN", comp = 3, min = 0,    max = 1,    default = 0.6},
+    Strength    = {uniform = "BCAS_SHARPEN", comp = 1, min = 0,    max = 8,    default = 7.8},
+    NoiseReduce = {uniform = "BCAS_SHARPEN", comp = 2, min = 0,    max = 1,    default = 0.67},
+    AntiRinging = {uniform = "BCAS_SHARPEN", comp = 3, min = 0,    max = 1,    default = 0.89},
     DarkProtect = {uniform = "BCAS_SHARPEN", comp = 4, min = 0,    max = 1,    default = 0.25},
 
     -- == 逆卷积墨线收敛 (studio / BCAS_DECONV) ==
-    DeconvStrength = {uniform = "BCAS_DECONV", comp = 1, min = 0,    max = 2.0,  default = 0.85},
+    DeconvStrength = {uniform = "BCAS_DECONV", comp = 1, min = 0,    max = 2.0,  default = 1.89},
     DeconvGate     = {uniform = "BCAS_DECONV", comp = 2, min = 0.01, max = 0.08, default = 0.025},
     DeconvPenetr   = {uniform = "BCAS_DECONV", comp = 3, min = 0,    max = 1.0,  default = 0.80},
 
@@ -73,24 +77,24 @@ local VEC = {
     RangeSigma   = {uniform = "BCAS_SHARP2", comp = 1, min = 0.01, max = 2,    default = 0.26},
     SpatialSigma = {uniform = "BCAS_SHARP2", comp = 2, min = 0,    max = 4,    default = 1.10},
     CenterWeight = {uniform = "BCAS_SHARP2", comp = 3, min = 0,    max = 4,    default = 1.0},
-    NoiseFloor   = {uniform = "BCAS_SHARP2", comp = 4, min = 0,    max = 0.05, default = 0.008},
+    NoiseFloor   = {uniform = "BCAS_SHARP2", comp = 4, min = 0,    max = 0.05, default = 0.01},
 
     -- == AURA 抗过冲 (studio / BCAS_AURA) ==
-    AR_Threshold  = {uniform = "BCAS_AURA", comp = 1, min = 0,     max = 0.02, default = 0.0015},
-    AR_L_Overshoot= {uniform = "BCAS_AURA", comp = 2, min = 0.001, max = 0.1,  default = 0.003},
-    AR_D_Overshoot= {uniform = "BCAS_AURA", comp = 3, min = 0.001, max = 0.1,  default = 0.009},
-    ChromaProtect = {uniform = "BCAS_AURA", comp = 4, min = 0,     max = 1,    default = 0.65},
+    AR_Threshold  = {uniform = "BCAS_AURA", comp = 1, min = 0,     max = 0.02, default = 0.0},
+    AR_L_Overshoot= {uniform = "BCAS_AURA", comp = 2, min = 0.001, max = 0.1,  default = 0.001},
+    AR_D_Overshoot= {uniform = "BCAS_AURA", comp = 3, min = 0.001, max = 0.1,  default = 0.001},
+    ChromaProtect = {uniform = "BCAS_AURA", comp = 4, min = 0,     max = 1,    default = 1.0},
 
     -- == 色彩基础 (cinema / BCAS_GRADE_A/B/EXTRA) ==
     ExposureEV  = {uniform = "BCAS_GRADE_A", comp = 1, min = -2,   max = 2,    default = 0.06},
-    Temp        = {uniform = "BCAS_GRADE_A", comp = 2, min = -1,   max = 1,    default = 0.305},
-    Tint        = {uniform = "BCAS_GRADE_A", comp = 3, min = -1,   max = 1,    default = -0.089},
+    Temp        = {uniform = "BCAS_GRADE_A", comp = 2, min = -1,   max = 1,    default = 0.40},
+    Tint        = {uniform = "BCAS_GRADE_A", comp = 3, min = -1,   max = 1,    default = -0.11},
     Saturation  = {uniform = "BCAS_GRADE_A", comp = 4, min = 0,    max = 2,    default = 0.988},
-    Vibrance    = {uniform = "BCAS_GRADE_B", comp = 1, min = -1,   max = 1,    default = 0.143},
-    Contrast    = {uniform = "BCAS_GRADE_B", comp = 2, min = -0.5, max = 1,    default = 0},
+    Vibrance    = {uniform = "BCAS_GRADE_B", comp = 1, min = -1,   max = 1,    default = 0.27},
+    Contrast    = {uniform = "BCAS_GRADE_B", comp = 2, min = -0.5, max = 1,    default = 0.03},
     Lightness   = {uniform = "BCAS_GRADE_B", comp = 3, min = -0.3, max = 0.3,  default = 0},
     Gamma       = {uniform = "BCAS_GRADE_B", comp = 4, min = 0.5,  max = 2,    default = 1.0},
-    Filmic      = {uniform = "BCAS_EXTRA",   comp = 1, min = 0,    max = 1,    default = 0.311},
+    Filmic      = {uniform = "BCAS_EXTRA",   comp = 1, min = 0,    max = 1,    default = 0.32},
     SunFill     = {uniform = "BCAS_EXTRA",   comp = 2, min = 0,    max = 1,    default = 0.75},
 
     -- == 氛围 (studio / BCAS_ATMO) ==
@@ -106,7 +110,7 @@ local VEC = {
     OffsetR  = {uniform = "BCAS_CDL_O", comp = 1, min = -1,  max = 1, default = 0},
     OffsetG  = {uniform = "BCAS_CDL_O", comp = 2, min = -1,  max = 1, default = 0},
     OffsetB  = {uniform = "BCAS_CDL_O", comp = 3, min = -1,  max = 1, default = 0},
-    HL_Desat = {uniform = "BCAS_CDL_O", comp = 4, min = 0,   max = 1, default = 0},
+    HL_Desat = {uniform = "BCAS_CDL_O", comp = 4, min = 0,   max = 1, default = 0.41},
     PowerR   = {uniform = "BCAS_CDL_P", comp = 1, min = 0.1, max = 4, default = 1.0},
     PowerG   = {uniform = "BCAS_CDL_P", comp = 2, min = 0.1, max = 4, default = 1.0},
     PowerB   = {uniform = "BCAS_CDL_P", comp = 3, min = 0.1, max = 4, default = 1.0},
@@ -118,7 +122,7 @@ local VEC = {
     SecOffsetR = {uniform = "BCAS_SEC_O", comp = 1, min = -1,  max = 1, default = 0},
     SecOffsetG = {uniform = "BCAS_SEC_O", comp = 2, min = -1,  max = 1, default = 0},
     SecOffsetB = {uniform = "BCAS_SEC_O", comp = 3, min = -1,  max = 1, default = 0},
-    OriginalMix= {uniform = "BCAS_SEC_O", comp = 4, min = 0,   max = 1, default = 0.05},
+    OriginalMix= {uniform = "BCAS_SEC_O", comp = 4, min = 0,   max = 1, default = 0.10},
     SecPowerR  = {uniform = "BCAS_SEC_P", comp = 1, min = 0.1, max = 4, default = 1.0},
     SecPowerG  = {uniform = "BCAS_SEC_P", comp = 2, min = 0.1, max = 4, default = 1.0},
     SecPowerB  = {uniform = "BCAS_SEC_P", comp = 3, min = 0.1, max = 4, default = 1.0},
@@ -130,13 +134,13 @@ local VEC = {
     -- 按长尾权重叠加，B 合成收尾做暖色偏移 + Reinhard 高光压缩。
     -- 发布默认（楠眠已实机调校 2026-09）：强度拉满 4.0 + 阈值几乎不过滤
     -- （0.04）+ 全暖全饱和 + 关闭高光压缩 = 又亮又暖的柔光。
-    GlowIntensity = {uniform = "BCAS_GLOW",  comp = 1, min = 0, max = 4,   default = 4.0},
+    GlowIntensity = {uniform = "BCAS_GLOW",  comp = 1, min = 0, max = 4,   default = 1.20},
     GlowThreshold = {uniform = "BCAS_GLOW",  comp = 2, min = 0, max = 1,   default = 0.04},
-    GlowKnee      = {uniform = "BCAS_GLOW",  comp = 3, min = 0.05, max = 1, default = 1.0},
-    GlowWarmth    = {uniform = "BCAS_GLOW",  comp = 4, min = -1, max = 1, default = 1.0},
-    GlowSpread    = {uniform = "BCAS_GLOW2", comp = 1, min = 0, max = 1, default = 0.85},
+    GlowKnee      = {uniform = "BCAS_GLOW",  comp = 3, min = 0.05, max = 1, default = 1.00},
+    GlowWarmth    = {uniform = "BCAS_GLOW",  comp = 4, min = -1, max = 1, default = 1.00},
+    GlowSpread    = {uniform = "BCAS_GLOW2", comp = 1, min = 0, max = 1, default = 1.00},
     GlowSat       = {uniform = "BCAS_GLOW2", comp = 2, min = 0, max = 1, default = 1.0},
-    GlowCompress  = {uniform = "BCAS_GLOW2", comp = 3, min = 0, max = 0.5, default = 0.0},
+    GlowCompress  = {uniform = "BCAS_GLOW2", comp = 3, min = 0, max = 0.5, default = 0.03},
 
     -- == 引擎开关（不占 uniform）==
     -- 昼夜滤镜：预设不接管（见 PRESET_NEUTRAL），R 回归 = 原版开
@@ -145,16 +149,16 @@ local VEC = {
 
     -- == 原版滤镜接管（滤镜RR 3115280970 移植，引擎开关型，不占 uniform）==
     -- 低SAN保色：低精神值不再黑白化（只压精神色块通道混合，不碰环境色块）
-    SanityColourOn = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
+    SanityColourOn = {uniform = nil, comp = 0, min = 0, max = 1, default = 0},
     -- 失真消除：关掉精神值屏幕晃动（DISTORTION_FACTOR=1 = shader 里取原图）
     DistortFree    = {uniform = nil, comp = 0, min = 0, max = 1, default = 0},
     -- 积雪上限：0=无雪（RR 默认）0.6=有点积雪 3=原版，中间值自由截断
-    SnowCap        = {uniform = nil, comp = 0, min = 0, max = 3, default = 0},
+    SnowCap        = {uniform = nil, comp = 0, min = 0, max = 3, default = 0.64},
     -- 过滤风沙：藏起沙尘暴全屏遮罩（含沙尘层）
     SandFilter     = {uniform = nil, comp = 0, min = 0, max = 1, default = 0},
     -- 官方调色强度：复用官方季节/昼夜 LUT 调教，只缩放混合强度
     -- （0=完全原色 ~ 1=官方原版，包装器按此缩放 SetColourCubeLerp(0,·)）
-    VanillaGrade   = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
+    VanillaGrade   = {uniform = nil, comp = 0, min = 0, max = 1, default = 0.73},
 
     -- == 光影科学 v3.2（BCAS_GLOW3，glow 合成 pass）==
     -- 光晕长尾：光晕最外层四阶抬升，辉光向夜空长尾消散而非数码截断
@@ -162,7 +166,7 @@ local VEC = {
     -- 光包裹：暖光晕按暗部掩码沁入阴影（空气散射，软化光圈硬边）
     LightWrap  = {uniform = "BCAS_GLOW3", comp = 2, min = 0, max = 1,   default = 1.0},
     -- 轮廓光：光照附近的几何边缘勾 1-2px 暖亮边（halo 门控，远处不勾）
-    GlowRim    = {uniform = "BCAS_GLOW3", comp = 3, min = 0, max = 1,   default = 0.20},
+    GlowRim    = {uniform = "BCAS_GLOW3", comp = 3, min = 0, max = 1,   default = 0.05},
     -- 空气光束：沿太阳方向拉辉光层，形成空气里的斜向光柱
     GodRays    = {uniform = "BCAS_GLOW3", comp = 4, min = 0, max = 2.0, default = 1.0},
 
@@ -170,6 +174,19 @@ local VEC = {
     ShadowsOn  = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
     OceanOn    = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
     LightingMaster = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
+
+    -- == 海面波光 (bcas_glint；非后处理参数，uniform 字段仅作面板标记，
+    --    实际由 bcas_glint 每帧读取并 SetFloatParams/SetOceanBlendParams/
+    --    SetMultColour 下发；程序化 caustics 光网 + 离岸深度过渡) ==
+    GlintOn       = {uniform = "GLINT", comp = 0, min = 0,    max = 1,     default = 1},
+    -- 强度：叠加层不透明度/亮度，<1 时金色波光半透明能透出底下水色
+    GlintStrength = {uniform = "GLINT", comp = 1, min = 0,    max = 2,     default = 0.33},
+    -- 增益：caustics 光网亮度（0.93 = 原模组 *10 的精确值）
+    GlintDensity  = {uniform = "GLINT", comp = 2, min = 0.80, max = 0.998, default = 0.99},
+    -- 颗粒：caustics 频率倍率，越大光网越细碎
+    GlintGrain    = {uniform = "GLINT", comp = 3, min = 0.4,  max = 2.5,   default = 0.74},
+    -- 海色融合：把金色与原版海水颜色混合的量，越大越像真实水下沙地
+    GlintSoft     = {uniform = "GLINT", comp = 4, min = 0,    max = 1,     default = 1.0},
 }
 State.VEC = VEC
 
@@ -183,7 +200,23 @@ local EFFECT_UNIFORMS = {
         "BCAS_SEC_S", "BCAS_SEC_O", "BCAS_SEC_P",
     },
     studio = {"BCAS_SHARPEN", "BCAS_SHARP2", "BCAS_AURA", "BCAS_ATMO", "BCAS_DECONV"},
-    glow = {"BCAS_GLOW", "BCAS_GLOW2", "BCAS_GLOW3", "BCAS_ATMO", "BCAS_EXTRA", "SCREEN_PARAMS"},
+    merged = {
+        "BCAS_SHARPEN", "BCAS_SHARP2", "BCAS_AURA", "BCAS_ATMO", "BCAS_DECONV",
+        "BCAS_GRADE_A", "BCAS_GRADE_B", "BCAS_EXTRA",
+        "BCAS_CDL_S", "BCAS_CDL_O", "BCAS_CDL_P",
+        "BCAS_SEC_S", "BCAS_SEC_O", "BCAS_SEC_P",
+        -- SCREEN_PARAMS 不绑（同 studio）：引擎对这一魔法名自动按 RT 填充；
+        -- Lua 侧 AddUniformVariable 再绑一层会每帧被 ApplyAll 覆写成 0。
+    },
+    -- 折叠 pass（grade+sharpen+bloom 单 pass）：条目顺序必须与 ksh 一致
+    merged_glow = {
+        "BCAS_SHARPEN", "BCAS_SHARP2", "BCAS_AURA", "BCAS_ATMO", "BCAS_DECONV",
+        "BCAS_GRADE_A", "BCAS_GRADE_B", "BCAS_EXTRA",
+        "BCAS_CDL_S", "BCAS_CDL_O", "BCAS_CDL_P",
+        "BCAS_SEC_S", "BCAS_SEC_O", "BCAS_SEC_P",
+        "BCAS_GLOW", "BCAS_GLOW2", "BCAS_GLOW3",
+    },
+    glow = {"BCAS_GLOW", "BCAS_GLOW2", "BCAS_GLOW3", "BCAS_EXTRA", "SCREEN_PARAMS"},
 }
 
 -- 白平衡 RGB 增益（调色窗虚拟旋钮）：不占 uniform，数学映射到 Temp/Tint。
@@ -195,78 +228,82 @@ function State.GainToTempTint(r, g, b)
 end
 
 local PRESETS = {
-    -- 作者特调（楠眠已实机调校 2026-09-06 定版，七页逐项截图基准）
+    -- 作者特调（楠眠实机调校 2026-09-11 定版，按面板逐页截图基准）
     standard = {
-        ShadowsOn = 1, OceanOn = 1,
+        ShadowsOn = 1, OceanOn = 1, LightingMaster = 1,
         -- 01 锐化
-        Strength = 6.30, DeconvStrength = 0.85, NoiseReduce = 0.60, AntiRinging = 0.60, DarkProtect = 0.05,
+        Strength = 7.80, DeconvStrength = 1.89, NoiseReduce = 0.67, AntiRinging = 0.89, DarkProtect = 0.25,
         DeconvGate = 0.025, DeconvPenetr = 0.80,
         -- 02 进阶
         RangeSigma = 0.26, SpatialSigma = 1.10, CenterWeight = 1.0, NoiseFloor = 0.01,
-        AR_Threshold = 0.0, AR_L_Overshoot = 0.01, AR_D_Overshoot = 0.01, ChromaProtect = 0.39,
-        -- 03 色彩（白平衡轮 #FFF3EA = Temp 0.305 / Tint -0.089）
-        ExposureEV = 0.06, Temp = 0.305, Tint = -0.089, Saturation = 0.99,
-        Vibrance = 0.14, Contrast = 0.01, Lightness = 0, Gamma = 1.0,
-        Filmic = 0.31, HL_Desat = 0.10, OriginalMix = 0.05,
+        AR_Threshold = 0.0, AR_L_Overshoot = 0.0, AR_D_Overshoot = 0.0, ChromaProtect = 1.0,
+        -- 03 色彩（白平衡轮 #FFEFE4 = Temp 0.40 / Tint -0.11）
+        ExposureEV = 0.06, Temp = 0.40, Tint = -0.11, Saturation = 0.99,
+        Vibrance = 0.27, Contrast = 0.03, Lightness = 0, Gamma = 1.0,
+        Filmic = 0.32, HL_Desat = 0.41, OriginalMix = 0.10,
         -- 04 调色 CDL 一级
         SlopeR = 0.94, SlopeG = 1.0, SlopeB = 1.0,
         OffsetR = 0, OffsetG = 0, OffsetB = 0,
         PowerR = 1.0, PowerG = 1.0, PowerB = 1.0,
         -- 05 氛围
         Vignette = 0, Grain = 0.06,
-        SanityColourOn = 1, DistortFree = 0, SnowCap = 0.22, SandFilter = 0,
-        VanillaGrade = 0.71,
+        SanityColourOn = 0, DistortFree = 0, SnowCap = 0.64, SandFilter = 0,
+        VanillaGrade = 0.73,
         -- 06 辉光
-        GlowIntensity = 2.25, GlowThreshold = 0.04, GlowKnee = 0.61,
-        GlowSpread = 1.0, GlowWarmth = 1.0, GlowSat = 1.0, GlowCompress = 0.0,
+        GlowIntensity = 1.20, GlowThreshold = 0.04, GlowKnee = 1.00,
+        GlowSpread = 1.00, GlowWarmth = 1.00, GlowSat = 1.0, GlowCompress = 0.03,
         BloomOn = 1,
         -- 07 光影
-        GlowTail = 1.0, LightWrap = 1.0, GlowRim = 0.20, GodRays = 2.0, SunFill = 1.0,
+        GlowTail = 1.00, LightWrap = 1.00, GlowRim = 0.05, GodRays = 2.0, SunFill = 1.0,
+        -- 08 水面
+        GlintOn = 1, GlintStrength = 0.33, GlintDensity = 0.99, GlintGrain = 0.74, GlintSoft = 1.00,
     },
-    -- 轻量画质：同一基底，强度全面收敛（低配 / 长时间游玩）
+    -- 轻量画质：作者特调的收敛版（低配 / 长时间游玩），保留同一色彩基调
     light = {
-        ShadowsOn = 1, OceanOn = 1,
-        Strength = 4.50, DeconvStrength = 0.60, NoiseReduce = 0.45, AntiRinging = 0.60, DarkProtect = 0.10,
+        ShadowsOn = 1, OceanOn = 1, LightingMaster = 1,
+        Strength = 5.00, DeconvStrength = 0.90, NoiseReduce = 0.50, AntiRinging = 0.70, DarkProtect = 0.15,
         DeconvGate = 0.025, DeconvPenetr = 0.75,
-        RangeSigma = 0.26, SpatialSigma = 1.10, CenterWeight = 1.0, NoiseFloor = 0.01,
-        AR_Threshold = 0.0, AR_L_Overshoot = 0.01, AR_D_Overshoot = 0.01, ChromaProtect = 0.39,
-        ExposureEV = 0.04, Temp = 0.305, Tint = -0.089, Saturation = 0.99,
-        Vibrance = 0.10, Contrast = 0.01, Lightness = 0, Gamma = 1.0,
-        Filmic = 0.20, HL_Desat = 0.08, OriginalMix = 0.08,
+        RangeSigma = 0.26, SpatialSigma = 1.10, CenterWeight = 1.0, NoiseFloor = 0.012,
+        AR_Threshold = 0.0, AR_L_Overshoot = 0.0, AR_D_Overshoot = 0.0, ChromaProtect = 0.70,
+        ExposureEV = 0.06, Temp = 0.40, Tint = -0.11, Saturation = 0.99,
+        Vibrance = 0.18, Contrast = 0.02, Lightness = 0, Gamma = 1.0,
+        Filmic = 0.22, HL_Desat = 0.30, OriginalMix = 0.12,
         SlopeR = 0.96, SlopeG = 1.0, SlopeB = 1.0,
         OffsetR = 0, OffsetG = 0, OffsetB = 0,
         PowerR = 1.0, PowerG = 1.0, PowerB = 1.0,
         Vignette = 0, Grain = 0.04,
-        SanityColourOn = 1, DistortFree = 0, SnowCap = 0.22, SandFilter = 0,
+        SanityColourOn = 0, DistortFree = 0, SnowCap = 0.64, SandFilter = 0,
         VanillaGrade = 0.80,
-        GlowIntensity = 1.80, GlowThreshold = 0.05, GlowKnee = 0.65,
-        GlowSpread = 1.0, GlowWarmth = 1.0, GlowSat = 1.0, GlowCompress = 0.0,
+        GlowIntensity = 0.90, GlowThreshold = 0.06, GlowKnee = 0.90,
+        GlowSpread = 0.90, GlowWarmth = 0.90, GlowSat = 1.0, GlowCompress = 0.05,
         BloomOn = 1,
-        GlowTail = 0.90, LightWrap = 0.90, GlowRim = 0.15, GodRays = 1.50, SunFill = 0.90,
+        GlowTail = 0.80, LightWrap = 0.80, GlowRim = 0.03, GodRays = 1.20, SunFill = 0.90,
+        GlintOn = 1, GlintStrength = 0.28, GlintDensity = 0.99, GlintGrain = 0.74, GlintSoft = 1.00,
     },
-    -- 电影胶片：同一基底，调色与光效加重（截图 / 录视频用）
+    -- 电影胶片：作者特调的加重版（截图 / 录视频），暖调、暗角、颗粒、重辉光
     cinema = {
-        ShadowsOn = 1, OceanOn = 1,
-        Strength = 6.30, DeconvStrength = 1.00, NoiseReduce = 0.70, AntiRinging = 0.60, DarkProtect = 0.05,
+        ShadowsOn = 1, OceanOn = 1, LightingMaster = 1,
+        Strength = 7.00, DeconvStrength = 1.50, NoiseReduce = 0.70, AntiRinging = 0.80, DarkProtect = 0.20,
         DeconvGate = 0.025, DeconvPenetr = 0.85,
         RangeSigma = 0.26, SpatialSigma = 1.10, CenterWeight = 1.0, NoiseFloor = 0.01,
-        AR_Threshold = 0.0, AR_L_Overshoot = 0.01, AR_D_Overshoot = 0.01, ChromaProtect = 0.39,
-        ExposureEV = 0.08, Temp = 0.305, Tint = -0.089, Saturation = 0.94,
-        Vibrance = 0.20, Contrast = 0.05, Lightness = -0.01, Gamma = 0.97,
-        Filmic = 0.50, HL_Desat = 0.18, OriginalMix = 0.02,
+        AR_Threshold = 0.0, AR_L_Overshoot = 0.0, AR_D_Overshoot = 0.0, ChromaProtect = 0.80,
+        ExposureEV = 0.10, Temp = 0.42, Tint = -0.10, Saturation = 0.95,
+        Vibrance = 0.30, Contrast = 0.06, Lightness = -0.01, Gamma = 0.98,
+        Filmic = 0.55, HL_Desat = 0.45, OriginalMix = 0.04,
         SlopeR = 0.92, SlopeG = 0.99, SlopeB = 1.0,
         OffsetR = 0, OffsetG = 0, OffsetB = 0,
         PowerR = 1.0, PowerG = 1.0, PowerB = 1.0,
-        Vignette = 0.18, Grain = 0.10,
-        SanityColourOn = 1, DistortFree = 0, SnowCap = 0.22, SandFilter = 0,
-        VanillaGrade = 0.55,
-        GlowIntensity = 2.80, GlowThreshold = 0.04, GlowKnee = 0.55,
-        GlowSpread = 1.0, GlowWarmth = 1.0, GlowSat = 1.0, GlowCompress = 0.15,
+        Vignette = 0.20, Grain = 0.12,
+        SanityColourOn = 0, DistortFree = 0, SnowCap = 0.50, SandFilter = 0,
+        VanillaGrade = 0.60,
+        GlowIntensity = 1.60, GlowThreshold = 0.04, GlowKnee = 1.00,
+        GlowSpread = 1.00, GlowWarmth = 1.00, GlowSat = 1.0, GlowCompress = 0.08,
         BloomOn = 1,
-        GlowTail = 1.0, LightWrap = 1.0, GlowRim = 0.25, GodRays = 2.0, SunFill = 1.0,
+        GlowTail = 1.00, LightWrap = 1.00, GlowRim = 0.08, GodRays = 2.0, SunFill = 1.0,
+        GlintOn = 1, GlintStrength = 0.40, GlintDensity = 0.99, GlintGrain = 0.74, GlintSoft = 1.00,
     },
     off = {
-        ShadowsOn = 0, OceanOn = 0,
+        ShadowsOn = 0, OceanOn = 0, LightingMaster = 0, GlintOn = 0,
         Strength = 0, NoiseReduce = 0, AntiRinging = 0, DarkProtect = 0,
         ExposureEV = 0, Temp = 0, Tint = 0, Saturation = 1.0,
         Vibrance = 0, Contrast = 0, Lightness = 0, Gamma = 1.0,
@@ -299,6 +336,14 @@ function State.PackUniform(uniform)
     -- 当前呼吸值，光晕不会在参数刷新瞬间熄灭。
     if uniform == "BCAS_GLOW2" then
         v[4] = State.flicker or 1.0
+    end
+    -- 折叠模式：辉光合成在主 pass 里，关辉光不能靠禁用 effect（会连调色锐化
+    -- 一起关），改为把强度归零。
+    if uniform == "BCAS_GLOW" then
+        local bloom_on = State.enabled ~= false and (State.params.BloomOn or 0) > 0.5
+        if State.glow_folded and not bloom_on then
+            v[1] = 0.0
+        end
     end
     if uniform == "BCAS_EXTRA" then
         v[3] = State.sun_u or 0.22
@@ -605,6 +650,14 @@ function State.GlowOverrideActive()
         and (State.params.BloomOn or 0) > 0.5
 end
 
+-- 只要我们的辉光链已注册且 mod 总开关开着，Bloom 就由我们托管：原生辉光
+-- 一律压死（无论 BloomOn 是开是关）。这样 BloomOn=关 = 真正没有任何辉光
+-- （此前关掉只是"恢复玩家原生辉光"，所以关不干净、也不省性能）。
+-- 只有 mod 总开关关闭（P）或辉光链不可用时，才把原生设置还给玩家。
+function State.BloomManaged()
+    return State.glow_id ~= nil and State.enabled
+end
+
 -- 原生 Bloom 开关接管钩子（一次性安装，幂等）。
 -- 引擎在玩家设置变更 / 进世界时经 PostProcessor:SetBloomEnabled 反复重开
 -- 原生 Bloom（playerprofile ApplySettings，postprocesseffects.lua 的 Lua
@@ -625,7 +678,7 @@ function State.HookNativeBloom()
     end
     local orig = idx.SetBloomEnabled
     idx.SetBloomEnabled = function(self, enabled)
-        if State.GlowOverrideActive() then
+        if State.BloomManaged() then
             enabled = false
         end
         orig(self, enabled)
@@ -646,11 +699,16 @@ function State.ApplyBloom()
     State.ApplyEnhancements()
     if PostProcessor == nil or State.glow_id == nil then return end
     local on = State.GlowOverrideActive()
-    PostProcessor:EnablePostProcessEffect(State.glow_id, on)
+    -- 折叠模式：glow_id 就是主 pass（grade+sharpen+bloom），不能按辉光开关
+    -- 去 Enable/Disable 它——否则关辉光会把调色锐化一起关掉。改用强度归零
+    -- （PackUniform 里处理）+ 金字塔 sampler 断电。
+    if not State.glow_folded then
+        PostProcessor:EnablePostProcessEffect(State.glow_id, on)
+    end
     -- 金字塔四级 sampler 逐级断电（v3）：此前辉光关闭时四个 1/4 分辨率
     -- pass 仍在每帧空跑。引擎绑定表原生方法，pcall 防老版本签名差异。
     if State.glow_samplers ~= nil then
-        for i = 1, 4 do
+        for i = 1, #State.glow_samplers do
             local sid = State.glow_samplers[i]
             if sid ~= nil then
                 pcall(PostProcessor.SetSamplerEffectState, PostProcessor, sid, on)
@@ -658,7 +716,8 @@ function State.ApplyBloom()
         end
     end
     if PostProcessorEffects ~= nil and PostProcessorEffects.Bloom ~= nil then
-        if on then
+        if State.BloomManaged() then
+            -- 托管期间原生辉光恒关：BloomOn=关 才是真的没有辉光，也真的省性能
             PostProcessor:SetBloomEnabled(false)
         else
             local native = true
@@ -667,6 +726,9 @@ function State.ApplyBloom()
             end
             PostProcessor:SetBloomEnabled(native)
         end
+    end
+    if State.glow_folded then
+        State.ApplyUniform("BCAS_GLOW")
     end
 end
 
@@ -684,6 +746,11 @@ function State.SetParam(key, value)
     local meta = VEC[key]
     if meta == nil then return end
     State.params[key] = math.clamp(value, meta.min, meta.max)
+    if meta.uniform == "GLINT" then
+        -- 海面波光参数：由 bcas_glint 每帧读取并下发到水面实体，
+        -- 不走后处理 effect 的 uniform 表（该 pass 没有这些 uniform）
+        return
+    end
     if key == "ColourCubeOn" then
         State.ApplyColourCube()
         return
@@ -809,7 +876,7 @@ end
 -- 写入的辉光源，引擎每帧照常填充、与原生 Bloom 效果的开关无关——光影绘卷
 -- 已实测），逐级经 SamplerEffectBase.Shader 级联：
 --   级 1 = 软膝预滤 + Kawase 步长 1（= 金字塔 CORE，预滤后才模糊）
---   级 2/3/4 = Kawase 步长 2/4/8（MID / WIDE / HALO，每级仅 4 taps）
+--   级 2/3 = Kawase 步长 3/8（MID / HALO，每级仅 4 taps）
 -- 合成 A 绑 core+mid，合成 B 绑 wide+halo（多 AddSampler 槽位语义同引擎
 -- BuildLunacyShader：调用顺序 = SAMPLER[1..] 顺序）。
 -- 性能：4 级 × 4 taps @ 1/4 分辨率 ≈ 每像素 1 tap 的原生分辨率开销，
@@ -819,20 +886,21 @@ end
 -- 填充，只需经 SetEffectUniformVariables 绑定（同引擎 blur 链做法），
 -- 绝不能 AddUniformVariable；预滤级额外绑 BCAS_GLOW（与合成共用句柄，
 -- 引擎 OVERLAY_BLEND 先例）。
--- 注册辉光管线（2026-09 v3 单合成 pass）：一个全分辨率合成 + 4 级 1/4
--- 分辨率 Kawase。
+-- 注册辉光管线（2026-09 v4 单合成 pass + 3 级金字塔）：一个全分辨率
+-- 合成 + 3 级 1/4 分辨率 Kawase（半径曲线 1.5/3.8/9.3 覆盖原四级
+-- 1.5/2.9/5.3/10.1，中环一级承载原 mid+wide 能量，少一个 pass）。
 -- 采样链输入 = 引擎辉光缓冲（SamplerEffectBase.BloomSampler，Klei 按实体
 -- 写入的辉光源，引擎每帧照常填充、与原生 Bloom 效果的开关无关——光影绘卷
 -- 已实测），逐级经 SamplerEffectBase.Shader 级联：
 --   级 1 = 软膝预滤 + Kawase 步长 1（= 金字塔 CORE，预滤后才模糊）
---   级 2/3/4 = Kawase 步长 2/4/8（MID / WIDE / HALO，每级仅 4 taps）
--- 合成 pass（bcas_glow.ksh v3）SAMPLER[1..4] 依次绑四级金字塔输出，
+--   级 2/3 = Kawase 步长 3/8（MID / HALO，每级仅 4 taps）
+-- 合成 pass（bcas_glow.ksh v4）SAMPLER[1..3] 依次绑三级金字塔输出，
 -- SAMPLER[0] = 链路输入（studio 输出），一次完成旧 A+B 全部合成
 -- （权重/暖色/饱和塑形与旧两 pass 数学等价：饱和塑形对 bloom 线性）。
--- 性能：合成 2 pass -> 1 pass（全分辨率少一个 RT 往返）；4 级 × 4 taps
---   @ 1/4 分辨率 ≈ 每像素 1 tap 的原生分辨率开销。
+-- 性能：合成 2 pass -> 1 pass（全分辨率少一个 RT 往返）；3 级 × 4 taps
+--   @ 1/4 分辨率 ≈ 每像素 0.75 tap 的原生分辨率开销（旧 4 级为 1 tap）。
 -- 关闭真零开销：EnablePostProcessEffect 停合成 + SetSamplerEffectState
---   逐级停金字塔（引擎绑定表原生方法，v3 新接入——此前辉光关闭时四级
+--   逐级停金字塔（引擎绑定表原生方法，v3 新接入——此前辉光关闭时
 --   sampler 仍在每帧空跑）。
 -- 不碰 SetBloomSamplerParams：保持引擎默认 0.25 分辨率 RGB 辉光缓冲。
 -- 注意 ksh 是 sampler 效果：SAMPLER_PARAMS 魔法 uniform 由引擎按 RT 自动
@@ -840,24 +908,33 @@ end
 -- 绝不能 AddUniformVariable；预滤级额外绑 BCAS_GLOW（与合成共用句柄，
 -- 引擎 OVERLAY_BLEND 先例）。
 local function RegisterGlowChain()
-    local glow_id = RegisterPass("shaders/bcas_glow.ksh", EFFECT_UNIFORMS.glow)
-    if glow_id == nil then
-        print("[BCAS] 错误：glow 合成 pass 注册失败！辉光不可用，请查日志更早的编译报错。")
-        return nil
+    -- 折叠模式：辉光合成已经并进 merged 单 pass，只需把 mip 金字塔挂到它上面，
+    -- 不再注册独立的 glow 合成 pass（全分辨率 pass 1 个）。
+    local folded = State.merged_has_glow
+    local glow_id
+    if folded then
+        glow_id = State.merged_id
+    else
+        glow_id = RegisterPass("shaders/bcas_glow.ksh", EFFECT_UNIFORMS.glow)
+        if glow_id == nil then
+            print("[BCAS] 错误：glow 合成 pass 注册失败！辉光不可用，请查日志更早的编译报错。")
+            return nil
+        end
     end
     if SamplerEffectBase == nil or SamplerSizes == nil or SamplerColourMode == nil
         or FILTER_MODE == nil or MIP_FILTER_MODE == nil or UniformVariables == nil
         or UniformVariables.SAMPLER_PARAMS == nil then
         -- 引擎全局量缺失：合成 pass 留着也无害（SAMPLER[1..4] 无输入 =
         -- 辉光 0 = 加法混合原样直通），但功能不完整，提示并降级
+        State.glow_folded = folded
         print("[BCAS] 警告：SamplerEffect 引擎全局量缺失，辉光金字塔未创建")
         return glow_id
     end
     local chain = {
-        {path = "shaders/bcas_kawase_pre.ksh", base = SamplerEffectBase.BloomSampler, prefilter = true},
-        {path = "shaders/bcas_kawase2.ksh", base = SamplerEffectBase.Shader},
-        {path = "shaders/bcas_kawase4.ksh", base = SamplerEffectBase.Shader},
-        {path = "shaders/bcas_kawase8.ksh", base = SamplerEffectBase.Shader},
+        {path = "shaders/bcas_bloom_pre.ksh", base = SamplerEffectBase.BloomSampler, prefilter = true, size = 0.25},
+        {path = "shaders/bcas_bloom_d1.ksh",  base = SamplerEffectBase.Shader, size = 0.125},
+        {path = "shaders/bcas_bloom_d2.ksh",  base = SamplerEffectBase.Shader, size = 0.0625},
+        {path = "shaders/bcas_bloom_d3.ksh",  base = SamplerEffectBase.Shader, size = 0.03125},
     }
     local samplers = {}
     local prev = nil
@@ -865,10 +942,10 @@ local function RegisterGlowChain()
         local sid
         if i == 1 then
             sid = PostProcessor:AddSamplerEffect(resolvefilepath(c.path),
-                SamplerSizes.Relative, 0.25, 0.25, SamplerColourMode.RGB, c.base)
+                SamplerSizes.Relative, c.size, c.size, SamplerColourMode.RGB, c.base)
         else
             sid = PostProcessor:AddSamplerEffect(resolvefilepath(c.path),
-                SamplerSizes.Relative, 0.25, 0.25, SamplerColourMode.RGB, c.base, prev)
+                SamplerSizes.Relative, c.size, c.size, SamplerColourMode.RGB, c.base, prev)
         end
         if sid == nil then
             -- 不整体放弃：已建成的级仍可绑给合成（金字塔缺层仍能工作）
@@ -891,6 +968,7 @@ local function RegisterGlowChain()
         end
     end
     State.glow_samplers = samplers
+    State.glow_folded = folded
     return glow_id
 end
 
@@ -903,11 +981,33 @@ function State.InitShader()
     -- 引擎方法就绪，此处兜底重试，幂等）
     State.HookNativeBloom()
     State.HookVanillaFilters()
-    State.effect_id = RegisterPass("shaders/bcas_studio.ksh", EFFECT_UNIFORMS.studio)
-    if State.effect_id == nil then return end
-    State.effect2_id = RegisterPass("shaders/bcas_cinema.ksh", EFFECT_UNIFORMS.cinema)
-    if State.effect2_id == nil then
-        print("[BCAS] 警告：cinema pass 注册失败，仅有锐化生效")
+    -- 实验路径（MERGED_PASS=on）：先试注册 6593B 合并 pass。引擎源码缓冲
+    -- 若小于源码长度，ksh 注册照常返回 id 但编译静默失败（画面=无调色无
+    -- 锐化），无法运行时探测——所以成败只能靠用户看画面验证，失败就关
+    -- 开关回双 pass（默认路径零风险）。
+    if State.merged_pass then
+        -- 内置默认：调色+锐化+辉光在同一个全分辨率 pass 里完成（架构优化，
+        -- 全屏 pass 2 -> 1）。实机 A/B 已确认与双 pass 画质一致。
+        State.merged_id = RegisterPass("shaders/bcas_merged_glow.ksh", EFFECT_UNIFORMS.merged_glow)
+        if State.merged_id ~= nil then
+            State.merged_has_glow = true
+            print("[BCAS] 合并 pass 注册 -> id=" .. tostring(State.merged_id)
+                .. " (GRADE+SHARPEN+BLOOM 单 pass)")
+        else
+            print("[BCAS] merged_glow 注册失败，回退普通 merged + 独立辉光")
+            State.merged_id = RegisterPass("shaders/bcas_merged.ksh", EFFECT_UNIFORMS.merged)
+        end
+    end
+    if State.merged_id ~= nil then
+        State.effect_id = State.merged_id
+        State.effect2_id = nil
+    else
+        State.effect_id = RegisterPass("shaders/bcas_studio.ksh", EFFECT_UNIFORMS.studio)
+        if State.effect_id == nil then return end
+        State.effect2_id = RegisterPass("shaders/bcas_cinema.ksh", EFFECT_UNIFORMS.cinema)
+        if State.effect2_id == nil then
+            print("[BCAS] 警告：cinema pass 注册失败，仅有锐化生效")
+        end
     end
     State.glow_id = RegisterGlowChain()
     State.glow2_id = nil
@@ -927,9 +1027,17 @@ function State.SortAndStart()
     -- 调色在前让动态范围先稳定，锐化不会再被后续对比度二次拉伸；
     -- 颗粒在锐化之后生成，锐化永远采不到噪点。
     local rc = false
-    if State.effect2_id ~= nil then
+    if State.merged_id ~= nil then
+        -- 合并 pass 单体插入：位置同调色链（Lunacy 之后），锐化链全跳过
+        rc = PostProcessor:SetPostProcessEffectAfter(State.merged_id, PostProcessorEffects.Lunacy)
+        print("[BCAS] 插入合并pass After(Lunacy) -> " .. tostring(rc))
+    elseif State.effect2_id ~= nil then
         rc = PostProcessor:SetPostProcessEffectAfter(State.effect2_id, PostProcessorEffects.Lunacy)
         print("[BCAS] 插入调色链 After(Lunacy) -> " .. tostring(rc))
+    end
+    if not rc and State.merged_id ~= nil then
+        rc = PostProcessor:SetPostProcessEffectBefore(State.merged_id, PostProcessorEffects.Distort)
+        print("[BCAS] 合并pass Before(Distort) -> " .. tostring(rc))
     end
     if not rc then
         -- 调色 pass 缺席时锐化直接顶上；或作为回退插入位置
@@ -940,6 +1048,7 @@ function State.SortAndStart()
         local rs = PostProcessor:SetPostProcessEffectAfter(State.effect_id, State.effect2_id)
         print("[BCAS] 插入锐化链 After(cinema) -> " .. tostring(rs))
     end
+    -- merged 路径：effect_id == merged_id 且 effect2_id == nil，上面自然跳过
     -- 辉光合成插在 studio 之后（链尾）：作用于最终画面，辉光层永不被
     -- 锐化或二次调色。v3 单合成 pass：SAMPLER[0] 自动取链路输入
     -- （studio 输出），SAMPLER[1..4] = 四级金字塔。MoonPulse（月暴）

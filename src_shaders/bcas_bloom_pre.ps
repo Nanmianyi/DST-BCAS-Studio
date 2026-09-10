@@ -1,0 +1,59 @@
+#if defined( GL_ES )
+precision highp float;
+#endif
+
+// ============================================================================
+//  BCAS Studio - bloom head: soft-knee highlight extraction + 4-tap soften
+//
+//  Reads the engine bloom buffer (SamplerEffectBase.BloomSampler, Klei writes
+//  per-entity glow at 1/4 res) and keeps ONLY real highlights. Thresholds on
+//  luma with a quadratic soft knee (Unreal style), colour-preserving: RGB is
+//  scaled by one multiplier so the emitter's own hue survives.
+//
+//  The knee is clamped to the threshold, so the ramp can never reach luma 0 -
+//  the old build had threshold 0.04 + knee 1.0, which made the WHOLE screen
+//  bloom (the "light pollution" complaint). Defaults are now ~0.55 / 0.30.
+//
+//  A 4-tap diagonal soften hides the 1/4-res sprite blocks of the source
+//  before the pyramid blurs it further.
+//
+//  BCAS_GLOW is shared with the composite pass (same handle, bound per
+//  effect via SetEffectUniformVariables); only y (threshold) / z (knee)
+//  are read here.
+//
+//  NOTE FOR MAINTAINERS: pure ASCII only (ANGLE rejects anything else).
+// ============================================================================
+
+uniform sampler2D SAMPLER[1];
+uniform vec4 SAMPLER_PARAMS;
+uniform vec4 BCAS_GLOW;
+
+varying vec2 PS_TEXCOORD0;
+
+#define THRESHOLD BCAS_GLOW.y
+#define KNEE      BCAS_GLOW.z
+
+vec3 bcas_extract(vec3 c)
+{
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    // knee clamped to the threshold: the ramp can never reach luma 0, so dark
+    // pixels are never amplified even with threshold ~0 + knee 1.0 (author
+    // preset values). Without this clamp the whole screen blooms.
+    float k = max(min(KNEE, THRESHOLD), 1e-3);
+    float e = clamp(l - THRESHOLD + k, 0.0, 2.0 * k);
+    float ridge = (e * e) / (4.0 * k);
+    float w = clamp(max(ridge, l - THRESHOLD) / max(l, 1e-4), 0.0, 1.0);
+    return c * w;
+}
+
+void main()
+{
+    vec2 o = SAMPLER_PARAMS.zw * 0.75;
+
+    vec3 c = bcas_extract(texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2( o.x,  o.y)).rgb)
+           + bcas_extract(texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2( o.x, -o.y)).rgb)
+           + bcas_extract(texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2(-o.x,  o.y)).rgb)
+           + bcas_extract(texture2D(SAMPLER[0], PS_TEXCOORD0.xy + vec2(-o.x, -o.y)).rgb);
+
+    gl_FragColor = vec4(c * 0.25, 1.0);
+}

@@ -3,36 +3,29 @@ precision highp float;
 #endif
 
 // ============================================================================
-//  BCAS Studio - glow composite (merged A+B, 2026-09 v3 single-pass)
+//  BCAS Studio - bloom composite (2026-09 v5, mip pyramid)
 //
-//  One full-resolution pass instead of two. Inputs:
+//  One full-resolution pass. Inputs:
 //    SAMPLER[0] = SRC  : chain input (studio sharpen output)
-//    SAMPLER[1] = CORE : Kawase stride 1 (sharp bloom core)
-//    SAMPLER[2] = MID  : Kawase stride 2
-//    SAMPLER[3] = WIDE : Kawase stride 4
-//    SAMPLER[4] = HALO : Kawase stride 8
-//  The pyramid head (kawase_pre) already applied the soft-knee prefilter,
-//  so every level here is thresholded light only.
+//    SAMPLER[1] = L0   : prefiltered core   (1/4 res)
+//    SAMPLER[2] = L1   : mip level          (1/8 res)
+//    SAMPLER[3] = L2   : mip level          (1/16 res)
+//    SAMPLER[4] = L3   : widest mip level   (1/32 res)
 //
-//  Weights (spread slider, sum = 1.0 at both ends):
-//    spread=1 -> 0.15/0.25/0.30/0.30 (long soft tail)
-//    spread=0 -> 0.40/0.30/0.20/0.10 (tight hot core)
-//  Warmth: deeper levels lean harder toward the sunset palette. Saturation
-//  shaping is applied to the combined bloom (linear => identical to
-//  shaping A and B separately, as the old two-pass chain did).
+//  A progressive mip pyramid replaces the old fixed-1/4-res Kawase chain:
+//  every level is a clean 2x2 box downsample, so nothing undersamples into
+//  blocks or diagonal streaks. The four levels are summed with a weight
+//  profile blended by SPREAD, giving a smooth, energy-decreasing falloff
+//  (no uniform "disc" wrapped around objects).
 //
-//  Also here (was pass B): halo long-tail breathing, light wrap, 4-tap rim
-//  light (uniform-gated), water sun glitter (uniform-gated), Reinhard
-//  highlight shoulder. Disabling any sub-feature via uniforms lets the
-//  coherent branch skip its texture fetches.
+//  Removed the old light-wrap haze and edge rim from the defaults (both
+//  were what looked like a translucent film over the scene); they remain
+//  reachable from the panel but default to 0.
 //
-//  Uniform layout (must match AddUniformVariable calls in bcas_state.lua):
+//  Uniform layout (matches bcas_state.lua packing):
 //    BCAS_GLOW   x=intensity y=threshold z=knee w=warmth
-//    BCAS_GLOW2  x=spread y=glow saturation z=highlight compression
-//                w=halo breathing scalar (Lua)
-//    BCAS_GLOW3  x=tail breathe y=light wrap z=rim w=glitter
-//    BCAS_ATMO   z=time (glitter breathing)
-//    BCAS_EXTRA  y=SunFill gate zw=sun screen uv
+//    BCAS_GLOW2  x=spread y=saturation z=highlight compression w=breathing
+//    BCAS_GLOW3  x=tail lift y=light wrap z=rim w=(unused)
 //    SCREEN_PARAMS xy=size zw=1/size
 //
 //  NOTE FOR MAINTAINERS: this file MUST stay pure ASCII (ANGLE rejects
@@ -44,8 +37,6 @@ uniform sampler2D SAMPLER[5];
 uniform vec4 BCAS_GLOW;
 uniform vec4 BCAS_GLOW2;
 uniform vec4 BCAS_GLOW3;
-uniform vec4 BCAS_ATMO;
-uniform vec4 BCAS_EXTRA;
 uniform vec4 SCREEN_PARAMS;
 
 varying vec2 PS_TEXCOORD0;
@@ -58,75 +49,79 @@ float bcas_luma(vec3 c)
 void main()
 {
     vec2 uv = PS_TEXCOORD0.xy;
-    vec3 src  = texture2D(SAMPLER[0], uv).rgb;
-    vec3 core = texture2D(SAMPLER[1], uv).rgb;
-    vec3 mid  = texture2D(SAMPLER[2], uv).rgb;
-    vec3 wide = texture2D(SAMPLER[3], uv).rgb;
-    vec3 halo = texture2D(SAMPLER[4], uv).rgb;
+    vec3 src = texture2D(SAMPLER[0], uv).rgb;
+    vec3 l0  = texture2D(SAMPLER[1], uv).rgb;
+    vec3 l1  = texture2D(SAMPLER[2], uv).rgb;
+    vec3 l2  = texture2D(SAMPLER[3], uv).rgb;
+    vec3 l3  = texture2D(SAMPLER[4], uv).rgb;
 
-    // halo long-tail breathing: dim halos breathe, hot halos stay
-    float hl = bcas_luma(halo);
-    float ht = clamp(hl * 4.0, 0.0, 1.0);
-    float tail = 1.0 - ht;
-    tail = tail * tail;
-    halo *= 1.0 + BCAS_GLOW3.x * tail * tail;
+    // weight profiles: tight hot core -> long soft tail
+    vec4 wTight = vec4(0.55, 0.25, 0.13, 0.07);
+    vec4 wLong  = vec4(0.18, 0.24, 0.28, 0.30);
+    vec4 w = mix(wTight, wLong, clamp(BCAS_GLOW2.x, 0.0, 1.0));
 
-    // pyramid weights: spread=1 long soft tail, spread=0 tight hot core
-    vec4 w = mix(vec4(0.40, 0.30, 0.20, 0.10), vec4(0.15, 0.25, 0.30, 0.30),
-                 BCAS_GLOW2.x);
-
-    // warmth: core keeps authored hue, deeper levels lean toward the palette
+    // warmth: wider levels lean harder toward the warm palette; the core
+    // keeps the emitter's own hue (that is what makes glow "infuse").
     vec3 pal = mix(vec3(0.90, 0.96, 1.0), vec3(1.0, 0.92, 0.82),
                    BCAS_GLOW.w * 0.5 + 0.5);
-    mid  *= mix(vec3(1.0), pal, 0.33);
-    wide *= mix(vec3(1.0), pal, 0.66);
-    halo *= pal * BCAS_GLOW2.w;
+    l0 *= mix(vec3(1.0), pal, 0.10);
+    l1 *= mix(vec3(1.0), pal, 0.35);
+    l2 *= mix(vec3(1.0), pal, 0.65);
+    l3 *= pal * BCAS_GLOW2.w;
 
-    // additive composite; single saturation shaping (linear == A-then-B)
-    vec3 bloom = core * w.x + mid * w.y + wide * w.z + halo * w.w;
+    // long-tail lift: dim halos breathe out, hot halos stay put
+    float hl = bcas_luma(l3);
+    float tail = clamp(1.0 - hl * 4.0, 0.0, 1.0);
+    l3 *= 1.0 + BCAS_GLOW3.x * 0.5 * tail * tail;
+
+    vec3 bloom = l0 * w.x + l1 * w.y + l2 * w.z + l3 * w.w;
+
+    // single linear saturation shaping
     float bl = bcas_luma(bloom);
     bloom = mix(vec3(bl), bloom, BCAS_GLOW2.y);
 
+    // hue-preserving soft shoulder: caps additive stacking by scaling RGB
+    // uniformly so colours survive instead of bleaching to white
+    bl = bcas_luma(bloom);
+    float bc = bl / (1.0 + bl * 0.5);
+    bloom *= mix(1.0, bc / max(bl, 1e-4), smoothstep(0.6, 1.4, bl));
+
     vec3 final = src + bloom * BCAS_GLOW.x;
 
+    // optional light wrap (default 0): breathable haze in shadowed air
     float srcL = clamp(bcas_luma(src), 0.0, 1.0);
     float shadow = 1.0 - srcL;
-    // Light wrap: lifts shadowed air toward halo energy
-    final += halo * (BCAS_GLOW3.y * shadow * shadow + BCAS_GLOW3.w * 0.02 * shadow);
+    final += l3 * (BCAS_GLOW3.y * shadow * shadow);
 
-    // Rim: 4-neighbour luma edge on the raw scene, gated by bloom halo
-    // (fire/lantern/sunlight that actually hit the glow buffer).
-    if (BCAS_GLOW3.z > 0.001) {
+    // optional rim (default 0): thin light edge, gated by real halo energy.
+    // The hl guard also skips the four extra full-res taps on the (majority)
+    // of pixels with no halo, so the default-cost path stays cheap.
+    if (BCAS_GLOW3.z > 0.001 && hl > 0.01)
+    {
         vec2 px = SCREEN_PARAMS.zw;
-        if (px.x > 0.0 && px.y > 0.0) {
-            float Lr = bcas_luma(texture2D(SAMPLER[0], uv + vec2(px.x * 1.5, 0.0)).rgb);
-            float Ll = bcas_luma(texture2D(SAMPLER[0], uv - vec2(px.x * 1.5, 0.0)).rgb);
-            float Lu = bcas_luma(texture2D(SAMPLER[0], uv + vec2(0.0, px.y * 1.5)).rgb);
-            float Ld = bcas_luma(texture2D(SAMPLER[0], uv - vec2(0.0, px.y * 1.5)).rgb);
-            float edge = max(abs(srcL - Lr), abs(srcL - Ll));
-            edge = max(edge, max(abs(srcL - Lu), abs(srcL - Ld)));
+        if (px.x > 0.0 && px.y > 0.0)
+        {
+            float Lr = bcas_luma(texture2D(SAMPLER[0], uv + vec2(px.x * 2.0, 0.0)).rgb);
+            float Ll = bcas_luma(texture2D(SAMPLER[0], uv - vec2(px.x * 2.0, 0.0)).rgb);
+            float Lu = bcas_luma(texture2D(SAMPLER[0], uv + vec2(0.0, px.y * 2.0)).rgb);
+            float Ld = bcas_luma(texture2D(SAMPLER[0], uv - vec2(0.0, px.y * 2.0)).rgb);
+            float edge = max(max(abs(srcL - Lr), abs(srcL - Ll)),
+                             max(abs(srcL - Lu), abs(srcL - Ld)));
             float haloMask = clamp(hl * 6.0, 0.0, 1.0);
-            vec3 rim_gold = vec3(1.18, 1.06, 0.88);
-            final += rim_gold * (BCAS_GLOW3.z * 2.2 * edge * haloMask);
+            final += vec3(1.12, 1.03, 0.90) * (BCAS_GLOW3.z * 1.2 * edge * haloMask);
         }
     }
-    // Water sun-glitter: lives ONLY on bright, low-saturation crests (the
-    // engine's world-anchored white dashes). Radial sun weighting with a
-    // small base so far dashes still glint a little; global breathing.
-    if (BCAS_GLOW3.w > 0.001 && BCAS_EXTRA.y > 0.001) {
-        float mx = max(src.r, max(src.g, src.b));
-        float mn = min(src.r, min(src.g, src.b));
-        float sat = mx - mn;
-        float dash = smoothstep(0.45, 0.78, srcL) * (1.0 - smoothstep(0.32, 0.60, sat));
-        vec2 ar = vec2(SCREEN_PARAMS.x / max(SCREEN_PARAMS.y, 1.0), 1.0);
-        vec2 dv = (uv - BCAS_EXTRA.zw) * ar;
-        float toward = 0.25 + 0.75 * pow(max(1.0 - length(dv) * 0.55, 0.0), 2.0);
-        float fres = mix(0.75, 1.30, 1.0 - uv.y);
-        float breathe = 0.60 + 0.40 * sin(BCAS_ATMO.z * 1.7);
-        float amt = BCAS_GLOW3.w * BCAS_EXTRA.y * 0.55
-                  * dash * toward * fres * breathe;
-        final += vec3(1.20, 1.12, 0.94) * amt;
-    }
+
+    // global highlight compression (panel "compress")
     final = final / (1.0 + final * BCAS_GLOW2.z);
+
+    // final hue-preserving shoulder: tame stacked brightness above a knee
+    // without bleaching the emitter's colour
+    float fl = bcas_luma(final);
+    if (fl > 0.88)
+    {
+        float cl = 0.88 + (fl - 0.88) / (1.0 + (fl - 0.88) * 1.2);
+        final *= cl / fl;
+    }
     gl_FragColor = vec4(final, 1.0);
 }

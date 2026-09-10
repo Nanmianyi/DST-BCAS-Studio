@@ -94,13 +94,17 @@ void main()
     // ========================================================================
     if (SUN_FILL > 0.001) {
         float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        // Headroom gate (2026-09): bright ground (savanna/white turf) used
+        // to clip straight to white under the flat additive. Scale by
+        // remaining headroom: bright tiles get ~nothing, dark unchanged.
+        float head = smoothstep(1.0, 0.45, luma);
         // Soft ambient directional light gradient from top-left, never rotates with camera
         float sun_grad = clamp(1.35 - (PS_TEXCOORD0.x * 0.55 + PS_TEXCOORD0.y * 0.60), 0.0, 1.0);
         sun_grad = sun_grad * sun_grad;
         vec3 sun_tint = vec3(1.14, 1.05, 0.92);
-        color = mix(color, color * sun_tint + vec3(0.05, 0.035, 0.015) * sun_grad, SUN_FILL * sun_grad * 0.65);
+        color = mix(color, color * sun_tint + vec3(0.05, 0.035, 0.015) * sun_grad, SUN_FILL * sun_grad * 0.65 * head);
         float hl_mask = smoothstep(0.40, 0.85, luma);
-        color += vec3(0.08, 0.06, 0.03) * (hl_mask * SUN_FILL * 0.40);
+        color += vec3(0.08, 0.06, 0.03) * (hl_mask * SUN_FILL * 0.40 * head);
         color += (SUN_UV.x + SUN_UV.y) * 0.0;
     }
 

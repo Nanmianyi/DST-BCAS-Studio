@@ -1,0 +1,295 @@
+// BCAS Studio - ocean glint / shallow-water caustics overlay.
+//
+// Our own procedural water-surface layer, drawn on a camera-following ground
+// quad over the untouched vanilla ocean:
+//   * chained caustics light web - a smooth noise height field (simplex) plus
+//     the chained caustics field, sharpened into thin crests.
+//   * sand bottom - the shallow water gets a procedural seabed texture
+//     (low-frequency dune shading + sparse grain), tinted toward clear cyan,
+//     so it reads as a bright sandy flat instead of muddy water.
+//   * scattered caustics - a domain warp bends the regular hexagonal lattice
+//     and a large-scale gate sprinkles the light instead of a connected grid.
+//   * shallow -> deep - with depth the caustic cells stretch into wave-like
+//     bands, the tint turns gold -> cyan, and the overlay thins out so the
+//     vanilla deep ocean colour (and its waves) come through. Boundary is
+//     wobbled by a slow noise.
+//   * tide surge - the scroll speed rises as the sun lowers (ambient driven),
+//     and the sand sheen fades with it.
+//   * salt stacks - DST plants saltstack prefabs on deep tiles though they
+//     belong on a broad half-leg-deep sand flat. Nearby stacks are clustered
+//     into a few LARGE patches; each patch entity is drawn through a cheap
+//     branch (FLOAT_PARAMS.y < 0) that skips the expensive openness/sand work,
+//     with FLOAT_PARAMS.z carrying the patch radius. A small count of big
+//     quads keeps the fill cost sane (one quad per stack lagged badly).
+//
+// Uniform budget (entity anim shader, all engine-existing slots):
+//   FLOAT_PARAMS.x        strength (overlay opacity)
+//   FLOAT_PARAMS.y        gain (caustic brightness); < 0 marks a salt patch
+//   FLOAT_PARAMS.z        grain (caustic frequency) | salt patch radius
+//   OCEAN_BLEND_PARAMS.x  softness (blend toward the vanilla ocean colour)
+//   COLOUR_XFORM          SetMultColour: G = ambient, dims rgb at night
+//   TIMEPARAMS.x          time
+//   OCEAN_SAMPLER         engine ocean mask / colour
+#if defined( GL_ES )
+precision mediump float;
+#endif
+
+uniform sampler2D SAMPLER[5];
+
+#ifndef LIGHTING_H
+#define LIGHTING_H
+varying vec3 PS_POS;
+
+uniform vec4 LIGHTMAP_WORLD_EXTENTS;
+
+#define LIGHTMAP_TEXTURE SAMPLER[3]
+
+vec3 CalculateLightingContribution()
+{
+    vec2 uv = ( PS_POS.xz - LIGHTMAP_WORLD_EXTENTS.xy ) * LIGHTMAP_WORLD_EXTENTS.zw;
+    return texture2D( LIGHTMAP_TEXTURE, uv.xy ).rgb;
+}
+#endif // LIGHTING_H
+
+varying vec3 PS_TEXCOORD;
+varying vec3 PS_CAMERA_POS;
+
+uniform mat4 MatrixW;
+uniform vec4 TIMEPARAMS;
+uniform mat4 COLOUR_XFORM;
+uniform vec3 FLOAT_PARAMS;
+uniform vec4 OCEAN_BLEND_PARAMS;
+
+uniform vec4 OCEAN_WORLD_EXTENTS;
+#define OCEAN_SAMPLER SAMPLER[4]
+
+// ---- cheap value noise (warp / gate / sand) -------------------------------
+float bcas_vhash(vec2 p)
+{
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float bcas_vnoise(vec2 p)
+{
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    float a = bcas_vhash(i);
+    float b = bcas_vhash(i + vec2(1.0, 0.0));
+    float c = bcas_vhash(i + vec2(0.0, 1.0));
+    float d = bcas_vhash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// ---- seabed noise (simplex) ----------------------------------------------
+// perlin/simplex noise by https://github.com/ashima/webgl-noise
+vec3 bcas_mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec2 bcas_mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec3 bcas_permute(vec3 x) { return bcas_mod289(((x * 34.0) + 1.0) * x); }
+
+float bcas_snoise(vec2 v)
+{
+    const vec4 C = vec4(0.211324865405187, 0.366025403784439,
+                       -0.577350269189626, 0.024390243902439);
+    vec2 i = floor(v + dot(v, C.yy));
+    vec2 x0 = v - i + dot(i, C.xx);
+
+    vec2 i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+    vec4 x12 = x0.xyxy + C.xxzz;
+    x12.xy -= i1;
+
+    i = bcas_mod289(i);
+    vec3 p = bcas_permute(bcas_permute(i.y + vec3(0.0, i1.y, 1.0))
+                        + i.x + vec3(0.0, i1.x, 1.0));
+
+    vec3 m = max(0.5 - vec3(dot(x0, x0), dot(x12.xy, x12.xy), dot(x12.zw, x12.zw)), 0.0);
+    m = m * m;
+    m = m * m;
+
+    vec3 x = 2.0 * fract(p * C.www) - 1.0;
+    vec3 h = abs(x) - 0.5;
+    vec3 ox = floor(x + 0.5);
+    vec3 a0 = x - ox;
+
+    m *= 1.79284291400159 - 0.85373472095314 * (a0 * a0 + h * h);
+
+    vec3 g;
+    g.x = a0.x * x0.x + h.x * x0.y;
+    g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+    return 130.0 * dot(m, g);
+}
+
+// (the old 5-octave fbm/pattern chain was removed: the sand base is a very
+//  low-frequency wash, so two simplex octaves in bcas_sand replaced the whole
+//  15-evaluation pile - same look, a fraction of the ALU)
+
+// ---- chained caustics ----------------------------------------------------
+float bcas_fn(inout vec4 k, mat3 m, float scale)
+{
+    mat3 mt = m * scale;
+    k.xyw *= mt;
+    return length(0.5 - fract(k.xyw));
+}
+
+// Caustics core with a domain warp (bend the hex lattice),
+// a scatter gate (sprinkle instead of a connected web) and a depth stretch
+// (cells elongate into wave-like bands as the water deepens).
+float bcas_caustics(vec2 wpos, float t, float grain, float gain, float deep)
+{
+    float wx = bcas_vnoise(wpos * 0.075 + vec2(0.0, t * 0.05));
+    float wz = bcas_vnoise(wpos * 0.075 + vec2(11.3, 0.0) - t * 0.04);
+    vec2 w = wpos + (vec2(wx, wz) - 0.5) * 2.8;
+
+    // wave frame: fixed world wind direction, stretched along it with depth.
+    // Stretch kept modest (1.15) so the deep bands stay a few pixels wide
+    // instead of collapsing into thin sub-pixel lines.
+    vec2 dir = vec2(0.86, 0.51);
+    vec2 perp = vec2(-dir.y, dir.x);
+    float u = dot(w, dir);
+    float v = dot(w, perp);
+    vec2 p = vec2(u * 0.32 * (1.0 - 0.30 * deep),
+                  v * 0.40 * (1.0 + 1.15 * deep)) * grain;
+
+    vec4 c = vec4(p, 0.0, t * 0.16);
+    mat3 m = mat3(-2, -1, 2, 3, -2, 1, 1, 2, 2);
+    float a = min(min(bcas_fn(c, m, 0.5), bcas_fn(c, m, 0.4)), bcas_fn(c, m, 0.3));
+
+    // distance anti-aliasing: far water lines go sub-pixel and the sharpen
+    // pass then rings on them. Soften the crest (lower exponent) and fade
+    // the amplitude with distance so nothing is sharpened at a sub-pixel
+    // scale.
+    float dist = length(PS_CAMERA_POS.xz - wpos);
+    float aa = 1.0 / (1.0 + dist * 0.05);
+    float cav = pow(a, mix(7.0, 4.0, (1.0 - aa) * 0.7)) * gain;
+
+    // scatter gate: keep some variation, but raise the floor so the glitter
+    // covers most of the water and only a few patches dim out. The slow drift
+    // keeps the light alive instead of frozen.
+    float gate = bcas_vnoise(wpos * 0.04 + vec2(5.7, 2.1) + vec2(t * 0.030, t * -0.022));
+    cav *= 0.45 + 0.55 * smoothstep(0.15, 0.70, gate);
+
+    // fade with distance (deep sea is the far water): fewer, softer glints
+    cav *= mix(0.45, 1.0, aa);
+
+    // deep water: the glitter thins out as it dissolves toward waves, but
+    // keeps enough contrast for the stretched bands to stay readable
+    return cav * (1.0 - deep * 0.62);
+}
+
+// ---- sand bottom: green-tan mottling + speckles ---------------------------
+// (green-tan mottling + speckles; no winding stroke lines - those read as
+//  long dark squiggles in game)
+vec3 bcas_sand(vec2 wpos, float t)
+{
+    float m = 0.5 + 0.5 * (bcas_snoise(wpos * 0.12) * 0.80
+                         + bcas_snoise(wpos * 0.34 + vec2(7.1, 3.3)) * 0.40);
+    vec3 col = mix(vec3(0.58, 0.66, 0.42), vec3(0.84, 0.85, 0.66), clamp(m, 0.0, 1.0));
+
+    // sparse fine speckles (the sandy grain)
+    float sp = bcas_vnoise(wpos * 2.1 + vec2(0.0, t * 0.03));
+    col *= 1.0 - 0.12 * smoothstep(0.78, 0.96, sp);
+
+    return col;
+}
+
+float bcas_water(vec2 uv)
+{
+    return smoothstep(0.15, 0.45, texture2D(OCEAN_SAMPLER, uv).a);
+}
+
+// openness: 0 = hugging the shoreline, 1 = far from any land.
+float bcas_openness(vec2 ocean_uv)
+{
+    vec2 a1 = vec2(16.0 * OCEAN_WORLD_EXTENTS.z, 0.0);
+    vec2 b1 = vec2(0.0, 16.0 * OCEAN_WORLD_EXTENTS.w);
+    vec2 a2 = vec2(40.0 * OCEAN_WORLD_EXTENTS.z, 0.0);
+    vec2 b2 = vec2(0.0, 40.0 * OCEAN_WORLD_EXTENTS.w);
+
+    float m1 = min(min(bcas_water(ocean_uv + a1), bcas_water(ocean_uv - a1)),
+                   min(bcas_water(ocean_uv + b1), bcas_water(ocean_uv - b1)));
+    float m2 = min(min(bcas_water(ocean_uv + a2), bcas_water(ocean_uv - a2)),
+                   min(bcas_water(ocean_uv + b2), bcas_water(ocean_uv - b2)));
+    return clamp(m1 * 0.55 + m2 * 0.45, 0.0, 1.0);
+}
+
+void main()
+{
+    // water mask + colour
+    vec2 ocean_uv = ( PS_POS.xz - OCEAN_WORLD_EXTENTS.xy ) * OCEAN_WORLD_EXTENTS.zw;
+    vec4 ocean = texture2D( OCEAN_SAMPLER, ocean_uv );
+    float mask = smoothstep(0.02, 0.30, ocean.a);
+    if (mask < 0.002)
+    {
+        gl_FragColor = vec4(0.0);
+        return;
+    }
+
+    float strength = FLOAT_PARAMS.x;
+    if (strength < 0.002)
+    {
+        gl_FragColor = vec4(0.0);
+        return;
+    }
+    float salt = step(FLOAT_PARAMS.y, 0.0);
+    float soft = clamp(OCEAN_BLEND_PARAMS.x, 0.0, 1.0);
+    // Time: 1x by day. The lower the sun (COLOUR_XFORM[1][1] = ambient, pushed
+    // by Lua every frame), the faster the sea surface flows - a tide-like
+    // surge at dusk; by night the glitter is already dimmed out so the speed-up
+    // is not jarring. The sand sheen fades with the same ambient term.
+    float ambient = clamp(COLOUR_XFORM[1][1], 0.0, 1.0);
+    float t = TIMEPARAMS.x * (1.0 + (1.0 - ambient) * 1.5);
+    vec2 wpos = PS_POS.xz;
+    vec3 oceanDeep = max(ocean.rgb, vec3(0.10));
+
+    // ================= salt stack: cheap large shallow patch ===============
+    if (salt > 0.5)
+    {
+        // FLOAT_PARAMS.z carries the patch radius (world units)
+        float R = FLOAT_PARAMS.z * (0.80 + 0.34 * bcas_vnoise(wpos * 0.06 + vec2(3.0, 9.0)));
+        float rr = length(wpos - MatrixW[3].xz);
+        float fall = 1.0 - smoothstep(R * 0.45, R, rr);
+        if (fall < 0.004)
+        {
+            gl_FragColor = vec4(0.0);
+            return;
+        }
+
+        float cau = bcas_caustics(wpos, t, 1.0, 10.0, 0.0);
+        vec3 col = bcas_sand(wpos, t) + vec3(1.0, 0.97, 0.88) * cau;
+        col = mix(col, col * oceanDeep, soft * 0.20 + 0.20);
+        col *= max(CalculateLightingContribution(), vec3(0.20));
+
+        float amt = strength * mask * 1.00 * fall;
+        gl_FragColor = vec4(col * amt, amt) * COLOUR_XFORM;
+        return;
+    }
+
+    // ================= open ocean =========================================
+    float grain = FLOAT_PARAMS.z > 0.05 ? FLOAT_PARAMS.z : 1.0;
+    float density = clamp(FLOAT_PARAMS.y, 0.80, 0.998);
+
+    // depth from shore distance (stable across day/night), wobbled so the
+    // shallow->deep boundary is organic rather than a clean contour
+    float open = bcas_openness(ocean_uv);
+    open = clamp(open + (bcas_vnoise(wpos * 0.03) - 0.5) * 0.34, 0.0, 1.0);
+    float deep = smoothstep(0.10, 0.95, open);
+
+    float gain = 10.0 + (density - 0.93) * 50.0;
+    float cau = bcas_caustics(wpos, t, grain, gain, deep);
+    vec3 glitCol = mix(vec3(1.0, 0.97, 0.88), vec3(0.80, 0.95, 1.0), deep);
+
+    // sand only lives in the shallows; deeper water keeps just the light
+    vec3 sand = bcas_sand(wpos, t) * (1.0 - smoothstep(0.0, 0.65, deep));
+    vec3 col = sand + glitCol * cau;
+
+    // soak up the vanilla ocean colour: a light touch in the shallows (so the
+    // sand stays clear) and the full colour handover in the deep. The small
+    // constant lets the water read a little deeper than pure seabed.
+    col = mix(col, col * oceanDeep, soft * 0.30 + deep * 0.45 + 0.18);
+    col *= max(CalculateLightingContribution(), vec3(0.20));
+
+    float amt = strength * mask * (1.0 - deep * 0.78) * 1.00;
+    gl_FragColor = vec4(col * amt, amt) * COLOUR_XFORM;
+}

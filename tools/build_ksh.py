@@ -68,6 +68,64 @@ SHADERS = [
         ],
     },
     {
+        # 实验性合并 pass（调色+锐化 单 pass，6588B）：探测引擎着色器源码
+        # 缓冲上限（历史实测 ~4096B，实体路径 19KB 可跑）。MERGED_PASS
+        # modinfo 开关控制注册，默认关闭；若引擎实际缓冲更大则替代
+        # cinema+studio 双 pass，再省一个全分辨率 RT 往返。
+        'name': 'bcas_merged',
+        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_merged.ps'),
+        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_merged.ksh'),
+        'big_ok': True,
+        'entries': [
+            dict(name='SAMPLER', type=TYPE_SAMPLER2D, a=0, arraylen=1),
+            V('SCREEN_PARAMS'),
+            V('BCAS_SHARPEN'),
+            V('BCAS_SHARP2'),
+            V('BCAS_AURA'),
+            V('BCAS_ATMO'),
+            V('BCAS_DECONV'),
+            V('BCAS_GRADE_A'),
+            V('BCAS_GRADE_B'),
+            V('BCAS_EXTRA'),
+            V('BCAS_CDL_S'),
+            V('BCAS_CDL_O'),
+            V('BCAS_CDL_P'),
+            V('BCAS_SEC_S'),
+            V('BCAS_SEC_O'),
+            V('BCAS_SEC_P'),
+        ],
+    },
+    {
+        # 内置默认单 pass：grade + sharpen + bloom 合成一次全分辨率完成，
+        # 配 mip 金字塔。MERGED_PASS 开关控制注册；注册失败自动回退普通
+        # merged（+ 独立辉光 pass）。
+        'name': 'bcas_merged_glow',
+        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_merged_glow.ps'),
+        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_merged_glow.ksh'),
+        'big_ok': True,
+        'entries': [
+            dict(name='SAMPLER', type=TYPE_SAMPLER2D, a=0, arraylen=5),
+            V('SCREEN_PARAMS'),
+            V('BCAS_SHARPEN'),
+            V('BCAS_SHARP2'),
+            V('BCAS_AURA'),
+            V('BCAS_ATMO'),
+            V('BCAS_DECONV'),
+            V('BCAS_GRADE_A'),
+            V('BCAS_GRADE_B'),
+            V('BCAS_EXTRA'),
+            V('BCAS_CDL_S'),
+            V('BCAS_CDL_O'),
+            V('BCAS_CDL_P'),
+            V('BCAS_SEC_S'),
+            V('BCAS_SEC_O'),
+            V('BCAS_SEC_P'),
+            V('BCAS_GLOW'),
+            V('BCAS_GLOW2'),
+            V('BCAS_GLOW3'),
+        ],
+    },
+    {
         # PASS 2：锐化与终合成（双边锐化/AURA/暗角/颗粒/抖动）
         'name': 'bcas_studio',
         'ps': os.path.join(ROOT, 'src_shaders', 'bcas_studio.ps'),
@@ -83,10 +141,10 @@ SHADERS = [
         ],
     },
     {
-        # 辉光金字塔：预滤 + 步长 1
-        'name': 'bcas_kawase_pre',
-        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_kawase_pre.ps'),
-        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_kawase_pre.ksh'),
+        # 辉光金字塔头：软膝高光提取 + 4 抽头软化（1/4 分辨率）
+        'name': 'bcas_bloom_pre',
+        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_bloom_pre.ps'),
+        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_bloom_pre.ksh'),
         'entries': [
             dict(name='SAMPLER', type=TYPE_SAMPLER2D, a=0, arraylen=1),
             V('SAMPLER_PARAMS'),
@@ -94,42 +152,38 @@ SHADERS = [
         ],
     },
     {
-        # 辉光金字塔：纯 Kawase 步长 2
-        'name': 'bcas_kawase2',
-        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_kawase.ps'),
-        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_kawase2.ksh'),
-        'replace': {'KAWASE_STRIDE': '2.0'},
+        # 辉光 mip 逐级下采样（同一个 shader，三个不同 RT 尺寸的实例）
+        'name': 'bcas_bloom_d1',
+        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_bloom_down.ps'),
+        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_bloom_d1.ksh'),
         'entries': [
             dict(name='SAMPLER', type=TYPE_SAMPLER2D, a=0, arraylen=1),
             V('SAMPLER_PARAMS'),
         ],
     },
     {
-        # 辉光金字塔：纯 Kawase 步长 4
-        'name': 'bcas_kawase4',
-        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_kawase.ps'),
-        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_kawase4.ksh'),
-        'replace': {'KAWASE_STRIDE': '4.0'},
+        'name': 'bcas_bloom_d2',
+        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_bloom_down.ps'),
+        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_bloom_d2.ksh'),
         'entries': [
             dict(name='SAMPLER', type=TYPE_SAMPLER2D, a=0, arraylen=1),
             V('SAMPLER_PARAMS'),
         ],
     },
     {
-        # 辉光金字塔：纯 Kawase 步长 8
-        'name': 'bcas_kawase8',
-        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_kawase.ps'),
-        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_kawase8.ksh'),
-        'replace': {'KAWASE_STRIDE': '8.0'},
+        'name': 'bcas_bloom_d3',
+        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_bloom_down.ps'),
+        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_bloom_d3.ksh'),
         'entries': [
             dict(name='SAMPLER', type=TYPE_SAMPLER2D, a=0, arraylen=1),
             V('SAMPLER_PARAMS'),
         ],
     },
     {
-        # 辉光合成（v3 单 pass 合并 A+B）：src + 核心环 + 中环 + 宽环 + 光晕
-        # 五路采样一次完成，含长尾呼吸/光包裹/轮廓光/水面碎金/Reinhard 压缩。
-        # SAMPLER[1..4] 由 Lua 侧按 AddSampler 调用顺序绑定四级金字塔输出。
+        # 辉光合成（v5 mip 金字塔）：src + 4 级金字塔一次合成。
+        # 权重由 SPREAD 在紧凑/长尾两套画像间插值；去掉了默认的光包裹雾与
+        # 硬描边（那个"透明膜包住物体"的观感），保留可调但默认 0。
+        # SAMPLER[1..4] 由 Lua 侧按 AddSampler 顺序绑定四级金字塔输出。
         'name': 'bcas_glow',
         'ps': os.path.join(ROOT, 'src_shaders', 'bcas_glow.ps'),
         'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_glow.ksh'),
@@ -139,8 +193,31 @@ SHADERS = [
             V('BCAS_GLOW'),
             V('BCAS_GLOW2'),
             V('BCAS_GLOW3'),
-            V('BCAS_ATMO'),
-            V('BCAS_EXTRA'),
+        ],
+    },
+    {
+        # 海面波光（实体类 shader，AnimState effect handle）：跟随摄像机的
+        # 贴地 quad，程序化水面法线 + Blinn-Phong 太阳高光。条目顺序/引用
+        # 与原版 anim.ksh 的可用槽位对齐（VS 用 0..2 矩阵，PS 用 3..9）。
+        'name': 'bcas_glint',
+        'entity': True,
+        'ps': os.path.join(ROOT, 'src_shaders', 'bcas_glint.ps'),
+        'vs': os.path.join(ROOT, 'src_shaders', 'bcas_glint.vs'),
+        'out': os.path.join(ROOT, 'BCAS-Studio', 'shaders', 'bcas_glint.ksh'),
+        'vs_refs': [0, 1, 2],
+        # PS 也用到 MatrixW（盐堆浅滩以实体原点做半径衰减）
+        'ps_refs': [2, 3, 4, 5, 6, 7, 8, 9],
+        'entries': [
+            M4('MatrixP'),
+            M4('MatrixV'),
+            M4('MatrixW'),
+            S('SAMPLER', 5),
+            V('LIGHTMAP_WORLD_EXTENTS'),
+            V('TIMEPARAMS'),
+            M4('COLOUR_XFORM'),
+            V('FLOAT_PARAMS', 3),
+            V('OCEAN_BLEND_PARAMS'),
+            V('OCEAN_WORLD_EXTENTS'),
         ],
     },
 ]
@@ -250,7 +327,7 @@ def build_one(spec, vs_src):
         ps_src = minify_glsl(ps_text) + SRC_TAIL
 
         # 引擎 ~4096 字节源码缓冲的硬防线：超限的 ksh 能注册但编译必败（静默无效果）
-        if len(ps_src) > 3900:
+        if len(ps_src) > 3900 and not spec.get('big_ok'):
             raise SystemExit(
                 f"{spec['name']}: 压缩后 ps 源码 {len(ps_src)} 字节，超过安全线 3900"
                 f'（引擎 ~4096 缓冲截断后会静默编译失败），请缩短着色器源码。')
@@ -334,6 +411,13 @@ def main():
         spec['out'] = args[1]
         build_one(spec, vs_src)
         return
+    if len(args) == 1:
+        # 按名字单独构建（bcas_glint 等实体 shader 必须走这条）
+        for spec in SHADERS:
+            if spec['name'] == args[0]:
+                build_one(spec, vs_src)
+                return
+        raise SystemExit(f'未知 shader: {args[0]}（可选：{", ".join(s["name"] for s in SHADERS)}）')
     for spec in SHADERS:
         build_one(spec, vs_src)
 

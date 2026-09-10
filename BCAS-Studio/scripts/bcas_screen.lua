@@ -85,7 +85,7 @@ local STR = {
         {key = "off",      label = "# 原版关闭"},
     },
     HINT = "拖动微调 · 单击键入 · R 复位 · ESC 退出 · P 快捷开关",
-    TABS = {"01 锐化", "02 进阶", "03 色彩", "04 调色", "05 氛围", "06 辉光", "07 光影"},
+    TABS = {"01 锐化", "02 进阶", "03 色彩", "04 调色", "05 氛围", "06 辉光", "07 光影", "08 水面"},
     LABELS = {
         Strength = "锐化强度 STRENGTH", DeconvStrength = "逆卷积墨线收敛 DECONV",
         NoiseReduce = "图像降噪 DENOISE",
@@ -112,7 +112,8 @@ local STR = {
         GlowKnee = "辉光软膝 KNEE", GlowSpread = "辉光扩散 SPREAD",
         GlowCompress = "高光压缩 COMPRESS",
         VanillaGrade = "官方调色强度 GRADE",
-        SunFill = "太阳全局光 SUN-FILL", GodRays = "透云光束 SUN-SHAFTS", LightingMaster = "光影总开关 LIGHTING", ShadowsOn = "地面投影 SHADOWS", OceanOn = "海水波光 OCEAN", GlowTail = "光晕长尾 GLOW-TAIL", LightWrap = "光包裹 LIGHT-WRAP", GlowRim = "轮廓光 GLOW-RIM",
+        SunFill = "太阳全局光 SUN-FILL", GodRays = "透云光束 SUN-SHAFTS", LightingMaster = "光影总开关 LIGHTING", ShadowsOn = "地面投影 SHADOWS", OceanOn = "地皮色调 OCEAN-TILE", GlowTail = "光晕长尾 GLOW-TAIL", LightWrap = "光包裹 LIGHT-WRAP", GlowRim = "轮廓光 GLOW-RIM",
+        GlintOn = "海面波光 GLINT", GlintStrength = "波光强度 INTENSITY", GlintDensity = "波光增益 GAIN", GlintGrain = "波光颗粒 GRAIN", GlintSoft = "海色融合 MIX",
     },
     SHARP_NOTE = "双边自适应锐化：仅作用于游戏世界，HUD 界面不受影响；抗振铃(AURA)可消除白边。",
     WB_LAUNCH  = "# 白平衡 · 光学色彩轮 (点击展开调色仪)",
@@ -147,11 +148,12 @@ local TAB_ROWS = {
     [6] = {"BloomOn", "GlowIntensity", "GlowThreshold", "GlowKnee",
            "GlowSpread", "GlowWarmth", "GlowSat", "GlowCompress"},
     [7] = {"LightingMaster", "ShadowsOn", "OceanOn", "SunFill", "GodRays", "GlowRim", "GlowTail", "LightWrap"},
+    [8] = {"GlintOn", "GlintStrength", "GlintDensity", "GlintGrain", "GlintSoft"},
 }
 
 local BOOL_KEYS = { ColourCubeOn = true, BloomOn = true,
     SanityColourOn = true, DistortFree = true, SandFilter = true,
-    ShadowsOn = true, OceanOn = true, LightingMaster = true }
+    ShadowsOn = true, OceanOn = true, LightingMaster = true, GlintOn = true }
 
 -- ==== 3. 颜色数学 ===========================================================
 

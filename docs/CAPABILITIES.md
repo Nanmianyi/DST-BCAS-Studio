@@ -7,7 +7,7 @@
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
 | 双 pass 后处理链 | ✅ | cinema（调色）→ studio（锐化终合成），官方 Mod 着色器链注册 |
-| 辉光子管线 | ✅ | Kawase pre/2/4/8 + 双合成 pass，BloomOn 时完全替代原生 Bloom |
+| 辉光子管线 | ✅ | bloom_pre + mip 三级下采样（1/4→1/32）+ bcas_glow 单合成，BloomOn 时完全替代原生 Bloom |
 | 参数总线 | ✅ | 17 个 vec4 uniform、40+ 参数，改动即下发、自动持久化 |
 | 快照回滚 | ✅ | 打开面板时快照，ESC 回滚，PgDn 落盘 |
 
@@ -42,18 +42,18 @@
 | 暗角 | Vignette |
 | 动态胶片颗粒（8Hz 时钟驱动） | Grain |
 
-## 辉光（kawase ×4 + bcas_glow / bcas_glow2）
+## 辉光（mip 金字塔 + bcas_glow 单合成）
 
 | 能力 | 参数 |
 | --- | --- |
 | 原生 Bloom 置空接管 | BloomOn |
-| Kawase 四层金字塔 + 软膝预滤 | GlowIntensity / GlowThreshold / GlowKnee |
-| 宽环扩散 / 暖色偏移 / 辉光饱和 | GlowSpread / GlowWarmth / GlowSat |
-| 光晕长尾（对数消散） | GlowTail |
-| 光包裹（暖光沁入阴影） | LightWrap |
-| 轮廓光（光源邻近勾边） | GlowRim |
+| 软膝高光提取（默认阈值 0.55，杜绝全屏泛光） | GlowThreshold / GlowKnee / GlowIntensity |
+| mip 逐级下采样金字塔（1/4→1/32，4 抽头/级，无方块拖影） | GlowSpread / GlowWarmth / GlowSat |
+| 光晕长尾抬升 | GlowTail |
+| 光包裹（默认关） | LightWrap |
+| 轮廓光（默认关） | GlowRim |
 | 透云光束（云隙光斑状态机 + 引擎勾边） | GodRays |
-| Reinhard 高光压缩 | GlowCompress |
+| 保色软肩高光压缩 | GlowCompress |
 
 ## 动态太阳光影（bcas_sun_emitter.lua）
 
@@ -75,6 +75,17 @@
 | 海洋地皮调色 | 8 种海洋地块 primary/secondary/昼夜变体 |
 | 小地图配色 | 同步烘焙 |
 | 零运行时开销 | 世界生成时烘焙，原版渲染路径呈现（改动需重进世界） |
+
+## 海面波光（bcas_glint.lua + shaders/bcas_glint.ksh）
+
+| 能力 | 说明 |
+| --- | --- |
+| caustics 光网 | 单纯形噪声沙底底色 + chained caustics 锐化成光网；域扭曲打散规则网格、大尺度 gate 成片抹除，光斑呈散点粼粼 |
+| 散乱化 | 域扭曲打散规则六角网格 + 大尺度 gate 成片抹除，光斑由"连成一片的网"变散点 |
+| 浅→深过渡 | 逐像素深度 = 离岸距离（由引擎海水遮罩双环采样得出，昼夜无关）：浅滩金色通透，中海 caustics 拉长成长浪带，深海消退交还原版青色与海浪；边界加噪声扰动不生成硬边 |
+| 盐堆浅滩补丁 | 镜头附近 saltstack 贪心聚类成 ≤6 块**大浅滩**（一个盐堆一块 quad 会重叠过绘卡顿），每块走廉价分支（跳过 fbm/离岸采样），补上科雷"盐堆种在深海地块"的科学漏洞 |
+| 沙底质感 | 浅滩叠加低频沙丘明暗 + 细沙颗粒 + 定向沙纹，混成半透明青调——读作清浅的沙底浅水，不再是"脏水沟" |
+| 遮罩/昼夜/档位 | 海洋纹理 alpha 判定水陆；环境光自动衰减（夜晚变暗）；modinfo 三档 + 面板 强度/增益/颗粒/融合；实体纯客户端（dedicated 零开销） |
 
 ## 原版滤镜接管（引擎函数包装，可逆）
 

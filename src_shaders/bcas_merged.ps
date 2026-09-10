@@ -1,0 +1,304 @@
+#if defined( GL_ES )
+precision highp float;
+#endif
+
+// ===========================================================================
+//  BCAS Studio - MERGED grade+sharpen pass (EXPERIMENT: 4096 buffer probe)
+//
+//  Single full-resolution pass replacing the cinema -> studio two-pass chain.
+//  Semantics preserved: GradePixel() is the cinema engine as a pure function
+//  (per-pixel; uv only enters the sun gradient), applied identically to the
+//  center sample and its 4 neighbours -- mathematically identical to grading
+//  the whole image first, then sharpening. Deconvolution/bilateral sharpen,
+//  AURA, vignette, grain follow; ONE TPDF dither at the very end (the old
+//  chain dithered twice; once is equivalent and cheaper).
+//
+//  Source exceeds the historical ~4096-byte engine buffer. 2026-09-09 in-game
+//  probe proved the engine feeds the FULL source to the compiler (no trunc);
+//  the first probe failed only on genuine GLSL errors from naive concat.
+//  MERGED_PASS config gates this pass; failure mode = pass silently dead
+//  (register still returns an id, image loses grade+sharpen).
+//  Pure ASCII only.
+// ===========================================================================
+
+uniform sampler2D SAMPLER[1];
+
+#define SRC_IMAGE        SAMPLER[0]
+
+uniform vec4 SCREEN_PARAMS;
+uniform vec4 BCAS_SHARPEN;
+uniform vec4 BCAS_SHARP2;
+uniform vec4 BCAS_AURA;
+uniform vec4 BCAS_ATMO;
+uniform vec4 BCAS_DECONV;
+uniform vec4 BCAS_GRADE_A;
+uniform vec4 BCAS_GRADE_B;
+uniform vec4 BCAS_EXTRA;
+uniform vec4 BCAS_CDL_S;
+uniform vec4 BCAS_CDL_O;
+uniform vec4 BCAS_CDL_P;
+uniform vec4 BCAS_SEC_S;
+uniform vec4 BCAS_SEC_O;
+uniform vec4 BCAS_SEC_P;
+
+varying vec2 PS_TEXCOORD0;
+
+// ---- grading (from cinema pass) ----
+#define EXPOSURE_EV   BCAS_GRADE_A.x
+#define WB_TEMP       BCAS_GRADE_A.y
+#define WB_TINT       BCAS_GRADE_A.z
+#define SATURATION    BCAS_GRADE_A.w
+
+#define VIBRANCE      BCAS_GRADE_B.x
+#define CONTRAST      BCAS_GRADE_B.y
+#define LIGHTNESS     BCAS_GRADE_B.z
+#define GAMMA         BCAS_GRADE_B.w
+
+#define FILMIC        BCAS_EXTRA.x
+#define SUN_FILL      BCAS_EXTRA.y
+#define SUN_UV        BCAS_EXTRA.zw
+
+#define SLOPE         BCAS_CDL_S.xyz
+#define SEC_ON        BCAS_CDL_S.w
+#define OFFSET        BCAS_CDL_O.xyz
+#define HL_DESAT      BCAS_CDL_O.w
+#define POWER         BCAS_CDL_P.xyz
+#define SEC_SLOPE     BCAS_SEC_S.xyz
+#define SEC_OFFSET    BCAS_SEC_O.xyz
+#define ORIGINAL_MIX  BCAS_SEC_O.w
+#define SEC_POWER     BCAS_SEC_P.xyz
+
+// ---- sharpen (from studio pass) ----
+#define DECONV_STRENGTH BCAS_DECONV.x
+#define DECONV_GATE     BCAS_DECONV.y
+#define DECONV_PENETR   BCAS_DECONV.z
+
+#define STRENGTH      BCAS_SHARPEN.x
+#define NOISE_REDUCE  BCAS_SHARPEN.y
+#define ANTI_RING     BCAS_SHARPEN.z
+#define DARK_PROT     BCAS_SHARPEN.w
+
+#define RANGE_SIGMA   BCAS_SHARP2.x
+#define SPATIAL_SIGMA BCAS_SHARP2.y
+#define CENTER_W      BCAS_SHARP2.z
+#define NOISE_FLOOR   BCAS_SHARP2.w
+
+#define AR_THRESH     BCAS_AURA.x
+#define AR_OVER_L     BCAS_AURA.y
+#define AR_OVER_D     BCAS_AURA.z
+#define CHROMA_PROT   BCAS_AURA.w
+
+#define VIGNETTE      BCAS_ATMO.x
+#define GRAIN         BCAS_ATMO.y
+#define TIME          BCAS_ATMO.z
+
+vec3 ApplyCDL(vec3 x, vec3 slope, vec3 offset, vec3 power)
+{
+    x = clamp(x * slope + offset, 0.0, 1.0);
+    return pow(max(x, vec3(1e-6)), power);
+}
+
+vec3 ToLinear(vec3 c)
+{
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(c / 12.92, hi, step(vec3(0.04045), c));
+}
+
+vec3 ToGamma(vec3 c)
+{
+    vec3 hi = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(c * 12.92, hi, step(vec3(0.0031308), c));
+}
+
+float HighlightMask(float Y)
+{
+    float t = clamp((Y - 0.6) / 0.4, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+float slt(float x, float s)
+{
+    s = max(s, 1e-6);
+    return s * x / (abs(x) + s);
+}
+
+// Cinema grading engine as a pure per-pixel function (was PASS 1/2 main).
+vec3 GradePixel(vec3 color, vec2 uv)
+{
+    vec3 orig = color;
+
+    color *= exp2(EXPOSURE_EV);
+
+    vec3 wb = vec3(exp2(0.20 * WB_TEMP), exp2(0.12 * WB_TINT), exp2(-0.20 * WB_TEMP));
+    color *= wb * (3.0 / (wb.r + wb.g + wb.b + 1e-6));
+
+    vec3 cdl = ApplyCDL(color, SLOPE, OFFSET, POWER);
+    vec3 cdl2 = ApplyCDL(cdl, SEC_SLOPE, SEC_OFFSET, SEC_POWER);
+    color = mix(cdl, cdl2, clamp(SEC_ON, 0.0, 1.0));
+
+    color += LIGHTNESS;
+    color = (color - 0.5) * (1.0 + CONTRAST) + 0.5;
+
+    color = pow(max(color, vec3(0.0)), vec3(1.0 / max(GAMMA, 0.01)));
+
+    // Global Directional Sun Fill (top-left sun lighting)
+    if (SUN_FILL > 0.001) {
+        float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        // Headroom gate: on bright ground (savanna/white turf) the old flat
+        // additive + tint pushed everything straight into the clip -> the
+        // whole patch blew out. Scale the sun contribution by remaining
+        // headroom so bright tiles get almost nothing, mid/dark unchanged.
+        float head = smoothstep(1.0, 0.45, luma);
+        float sun_grad = clamp(1.35 - (uv.x * 0.55 + uv.y * 0.60), 0.0, 1.0);
+        sun_grad = sun_grad * sun_grad;
+        vec3 sun_tint = vec3(1.14, 1.05, 0.92);
+        color = mix(color, color * sun_tint + vec3(0.05, 0.035, 0.015) * sun_grad, SUN_FILL * sun_grad * 0.65 * head);
+        float hl_mask = smoothstep(0.40, 0.85, luma);
+        color += vec3(0.08, 0.06, 0.03) * (hl_mask * SUN_FILL * 0.40 * head);
+        color += (SUN_UV.x + SUN_UV.y) * 0.0;
+    }
+
+    if (FILMIC > 0.001) {
+        vec3 lin = ToLinear(clamp(color, 0.0, 1.0));
+        vec3 num = lin * (2.51 * lin + 0.03);
+        vec3 den = lin * (2.43 * lin + 0.59) + 0.14;
+        color = mix(color, ToGamma(clamp(num / den, 0.0, 1.0)), FILMIC);
+    }
+
+    float yt = 0.25 * color.r + 0.5 * color.g + 0.25 * color.b;
+    float ct = color.g - 0.5 * (color.r + color.b);
+    float co = color.r - color.b;
+    float cmag = sqrt(co * co + ct * ct);
+    float vibMask = clamp(1.0 - cmag / 0.6, 0.0, 1.0);
+    float wl = pow(clamp(4.0 * yt * (1.0 - yt), 0.0, 1.0), 1.1);
+    float satFactor = max(SATURATION, 0.0);
+    satFactor += VIBRANCE * (vibMask * wl);
+    satFactor *= 1.0 - HighlightMask(dot(color, vec3(0.2126, 0.7152, 0.0722))) * HL_DESAT;
+    color = mix(vec3(yt), color, satFactor);
+
+    color = mix(color, orig, clamp(ORIGINAL_MIX, 0.0, 1.0));
+    return color;
+}
+
+void main()
+{
+    vec2 px = SCREEN_PARAMS.zw;
+    if (px.x <= 0.0 || px.y <= 0.0) {
+        px = vec2(1.0 / 1280.0, 1.0 / 720.0);
+    }
+
+    // 5-tap raw fetch, then grade each tap. GradePixel is per-pixel and uv
+    // only enters the sun gradient, so grading the taps == grading the image
+    // first and then fetching neighbours (the old two-pass semantics).
+    // CLAMP each graded tap: the old chain wrote cinema's output to an RGBA8
+    // target (clamp(color,0,1)) and studio sharpened THAT. Feeding unclamped
+    // graded values into the sharpen statistics made Ye exceed 1 in bright
+    // regions -> sc=Ysharp/Ye flattened chroma and pinned luminance -> the
+    // whole bright band read whiter and rougher than the two-pass chain.
+    vec3 eR = texture2D(SRC_IMAGE, PS_TEXCOORD0).rgb;
+    vec3 bR = texture2D(SRC_IMAGE, PS_TEXCOORD0 + vec2( 0.0, -px.y)).rgb;
+    vec3 dR = texture2D(SRC_IMAGE, PS_TEXCOORD0 + vec2(-px.x,  0.0)).rgb;
+    vec3 fR = texture2D(SRC_IMAGE, PS_TEXCOORD0 + vec2( px.x,  0.0)).rgb;
+    vec3 hR = texture2D(SRC_IMAGE, PS_TEXCOORD0 + vec2( 0.0,  px.y)).rgb;
+
+    vec3 e  = clamp(GradePixel(eR, PS_TEXCOORD0), 0.0, 1.0);
+    vec3 b3 = clamp(GradePixel(bR, PS_TEXCOORD0 + vec2( 0.0, -px.y)), 0.0, 1.0);
+    vec3 d3 = clamp(GradePixel(dR, PS_TEXCOORD0 + vec2(-px.x,  0.0)), 0.0, 1.0);
+    vec3 f3 = clamp(GradePixel(fR, PS_TEXCOORD0 + vec2( px.x,  0.0)), 0.0, 1.0);
+    vec3 h3 = clamp(GradePixel(hR, PS_TEXCOORD0 + vec2( 0.0,  px.y)), 0.0, 1.0);
+
+    vec3 WY = vec3(0.25, 0.5, 0.25);
+    vec3 CO = vec3(1.0, 0.0, -1.0);
+    vec3 CG = vec3(-0.5, 1.0, -0.5);
+    vec4 nbrY = vec4(dot(b3, WY), dot(d3, WY), dot(f3, WY), dot(h3, WY));
+    vec4 Co4  = vec4(dot(b3, CO), dot(d3, CO), dot(f3, CO), dot(h3, CO));
+    vec4 Cg4  = vec4(dot(b3, CG), dot(d3, CG), dot(f3, CG), dot(h3, CG));
+
+    float Ye  = dot(e, WY);
+    float Coe = dot(e, CO);
+    float Cge = dot(e, CG);
+
+    vec4 diffY = nbrY - Ye;
+
+    // === 1. Local statistics ===
+    float madY = dot(abs(diffY), vec4(0.25));
+    float mco  = dot(abs(Co4 - Coe), vec4(0.25));
+    float mcg  = dot(abs(Cg4 - Cge), vec4(0.25));
+    float mc   = 0.5 * (mco + mcg);
+
+    float eu  = clamp(1.0 - (abs(nbrY.x - nbrY.w) + abs(nbrY.y - nbrY.z)) / (4.0 * madY + 1e-6), 0.0, 1.0);
+    float iso = clamp((madY - 2.0 * min(madY, mc)) / max(madY, 1e-6), 0.0, 1.0);
+
+    // === 2. Bilateral base ===
+    float sg = clamp(RANGE_SIGMA * (1.0 + 0.6 * (1.0 - clamp(madY / 0.05, 0.0, 1.0))), 0.01, 2.0);
+    float i2 = 0.5 / max(sg * sg, 1e-6);
+    float ws = SPATIAL_SIGMA > 0.001 ? exp(-0.5 / max(SPATIAL_SIGMA * SPATIAL_SIGMA, 1e-4)) : 1.0;
+    float cw = max(CENTER_W, 0.0);
+    vec4 soft = diffY * diffY + vec4(1.5e-5);
+    vec4 w4 = exp(-soft * i2) * ws;
+    float Ybase = (dot(nbrY, w4) + Ye * cw) / max(dot(w4, vec4(1.0)) + cw, 1e-6);
+
+    // === 3. Asymmetric ink deconvolution (ZERO white ringing halo) ===
+    float lapY = dot(diffY, vec4(0.25));
+    float edgeActivity = smoothstep(DECONV_GATE * 0.4, DECONV_GATE * 1.6, madY);
+    float inkDeepen = min(0.0, -lapY) * edgeActivity * (DECONV_STRENGTH * 2.2);
+
+    // === 4. High-frequency bilateral detail ===
+    float det = (Ye - Ybase) * mix(1.0, 0.6, iso) * mix(1.0, 0.8, eu);
+
+    float nf = max(NOISE_FLOOR, 0.0078);
+    float nm = mix(1.0 - NOISE_REDUCE, 1.0, clamp(madY / nf, 0.0, 1.0));
+    float cpg = 1.0 - CHROMA_PROT * clamp(mc / (madY + 1e-6), 0.0, 1.0);
+
+    float s0 = 0.16 * (1.0 + 3.0 * clamp(madY / 0.05, 0.0, 1.0));
+    s0 *= (0.7 + 0.6 * (4.0 * Ye * (1.0 - Ye)));
+    s0 *= (0.75 + 0.25 * cpg);
+
+    float raw = det * (STRENGTH * 0.85) * nm * cpg;
+    float y0 = Ye + slt(max(0.0, raw), s0 * 0.22) + slt(min(0.0, raw), s0);
+
+    float th = max(1e-6, nf * DARK_PROT);
+    float y1 = mix(Ye, y0, clamp((y0 - th) / max(0.04, th), 0.0, 1.0));
+
+    // === 5. AURA anti-overshoot ===
+    float Ysharp = y1;
+    if (ANTI_RING > 0.0 && madY > AR_THRESH) {
+        float mn5 = min(Ye, min(min(nbrY.x, nbrY.y), min(nbrY.z, nbrY.w)));
+        float mx5 = max(Ye, max(max(nbrY.x, nbrY.y), max(nbrY.z, nbrY.w)));
+        float md = max(min(mx5 - Ye, Ye - mn5), 1e-6);
+        float sd = y1 - Ye;
+        Ysharp = Ye + slt(max(0.0, sd), md + AR_OVER_L * 0.45) + slt(min(0.0, sd), max(Ye - mn5, 0.05) + AR_OVER_D * 4.0);
+        Ysharp = min(Ysharp, mx5);
+    }
+
+    // === 6. Asymmetric ink steepening ===
+    Ysharp += inkDeepen * nm * cpg;
+    Ysharp = min(Ysharp, Ye + 0.004);
+    Ysharp = clamp(Ysharp, 0.0, 1.0);
+
+    float sc = 1.0;
+    if (Ye > 1e-6) {
+        sc = mix(1.0, clamp(Ysharp / Ye, 0.82, 1.0), smoothstep(0.0, 0.1, Ye));
+    }
+    float tmp = Ysharp - 0.5 * sc * Cge;
+    vec3 color = vec3(tmp + 0.5 * sc * Coe, sc * Cge + tmp, tmp - 0.5 * sc * Coe);
+
+    // Atmosphere (graded space, same as the old studio tail)
+    if (VIGNETTE > 0.001) {
+        vec2 vc = PS_TEXCOORD0 - 0.5;
+        color *= 1.0 - VIGNETTE * smoothstep(0.35, 0.95, dot(vc, vc) * 2.4);
+    }
+
+    if (GRAIN > 0.001) {
+        vec2 gp = PS_TEXCOORD0 * SCREEN_PARAMS.xy + vec2(TIME * 61.7, TIME * 23.1);
+        float n = fract(dot(gp, vec2(12.9898, 78.233)) * 43758.5453);
+        color += (n - 0.5) * GRAIN * 0.13;
+    }
+
+    // Single TPDF dither (old chain dithered per pass; one is equivalent)
+    float d1 = fract(dot(gl_FragCoord.xy, vec2(12.9898, 78.233)) * 43758.5453);
+    float d2 = fract(dot(gl_FragCoord.yx, vec2(78.233, 12.9898)) * 24634.6345);
+    color += (d1 - d2) * (1.0 / 512.0);
+
+    gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+}

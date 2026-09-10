@@ -11,14 +11,15 @@ BCAS-Studio/                 ← Mod 本体（整体复制到 DST mods 目录即
 │   ├── bcas_screen.lua      ← 画质工作室面板：7 页签 / 拖拽行 / 白平衡色轮
 │   ├── bcas_sun_emitter.lua ← 动态太阳：日晷模型 / 剪影投影 / 透云光束
 │   └── bcas_ocean.lua       ← 海洋地皮调色（世界生成时烘焙）
-├── shaders/                 ← 构建产物（bcas_cinema/studio/glow×5 .ksh，勿手改）
+├── shaders/                 ← 构建产物（bcas_cinema/studio/glow + bloom_pre/d1..d3，勿手改）
 ├── fonts/                   ← 思源黑体 85px 视网膜重铸版（见 ATTRIBUTION.txt）
 └── anim/                    ← 投影剪影动画（wilson_shad / wilsonbeefalo_shad）
 src_shaders/                 ← 全部 GLSL ES 源码
 ├── bcas_cinema.ps           ← PASS 1 电影调色引擎
 ├── bcas_studio.ps           ← PASS 2 锐化与终合成
-├── bcas_glow.ps / glow2.ps  ← 辉光合成 A/B
-├── bcas_kawase*.ps          ← Kawase 金字塔（pre/2/4/8）
+├── bcas_glow.ps             ← 辉光合成（mip 金字塔四级一次合成）
+├── bcas_bloom_pre.ps        ← 辉光金字塔头：软膝高光提取 + 软化
+├── bcas_bloom_down.ps       ← mip 逐级下采样（三个尺寸实例）
 └── postprocess_base.vs      ← 后处理公共顶点着色器
 tools/
 ├── build_ksh.py             ← GLSL → .ksh 组装器（minify + 条目表交叉校验）
@@ -33,7 +34,7 @@ docs/                        ← 架构 / 能力矩阵 / 构建指南 / 工坊�
 ```
 启动: main.lua
   ├─ BuildModShaders()      → modmain.AddModShadersInit → State.InitShader()
-  │     注册 bcas_cinema / bcas_studio 后处理 pass + 辉光子管线（5 个 ksh）
+  │     注册主链 pass（默认 bcas_merged_glow：调色+锐化+辉光单 pass）+ mip 金字塔
   │     AddUniformVariable × 17 → 套用预设（modinfo PRESET 或持久化档）
   └─ SortAndEnableShaders() → modmain.AddModShadersSortAndEnable → State.SortAndStart()
         SetPostProcessEffectAfter(effect, Lunacy) → GetPersistentString 异步读档 → 生效
@@ -57,14 +58,17 @@ PASS 2  bcas_studio.ksh   锐化与终合成
 ## 辉光子管线（BloomOn 接管）
 
 ```
-原生 Bloom：钩住 SetBloomEnabled 强制置空（画质设置反复重开也被拦截）
-辉光:      场景降采样
-             → kawase_pre  软膝预滤（GlowThreshold/GlowKnee 双段门槛）
-             → kawase2/4/8 三层递增步长金字塔
-             → bcas_glow   核心层+中环层合成（BCAS_GLOW/GLOW2）
-             → bcas_glow2  宽环+长尾+暖偏移+光包裹+轮廓光
-                           +透云光束+Reinhard 压缩+与场景终合成
+原生 Bloom：钩住 SetBloomEnabled，mod 启用期间恒关（BloomOn 关掉 = 真的无辉光）
+主链（默认 MERGED_PASS=on）：全分辨率只 1 个 pass
+  bcas_merged_glow  调色 + 锐化 + 辉光合成 一次完成
+    金字塔（4 个 sampler，1/4 → 1/32）：
+      bloom_pre   软膝高光提取 + 4 抽头软化
+      bloom_d1/2/3  mip 逐级 2x 下采样
+    SAMPLER[1..4] 由 Lua 按 AddSampler 顺序挂到主 pass
+回退（MERGED_PASS=off）：cinema -> studio -> bcas_glow 独立合成 pass
 ```
+性能：全分辨率 pass 从 3（cinema/studio/glow）一路降到 **1**；金字塔每级仅
+4 抽头、尺寸逐级减半，无稀疏大步长采样（无方块/斜向拖影）。
 
 ## 动态太阳光影（世界空间，非屏幕空间）
 

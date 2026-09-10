@@ -458,6 +458,24 @@ local function LogSwapWrite(shadow, tag, sym, b, s)
     end
 end
 
+-- 装备的皮肤 build：优先 GetSkinBuild()；个别手持物在客户端返回空，但皮肤
+-- build 已经写在物品实体 AnimState 上（≠ prefab、也 ≠ swap_prefab）——用它
+-- 兜底，避免"换了皮肤的影子被还原成默认原皮"。
+local function EquipSkinBuild(item)
+    if item == nil then return nil end
+    local sb = item.GetSkinBuild ~= nil and item:GetSkinBuild() or nil
+    if sb ~= nil and sb ~= "" then return sb end
+    if item.AnimState ~= nil and item.AnimState.GetBuild ~= nil then
+        local hb = item.AnimState:GetBuild()
+        local pf = item.prefab
+        if hb ~= nil and hb ~= "" and type(pf) == "string"
+            and hb ~= pf and hb ~= ("swap_" .. pf) then
+            return hb
+        end
+    end
+    return nil
+end
+
 local function SyncPlayerEquipment(source, pa, sa, shadow)
     local inv = source.replica ~= nil and source.replica.inventory or nil
 
@@ -492,8 +510,8 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
         local slots = _G.EQUIPSLOTS or { HANDS = "hands", HEAD = "head", BODY = "body" }
         for eslot, slot_name in pairs(slots) do
             local item = inv:GetEquippedItem(slot_name)
-            local skin_build = item ~= nil and item.GetSkinBuild ~= nil and item:GetSkinBuild() or nil
-            if skin_build ~= nil and skin_build ~= "" and item.GUID ~= nil then
+            local skin_build = EquipSkinBuild(item)
+            if skin_build ~= nil and item.GUID ~= nil then
                 local slot_sym = (slot_name == "hands") and "swap_object" or ("swap_" .. slot_name)
                 skinned_equips = skinned_equips or {}
                 skinned_equips[slot_name] = { item = item, sym = slot_sym, skin = skin_build }
@@ -640,7 +658,7 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
             local swap_build = (swd ~= nil and swd.sym_build)
                 or ("swap_" .. tostring(hand.prefab))
             local sym_name = (swd ~= nil and swd.sym_name) or swap_build
-            local skin = hand.GetSkinBuild ~= nil and hand:GetSkinBuild() or nil
+            local skin = EquipSkinBuild(hand)
             if swap_build ~= nil and swap_build ~= "" then
                 local last = sym_cache["swap_object"]
                 if skin ~= nil and skin ~= "" then

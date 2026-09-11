@@ -32,6 +32,10 @@ Assets = {
     -- （见 scripts/bcas_glint.lua / src_shaders/bcas_glint.ps）
     Asset("ANIM", "anim/pbr_water.zip"),
     Asset("SHADER", "shaders/bcas_glint.ksh"),
+
+    -- BCAS Studio 设置面板图集（圆角面板/卡片/胶囊/旋钮，由 tools/build_ui_atlas.py 生成）。
+    -- 必须在此声明：mod 图集不声明 Asset，引擎不会加载，面板会整块透明只剩文字。
+    Asset("ATLAS", "images/bcas_ui.xml"),
 }
 
 local State = require "bcas_state"

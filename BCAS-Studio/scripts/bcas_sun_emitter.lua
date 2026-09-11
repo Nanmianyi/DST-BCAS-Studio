@@ -679,26 +679,6 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
         end
     end
 
-    -- 1d) 诊断（临时）：本地玩家每 ~2 秒回读源/影子的关键符号，定位"写了没生效"。
-    if shadow._is_player and source == _G.ThePlayer then
-        local sc = (shadow._scan_count or 0) + 1
-        shadow._scan_count = sc
-        if sc % 24 == 0 then
-            local function rbs(a, sym)
-                if a == nil or a.GetSymbolOverride == nil then return "noapi" end
-                local b, s = a:GetSymbolOverride(sym)
-                return tostring(b) .. "|" .. tostring(s)
-            end
-            local rl = {}
-            for k in pairs(reserved) do rl[#rl + 1] = k end
-            print(string.format(
-                "[BCAS] 装回读 源 hat=%s body=%s hbh=%s obj=%s || 影 hat=%s body=%s hbh=%s obj=%s | res={%s}",
-                rbs(pa, "swap_hat"), rbs(pa, "swap_body"), rbs(pa, "headbase_hat"), rbs(pa, "swap_object"),
-                rbs(sa, "swap_hat"), rbs(sa, "swap_body"), rbs(sa, "headbase_hat"), rbs(sa, "swap_object"),
-                table.concat(rl, ",")))
-        end
-    end
-
     -- 2) 普通装备镜像（照抄 3794362938 成熟实现）：从原角色的 pa:GetSymbolOverride 读回！
     -- 原版斧头/手杖/木甲装备时，服务端把 swap_axe/swap_cane/armor_wood 写进了原角色的普通覆盖表。
     -- pa:GetSymbolOverride(sym) 能正确读出真实的 swap build 与 symbol！
@@ -837,50 +817,6 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
             sa:Hide("ARM_carry")
             sa:Show("ARM_normal")
         end
-    end
-
-    -- 5) 装备探针（临时诊断，发布前移除）：equip/unequip 事件触发一轮，
-    --    把"源读回→占用→写入缓存→影子状态"全链路打进 client_log，
-    --    一次测试实锤"空气手持/帽子弹回"的断链点。
-    if shadow._diag_next then
-        shadow._diag_next = nil
-        local function rb(sym)
-            if pa.GetSymbolOverride == nil then return "noapi" end
-            local b, s = pa:GetSymbolOverride(sym)
-            return tostring(b) .. "|" .. tostring(s)
-        end
-        local parts = {}
-        if inv ~= nil and inv.GetEquippedItem ~= nil then
-            local slots = _G.EQUIPSLOTS or { HANDS = "hands", HEAD = "head", BODY = "body" }
-            for _, slot_name in pairs(slots) do
-                local ok_i, it = pcall(inv.GetEquippedItem, inv, slot_name)
-                if ok_i and it ~= nil then
-                    local sn = it.GetSkinName ~= nil and tostring(it:GetSkinName()) or "?"
-                    local sk = it.GetSkinBuild ~= nil and tostring(it:GetSkinBuild()) or "?"
-                    local bd = it.AnimState ~= nil and it.AnimState.GetBuild ~= nil
-                        and tostring(it.AnimState:GetBuild()) or "?"
-                    parts[#parts + 1] = slot_name .. "=" .. tostring(it.prefab)
-                        .. " 皮肤:" .. sn .. "/" .. sk .. " 实体build:" .. bd
-                end
-            end
-        end
-        local res, eqc, syc = {}, {}, {}
-        for k in pairs(reserved) do res[#res + 1] = k end
-        for k, v in pairs(eq_cache) do
-            eqc[#eqc + 1] = k .. ":" .. tostring(v.skin or v.guid) .. "@" .. tostring(v.sym)
-        end
-        for k, v in pairs(sym_cache) do syc[#syc + 1] = k .. ":" .. tostring(v[1]) end
-        print(string.format(
-            "[BCAS] 探针[%s]: 读回 obj=(%s) hat=(%s) body=(%s) | 占用={%s} | 背包: %s"
-            .. " | sym缓存: %s | eq缓存: %s | 影build=%s 影skin=%s",
-            tostring(source == _G.ThePlayer and "本地" or "远端"),
-            rb("swap_object"), rb("swap_hat"), rb("swap_body"),
-            table.concat(res, ","),
-            #parts > 0 and table.concat(parts, " ;; ") or "空手",
-            table.concat(syc, ","),
-            table.concat(eqc, ","),
-            tostring(sa.GetBuild ~= nil and sa:GetBuild() or "?"),
-            tostring(sa.GetSkinBuild ~= nil and sa:GetSkinBuild() or "?")))
     end
 end
 
@@ -1187,15 +1123,9 @@ local function BindShadowListeners(ent)
         -- Equipment / skin changes: force a full re-mirror (SetBuild wipes
         -- overrides, so the splat must re-apply swap symbols after any
         -- wardrobe/equip change; unequip must clear the old swap).
-        -- _diag_next：只对装备类事件开一轮探针（临时诊断，发布前移除）。
-        local function sync_now_diag()
-            local sh = ent._bcas_shadow
-            if sh ~= nil and sh:IsValid() then sh._diag_next = true end
-            sync_now()
-        end
-        ent:ListenForEvent("equip", sync_now_diag)
-        ent:ListenForEvent("unequip", sync_now_diag)
-        ent:ListenForEvent("ms_playerchangeclothing", sync_now_diag)
+        ent:ListenForEvent("equip", sync_now)
+        ent:ListenForEvent("unequip", sync_now)
+        ent:ListenForEvent("ms_playerchangeclothing", sync_now)
         ent:ListenForEvent("skinmaxchanged", sync_now)
     end
 

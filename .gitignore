@@ -48,3 +48,52 @@ BCAS-Studio/modicon_verify.png
 /星露谷光影.png
 /石头.png
 /modinfo_description.txt
+
+# 本地推广计划（不外发）
+docs/PROMO_PLAN.md
+
+# 工作台 work/：只入库脚本 + 少量证据图。
+# 大件渲染产物、本机美术/引擎素材解包产物一律不入库（脚本可重新生成）。
+work/font_final/
+work/_engine_shaders/
+work/gs/
+work/_dyn/
+work/dbg/
+work/*.zip
+work/*.ksh
+work/*.ksh.ps
+work/*.ksh.vs
+work/_anim*
+work/_e.ksh
+work/_t_*.lua
+work/_old_emitter.lua
+work/_promo_section3.md
+work/sim*.png
+work/*_normal.png
+work/dbg*.png
+work/caus_*.png
+work/fin_*.png
+work/port_*.png
+work/v2_preview.png
+work/v3_preview.png
+work/v4_shallow.png
+work/bcas_ui_*.png
+work/bcas_engine_preview.png
+work/_fillsim_*.png
+work/_finalsim_*.png
+work/_mapsim_*.png
+work/_shadowpreview_*.png
+work/_sim_*.png
+work/_wilson_*.png
+work/_faint_*.png
+work/_atlas_*.png
+work/_accent_check.png
+work/_knob_check.png
+work/_pill_test.png
+work/_zoom*.png
+work/_hdr_sim.png
+work/_shadow_wilson_levels.png
+
+# 根目录开发期临时图（正式图已入 docs/images/）
+/atlas_off*.png
+/font_*.png

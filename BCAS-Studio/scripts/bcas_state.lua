@@ -662,7 +662,7 @@ end
 -- 引擎在玩家设置变更 / 进世界时经 PostProcessor:SetBloomEnabled 反复重开
 -- 原生 Bloom（playerprofile ApplySettings，postprocesseffects.lua 的 Lua
 -- 方法记账 bloom_enabled 标志）。包装 metatable.__index 上的该方法
--- （光影绘卷同款做法）：我们辉光接管期间一律强制关，释放后原样放行
+-- （包装 __index 而非替换方法本身）：我们辉光接管期间一律强制关，释放后原样放行
 -- 玩家的原生设置值。效果：
 --   开我们 = 官方辉光必关（任何引擎路径都点不亮）；
 --   关我们 = 官方辉光恢复玩家自己的画质偏好。
@@ -873,8 +873,8 @@ end
 
 -- 注册辉光金字塔（2026-09 v2）：两个合成 pass + 4 级 1/4 分辨率 Kawase。
 -- 采样链输入 = 引擎辉光缓冲（SamplerEffectBase.BloomSampler，Klei 按实体
--- 写入的辉光源，引擎每帧照常填充、与原生 Bloom 效果的开关无关——光影绘卷
--- 已实测），逐级经 SamplerEffectBase.Shader 级联：
+-- 写入的辉光源，引擎每帧照常填充、与原生 Bloom 效果的开关无关——本项目
+-- 实测确认），逐级经 SamplerEffectBase.Shader 级联：
 --   级 1 = 软膝预滤 + Kawase 步长 1（= 金字塔 CORE，预滤后才模糊）
 --   级 2/3 = Kawase 步长 3/8（MID / HALO，每级仅 4 taps）
 -- 合成 A 绑 core+mid，合成 B 绑 wide+halo（多 AddSampler 槽位语义同引擎
@@ -890,8 +890,8 @@ end
 -- 合成 + 3 级 1/4 分辨率 Kawase（半径曲线 1.5/3.8/9.3 覆盖原四级
 -- 1.5/2.9/5.3/10.1，中环一级承载原 mid+wide 能量，少一个 pass）。
 -- 采样链输入 = 引擎辉光缓冲（SamplerEffectBase.BloomSampler，Klei 按实体
--- 写入的辉光源，引擎每帧照常填充、与原生 Bloom 效果的开关无关——光影绘卷
--- 已实测），逐级经 SamplerEffectBase.Shader 级联：
+-- 写入的辉光源，引擎每帧照常填充、与原生 Bloom 效果的开关无关——本项目
+-- 实测确认），逐级经 SamplerEffectBase.Shader 级联：
 --   级 1 = 软膝预滤 + Kawase 步长 1（= 金字塔 CORE，预滤后才模糊）
 --   级 2/3 = Kawase 步长 3/8（MID / HALO，每级仅 4 taps）
 -- 合成 pass（bcas_glow.ksh v4）SAMPLER[1..3] 依次绑三级金字塔输出，

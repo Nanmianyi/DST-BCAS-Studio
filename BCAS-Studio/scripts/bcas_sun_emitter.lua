@@ -29,6 +29,334 @@ local master_enabled = true
 
 local SHADOW_MAX_LENGTH = 2.4
 local SHADOW_MIN_LENGTH = 0.8
+-- 影子浓度（半透明）。0.50 = 比最早的 0.55 再透一点点
+-- （日出那段仍是 0→满分 的淡入，不受影响）。
+-- 注意：引擎是"逐张美术图分别混合"的，同一实体自身重叠处（帽子压头发、
+-- 树干叠树冠）浓度会叠加变深，这是引擎行为、不是 bug，别用提高浓度去压
+-- （上一版试过，影子会变得死黑）。
+local SHADOW_MAX_ALPHA = 0.50
+-- 满月夜影子的上限（仍然纯黑：影子只能有一个颜色，见 GetSunParams）。
+local SHADOW_MOON_ALPHA = 0.38
+
+-- ---------------------------------------------------------------------------
+-- 影子剪影着色器：纯色 + 均匀透明度（"没有描边"的真正来源）
+-- ---------------------------------------------------------------------------
+-- 影子是实体美术的黑色副本，所以**美术本身就是问题**：DST 的明暗/质感是一笔
+-- 笔画出来的，每个部件的边缘还带 1~2px 的半透明软边。在半透明混合下，软边
+-- 叠在另一个部件的实心上就加深成一条"黑色轮廓线"，内部的排线/网纹则显成浅色
+-- 线条 —— 这正是"人物有一层黑色轮廓线"。（rgb 恒 0 只能消掉彩色，消不掉
+-- alpha 差。）
+--
+-- 解法（本项目自研，实测结论）：引擎允许实体级自写着色器 —— AnimState 的
+-- SetDefaultEffectHandle 可以挂任意随模组发布的 .ksh，且对实体类型没有限制；
+-- 这是整套方案的前提。分两步：
+--
+--  1) 硬 alpha 测试（bcas_silhouette.ksh，固定逻辑、不依赖运行时开关）：
+--     >=0.30 一律抬成实心
+--     （整块影子只剩一个浓度），<0.30 的软边【丢弃】——不丢的话软边会混进
+--     混合、叠到别的部件上加深成线。
+--  2) 单层混合：影子被压到地面后"美术上下位置 = 远近"，所以同像素上不同部件
+--     的深度不一样。给每个影子再配一个【写深度孪生体】（同一 bank/build/动画/
+--     姿态，但不可见、只写深度），它先画（低一层），把每个像素最靠前那层的
+--     深度写进深度缓冲；可见影子后画并开启深度测试，于是同像素只有最靠前的
+--     那一层能落笔 —— 重叠不再叠加变深，用户截图里那些 1~2px 深色轮廓线才会
+--     真正消失。（只压平不做这一步的话，重叠加深与映射无关：离线实测三种
+--     alpha 映射的重叠加深带完全一样，约 30/255。）
+--
+-- 着色器由 tools/make_silhouette_shader.py 从**引擎自带 anim.ksh** 派生：
+-- uniform 表与 trailer 原样保留（引擎按名字喂 uniform、按 trailer 的
+-- vs_refs/ps_refs 绑槽位；表不一致会 ANGLE 断言硬闪退），只有 PS 多一段
+-- 哨兵控制的分支、VS 多一段哨兵控制的深度错位。哨兵 = FLOAT_PARAMS.z
+-- （SetFloatParams 第三个参数）：只有我们的影子设 2.0（可见层）/ 3.0（写深度
+-- 层），普通实体恒为 0，因此这段逻辑对普通实体永不生效。
+-- 三个固定变体（tools/make_silhouette_shader.py 从引擎 anim.ksh 派生）：
+--   visible = 本体可见剪影（alpha 压平 + 前推 LAYER_BIAS）
+--   write   = 写深度孪生体（alpha 压平 + 输出 alpha 0 + 前推 0）
+--   fx      = 装备克隆（可见，整体后撤 FX_BACKOFF）
+-- 【为什么不用哨兵】上一版把整套逻辑挂在一个运行时 uniform（FLOAT_PARAMS.z）
+-- 上，引擎一旦把它清掉/没喂到，压平与深度错位就【静默】全失效 —— 表现就是
+-- 线条一直在、疯狂闪、缺块，而且怎么调数值都没用。现在每个变体都是固定逻辑，
+-- 不读任何哨兵，也不依赖 SetFloatParams 是否成功。
+local SHADOW_FLAT_ENABLED = true
+-- 写深度孪生体总开关（性能不够时可单独关掉：只剩硬 alpha 压平）。
+local SHADOW_WRITE_TWIN = true
+-- 万一某个实体的影子出现"顶点碎成一块块"（说明引擎对这个实体用了 skinned
+-- 顶点布局，非 skinned 版就会这样），把这里改成 true 即可切到照抄引擎
+-- anim_skinned.ksh 的备用变体（六个 ksh 都随模组发布）。
+local SHADOW_SKINNED_FALLBACK = false
+-- 每个符号一个离散深度档（见着色器里 PARAMS.y 的用法）：同一像素上高度几乎
+-- 相同的两个部件（脸贴在头上、帽子压在头发上）靠它分胜负。它只是加分项 ——
+-- 着色器的深度错位主要来自顶点属性（美术高度/图集 u/图集页），即使这个编号
+-- 一个都没生效，也不会退化成"打平 -> 两层都画 -> 线条"。
+local SHADOW_SYMBOL_KEY = true
+-- 部件名候选：通用名 + prefab_/build_ 前缀。用 BuildHasSymbol 过滤，结果按
+-- build 缓存（每个 build 只算一次）。覆盖 DST 角色/生物/建筑常见符号名。
+local SYMBOL_CANDIDATES = {
+    "body", "head", "hair", "face", "beard", "hand", "arm", "leg", "foot",
+    "torso", "tail", "nose", "ear", "hat", "skirt", "cheek", "eye", "eyebrow",
+    "mouth", "pupil", "horn", "wing", "tusk", "collar", "pouch", "saddle",
+    "saddlebag", "mane", "spike", "shell", "fin", "claw", "tooth", "jaw",
+    "tongue", "stem", "leaf", "petal", "root", "trunk", "branch", "canopy",
+    "fruit", "flower", "gem", "light", "glow", "emblem", "strap", "belt",
+    "cape", "scarf", "mask", "crown", "helmet", "shield", "beak", "snout",
+    "hoof", "paw", "finger", "thumb", "shoulder", "knee", "elbow", "belly",
+    "chest", "back", "headbase_hat", "swap_object", "swap_hat", "swap_body",
+}
+local SYMBOL_KEY_MAX = 40
+local symbol_key_cache = {}
+
+-- 可见影子 AnimState -> 写深度孪生体 AnimState（弱键：实体销毁后自动回收）
+local twin_as_of = setmetatable({}, { __mode = "k" })
+
+-- 【唯一入口】把一次"符号级"AnimState 调用同时下发到可见层与写深度孪生体。
+-- 孪生体是"每像素只留最近一层"的关键，它必须与可见层【几何完全一致】：
+-- 只要有一处显隐/覆盖只落在可见层，孪生体就会在那些像素上照旧画出那块美术，
+-- 写下比可见层更近的深度，把可见层整块拒掉 —— 表现就是"影子缺一大块 + 边缘
+-- 狂闪"。2026-09-12 实测：戴帽/全盔时可见层 Hide("face")/Hide("HAIR")、
+-- Hide("swap_body")，孪生体没跟着藏，人物的脸就这样整块没了。
+-- 注意：图层/深度/着色器这些【两边本就不同】的设置不要走这里。
+local function BothAS(sa, method, ...)
+    if sa == nil then return end
+    local fn = sa[method]
+    if fn ~= nil then pcall(fn, sa, ...) end
+    local tas = twin_as_of[sa]
+    if tas ~= nil then
+        local fn2 = tas[method]
+        if fn2 ~= nil then pcall(fn2, tas, ...) end
+    end
+end
+
+-- 返回该 build 上"存在的符号 -> 编号"表（编号 1..40，按候选表顺序稳定分配）
+local function GetSymbolKeys(sa, build)
+    if not SHADOW_SYMBOL_KEY or sa == nil or sa.BuildHasSymbol == nil then
+        return nil
+    end
+    if type(build) ~= "string" or build == "" then return nil end
+    local cached = symbol_key_cache[build]
+    if cached ~= nil then return cached end
+    symbol_key_cache[build] = {}   -- 先占位：失败时缓存空表，不重复扫
+    local out = symbol_key_cache[build]
+    local k = 0
+    local prefab = build
+    -- ipairs：编号必须跨会话稳定（pairs 顺序由哈希决定，换一次运行可能换一套档）
+    for _, name in ipairs(SYMBOL_CANDIDATES) do
+        local ok, has = pcall(sa.BuildHasSymbol, sa, name)
+        if ok and has then
+            k = k + 1
+            out[name] = k
+        end
+        local pname = prefab .. "_" .. name
+        local ok2, has2 = pcall(sa.BuildHasSymbol, sa, pname)
+        if ok2 and has2 then
+            k = k + 1
+            out[pname] = k
+        end
+        if k >= SYMBOL_KEY_MAX then break end
+    end
+    return out
+end
+
+-- 把编号表刷到"可见影子 + 写深度孪生体"两边，且【孪生体先刷】：
+-- 孪生体没接受的编号，可见层也一并清掉（档位必须两边一致）。方向不能反 ——
+-- 可见层的档位只要比孪生体小一点点，那个部件就会被孪生体的深度整块拒掉。
+-- （BuildHasSymbol/SetSymbolLightOverride 都是引擎调用，出错只影响深度档，
+-- 所以全部 pcall。）
+local function ApplySymbolKeys(sa, build)
+    if sa == nil or sa.SetSymbolLightOverride == nil then return end
+    local keys = GetSymbolKeys(sa, build)
+    if keys == nil then return end
+    local tas = twin_as_of[sa]
+    for name, k in pairs(keys) do
+        local ok = false
+        if tas ~= nil then
+            ok = pcall(tas.SetSymbolLightOverride, tas, name, k)
+        end
+        if ok or tas == nil then
+            pcall(sa.SetSymbolLightOverride, sa, name, k)
+        else
+            -- 孪生体没接受：可见层也不给这个编号，两边都退回默认档
+            pcall(sa.SetSymbolLightOverride, sa, name, 0)
+        end
+    end
+end
+
+-- 三个通道（旧代码里的 MODE_* 现在就是变体名，调用点不用改）
+local SHADOW_MODE_VISIBLE = "visible"   -- 本体可见剪影
+local SHADOW_MODE_WRITE = "write"       -- 写深度孪生体
+local SHADOW_MODE_VISIBLE_FX = "fx"     -- 装备克隆
+local SHADOW_SHADER_FILES = {
+    visible = "shaders/bcas_silhouette.ksh",
+    write = "shaders/bcas_silhouette_write.ksh",
+    fx = "shaders/bcas_silhouette_fx.ksh",
+}
+local SHADOW_SHADER_FILES_SKINNED = {
+    visible = "shaders/bcas_silhouette_skinned.ksh",
+    write = "shaders/bcas_silhouette_write_skinned.ksh",
+    fx = "shaders/bcas_silhouette_fx_skinned.ksh",
+}
+-- kind -> 解析结果（nil 未解析 / false 失败）
+local shadow_shader_paths = {}
+-- 一次性自检：第一个影子建出来时把"着色器是否真的挂上了"打进日志。
+-- 这类静默失效以前排查过好几轮（渲染不对但日志干净），留一条现场证据。
+local shader_selftest_done = false
+-- kind -> 最近一次 SetDefaultEffectHandle 是否成功（自检用）
+local shader_apply_ok = {}
+
+local function ResolveShadowShader(kind)
+    local cached = shadow_shader_paths[kind]
+    if cached ~= nil then return cached end
+    shadow_shader_paths[kind] = false
+    local name = (SHADOW_SKINNED_FALLBACK and SHADOW_SHADER_FILES_SKINNED
+        or SHADOW_SHADER_FILES)[kind] or SHADOW_SHADER_FILES.visible
+    local ok, p = pcall(_G.resolvefilepath, name)
+    if ok and type(p) == "string" and p ~= "" then
+        shadow_shader_paths[kind] = p
+    else
+        print("[BCAS] 剪影着色器路径解析失败，影子回退引擎默认着色器: " .. tostring(name))
+    end
+    return shadow_shader_paths[kind]
+end
+
+-- kind: SHADOW_MODE_VISIBLE / SHADOW_MODE_WRITE / SHADOW_MODE_VISIBLE_FX
+local function ApplyShadowShader(sa, kind)
+    if not SHADOW_FLAT_ENABLED then return false end
+    if sa == nil or sa.SetDefaultEffectHandle == nil then return false end
+    kind = kind or SHADOW_MODE_VISIBLE
+    local path = ResolveShadowShader(kind)
+    if path == false then return false end
+    -- SetBuild / SetSkin 会把默认 effect 打回 build 自带的那套，所以每次换
+    -- build / 皮肤之后都要重挂一次（只在变化时调用，不逐帧）。
+    local ok = pcall(sa.SetDefaultEffectHandle, sa, path)
+    shader_apply_ok[kind] = ok
+    -- FLOAT_PARAMS 归零：着色器拿它的 .y 当"美术上界"（0 -> 512 默认），
+    -- .z 必须为 0，否则引擎会给顶点加 ±0.025 的浮动（floater 用的）。
+    if sa.SetFloatParams ~= nil then
+        pcall(sa.SetFloatParams, sa, 0, 0, 0)
+    end
+    return ok
+end
+
+-- ---------------------------------------------------------------------------
+-- 写深度孪生体（单层混合的关键）
+-- ---------------------------------------------------------------------------
+-- 影子被 ANIM_ORIENTATION.OnGround 压到地面后，"美术上下位置"就变成了世界远近，
+-- 所以同一个像素上不同部件的深度并不相同。孪生体与可见影子同 bank/build/动画/
+-- 姿态，但【不可见、只写深度】，而且放在更早的图层先画：每个像素被它写上
+-- "最靠前那一层"的深度；可见影子后画并开深度测试，于是同一像素只有最靠前的
+-- 一层能落笔 —— 重叠不再叠加变深。
+--
+-- 孪生体的显隐 = 影子可见 且 影子 alpha 不为 0。只在状态翻转时下发。
+local function UpdateTwinVisible(shadow)
+    local tw = shadow._wtwin
+    if tw == nil or not tw:IsValid() then return end
+    local want = shadow._shown ~= false and shadow._alpha_on ~= false
+    if want ~= shadow._twin_shown then
+        shadow._twin_shown = want
+        if want then
+            pcall(tw.Show, tw)
+        else
+            pcall(tw.Hide, tw)
+        end
+    end
+end
+
+-- 把可见影子的引擎态镜像到孪生体。what = "all" 时用影子侧缓存值一次性重建
+-- （建孪生体时用）；其余情况传引擎方法名与参数，只在状态变化处调用。
+local function MirrorTwin(shadow, what, ...)
+    local tw = shadow._wtwin
+    if tw == nil or not tw:IsValid() then return end
+    local as = tw.AnimState
+    if what ~= "all" then
+        local fn = as[what]
+        if fn ~= nil then pcall(fn, as, ...) end
+        -- SetBuild / SetSkin 会把默认 effect 打回 build 自带的那套：镜像完必须
+        -- 重挂一次，否则孪生体会用引擎着色器整块 quad 写深度（全都不拒绝，
+        -- 重叠线条照旧，正是"猪屋没事、人物还有线"的原因）。
+        ApplyShadowShader(as, SHADOW_MODE_WRITE)
+        return
+    end
+    if shadow._last_bank_hash ~= nil and as.SetBank ~= nil then
+        pcall(as.SetBank, as, shadow._last_bank_hash)
+    end
+    if shadow._last_build ~= nil and as.SetBuild ~= nil then
+        pcall(as.SetBuild, as, shadow._last_build)
+    end
+    if shadow._last_skin ~= nil and as.SetSkin ~= nil then
+        pcall(as.SetSkin, as, shadow._last_skin, shadow._last_build or "")
+    end
+    if shadow._last_anim_hash ~= nil and as.PlayAnimation ~= nil then
+        pcall(as.PlayAnimation, as, shadow._last_anim_hash,
+            shadow._last_anim_loop ~= false)
+    end
+    if shadow._last_frame ~= nil and as.SetFrame ~= nil then
+        local okn, num = pcall(as.GetCurrentAnimationNumFrames, as)
+        if okn and num and num > 0 then
+            pcall(as.SetFrame, as, shadow._last_frame % num)
+        end
+    end
+    if as.SetScale ~= nil then
+        pcall(as.SetScale, as, shadow._last_flip and -1 or 1, 1)
+    end
+    ApplyShadowShader(as, SHADOW_MODE_WRITE)
+end
+
+-- 安全性：孪生体是可见影子的子实体（位置/旋转/缩放自动继承），镜像只用影子侧
+-- 已缓存的值（不多读源实体）。
+-- 【2026-09-12 修正】孪生体必须与可见层【几何逐像素一致】：符号显隐、符号覆盖、
+-- override build 现在全部经 BothAS 同时下发两边。之前"少一块几何只会少拒绝一点
+-- 重叠"的判断是错的 —— 孪生体多画出来的那块（例如可见层已经 Hide 掉的头发/脸、
+-- 已经换掉的 bank）会在那些像素上写下更近的深度，把可见层整块拒掉，正是
+-- "人物脸没了 + 边缘狂闪"的来源。着色器没解析出来时不建孪生体。
+local function MakeWriteTwin(shadow)
+    if not SHADOW_FLAT_ENABLED or not SHADOW_WRITE_TWIN then return nil end
+    if ResolveShadowShader(SHADOW_MODE_WRITE) == false then return nil end
+    local tw = CreateEntity()
+    tw.entity:AddTransform()
+    tw.entity:AddAnimState()
+    tw.entity:SetCanSleep(false)
+    tw.persists = false
+    tw._is_shadow_twin = true
+    -- 乘色 alpha 用 0.001 而不是 0：alpha 恒 0 的实体有被引擎整块跳过绘制的风险，
+    -- 那样一个深度都不会写、"每像素只留最近一层"直接失效。着色器的 WRITE 档
+    -- 会把输出 alpha 拍成 0，所以它依然完全不可见，这 0.001 只是让引擎照常画它。
+    tw.AnimState:SetMultColour(0, 0, 0, 0.001)
+    pcall(tw.AnimState.SetManualBB, tw.AnimState, 0, 0, 0, 0)
+    tw.AnimState:UsePointFiltering(false)
+    -- 早于可见影子所在的 LAYER_WORLD_BACKGROUND，保证"先写深度、后画可见层"
+    tw.AnimState:SetLayer(LAYER_BACKGROUND)
+    tw.AnimState:SetOrientation(ANIM_ORIENTATION.OnGround)
+    -- 只写深度：测试【开】+ 写入开 —— 测试开是关键：引擎按美术 z 序画部件，
+    -- 而我们的地面投影里"后画的部件更远"（美术高度已经变成远近），若不做测试，
+    -- 缓冲最后留下的是"最后画的那层"，可见层就全都放行（线条照旧）。开了测试，
+    -- 缓冲里只留每像素最近那层的深度；可见层再往前推一点点（shader 里的
+    -- LAYER_BIAS），于是只有最近那层能落笔。孪生体自身靠 WRITE 档输出 alpha 0。
+    pcall(tw.AnimState.SetDepthWriteEnabled, tw.AnimState, true)
+    pcall(tw.AnimState.SetDepthTestEnabled, tw.AnimState, true)
+    ApplyShadowShader(tw.AnimState, SHADOW_MODE_WRITE)
+    if shadow._is_mover then
+        tw.Transform:SetNoFaced()
+    else
+        tw.Transform:SetEightFaced()
+    end
+    tw:AddTag("FX")
+    tw:AddTag("NOBLOCK")
+    tw:AddTag("DECOR")
+    tw:AddTag("NOCLICK")
+    tw.entity:SetParent(shadow.entity)
+    shadow._wtwin = tw
+    -- 登记进"可见层 -> 孪生体"表：此后所有符号级调用（BothAS）都会同时下发，
+    -- 保证两边几何逐像素一致 —— 这是"不带描边又不缺块"的前提。
+    twin_as_of[shadow.AnimState] = tw.AnimState
+    -- 先关着：等首轮姿态/alpha 同步确认后再亮，避免拿空状态写深度
+    shadow._alpha_on = true
+    if shadow._shown == nil then shadow._shown = true end
+    pcall(tw.Hide, tw)
+    shadow._twin_shown = false
+    MirrorTwin(shadow, "all")
+    UpdateTwinVisible(shadow)
+    return tw
+end
+
 local TWICE_MAX = 2.0 * SHADOW_MAX_LENGTH
 local DUSK_HYPOT = math.sqrt(SHADOW_MAX_LENGTH * SHADOW_MAX_LENGTH + SHADOW_MIN_LENGTH * SHADOW_MIN_LENGTH)
 local DUSK_ROTATION = math.deg(math.atan(SHADOW_MAX_LENGTH / SHADOW_MIN_LENGTH))
@@ -48,8 +376,18 @@ local shaft_ents = {}
 local static_roster = {}
 local roster_n = 0
 
+-- 清掉写深度孪生体（DropAllShadowEntities 在 DestroyShadow 之前定义，
+-- 这里内联做同样的事，避免前向引用）
+local function DropShadowTwin(shadow)
+    local tw = shadow._wtwin
+    shadow._wtwin = nil
+    if shadow.AnimState ~= nil then twin_as_of[shadow.AnimState] = nil end
+    if tw ~= nil and tw:IsValid() then tw:Remove() end
+end
+
 local function DropAllShadowEntities()
     for shadow, ent in pairs(dynamic_shadows) do
+        DropShadowTwin(shadow)
         if shadow:IsValid() then
             shadow:Remove()
         end
@@ -62,6 +400,7 @@ local function DropAllShadowEntities()
         dynamic_shadows[shadow] = nil
     end
     for shadow, ent in pairs(static_shadows) do
+        DropShadowTwin(shadow)
         if shadow:IsValid() then
             shadow:Remove()
         end
@@ -247,18 +586,21 @@ local function GetSunParams()
             local leg1 = TWICE_MAX * (progress - 0.5)
             scale_y = math.sqrt(leg1 * leg1 + SHADOW_MIN_LENGTH * SHADOW_MIN_LENGTH)
             rot = math.deg(math.atan(leg1 / SHADOW_MIN_LENGTH))
-            a = 0.55 * math.min(1, time / FADE)
+            a = SHADOW_MAX_ALPHA * math.min(1, time / FADE)
         elseif phase == "dusk" then
             scale_y = DUSK_HYPOT
             rot = DUSK_ROTATION
-            a = 0.55 * (1 - progress)
+            a = SHADOW_MAX_ALPHA * (1 - progress)
         elseif phase == "night" and moon == 1 then
             local leg1 = TWICE_MAX * (progress - 0.5)
             scale_y = math.sqrt(leg1 * leg1 + SHADOW_MIN_LENGTH * SHADOW_MIN_LENGTH)
             rot = math.deg(math.atan(leg1 / SHADOW_MIN_LENGTH))
-            a = 0.40 * math.min(1, progress / FADE)
-            r, g, b = 0.10, 0.15, 0.30
+            a = SHADOW_MOON_ALPHA * math.min(1, progress / FADE)
+            -- 影子只能有一个颜色：满月也不染色。染色会乘进美术 RGB，
+            -- 把白色描边/眼睛图案从影子里透出来（用户反复反馈的那个）。
         end
+        -- 季节/天气只压一点点：浓度一旦掉回 0.8 出头，多层叠加的深浅块就会
+        -- 重新露出来（见 SHADOW_MAX_ALPHA 的说明），所以这里不再大幅下调。
         if state.season == "winter" then a = a * 0.85
         elseif state.season == "summer" then a = a * 1.10 end
         if state.precipitation == "rain" or state.precipitation == "snow" then
@@ -350,6 +692,8 @@ local function CopyFrame(pa, sa, shadow, allow_restart)
                 and shadow._last_frame ~= nil and frame < shadow._last_frame - 2
                 and shadow._last_anim_name ~= nil then
                 sa:PlayAnimation(shadow._last_anim_name, LOOP_ANIMS[shadow._last_anim_name] == true)
+                MirrorTwin(shadow, "PlayAnimation", shadow._last_anim_name,
+                    LOOP_ANIMS[shadow._last_anim_name] == true)
                 shadow._last_frame = nil
                 return
             end
@@ -358,6 +702,7 @@ local function CopyFrame(pa, sa, shadow, allow_restart)
                 local num = sa:GetCurrentAnimationNumFrames()
                 if num and num > 0 then
                     sa:SetFrame(frame % num)
+                    MirrorTwin(shadow, "SetFrame", frame % num)
                 end
             end
         end
@@ -390,15 +735,15 @@ local function CopyLeaves(pa, sa, shadow, force)
     end
     shadow._last_leaf = key
     if leaf_build then
-        sa:OverrideSymbol("swap_leaves", leaf_build, leaf_sym or "swap_leaves")
+        BothAS(sa, "OverrideSymbol", "swap_leaves", leaf_build, leaf_sym or "swap_leaves")
     elseif shadow._is_birch then
         -- Winter / barren: no canopy. Keep trunk-only splat.
-        sa:ClearOverrideSymbol("swap_leaves")
+        BothAS(sa, "ClearOverrideSymbol", "swap_leaves")
     end
 end
 
--- DLC 角色影子的正解（2026-09-09，抄自工坊 3794362938 DST Shadows 的成熟
--- 实现）：**不猜任何 build 名**。每帧把 sa:GetBuild() 镜像到影子（SetBuild
+-- DLC 角色影子的正解（2026-09-09）：**不猜任何 build 名**。每帧把
+-- sa:GetBuild() 镜像到影子（SetBuild
 -- 不打断动画），皮肤 build 用 ss:SetSkin(skin, base_build) 镜像——DLC 角色
 -- （wurt/wortox/wormwood/wanda/walter）的基础美术全走皮肤系统，GetBuild()
 -- 报 "wilson"（共享 bank 的基础 build），美术本体在 GetSkinBuild() 里，
@@ -416,7 +761,7 @@ local SWAP_SYMBOLS = {
     "swap_body_short", "swap_body_tall", "swap_arm",
 }
 
--- 2026-09 装备镜像重建（照抄工坊 3794362938 DST Shadows 的实现）：
+-- 2026-09 装备镜像重建：
 --   * 带皮肤的手持/护甲由引擎经 OverrideItemSkinSymbol（皮肤表）上装，
 --     该表无任何读回——GetSymbolOverride 只能看到普通表，普通表在换装时
 --     冻结，这就是"影子拿上一次的工具/开局空手"的根因；
@@ -445,7 +790,7 @@ local PLAYER_EQUIP_SYMBOLS = {
 }
 
 local function GetItemEquipSkinData(item, slot_sym)
-    -- 原版姿势（torch/hats 等 prefab 的 onequip 照抄）：
+    -- 原版写法（torch/hats 等 prefab 的 onequip 惯例）：
     --   手持: owner:OverrideItemSkinSymbol("swap_object", skin_build, "swap_"..prefab, GUID, "swap_"..prefab)
     --   帽子/护甲: owner:OverrideItemSkinSymbol("swap_hat"/"swap_body", skin_build, "swap_hat"/"swap_body", GUID, fname)
     -- 第三参是皮肤 build 内部的【源符号名】。此前误传 item.AnimState:GetBuild()
@@ -471,8 +816,11 @@ local CLOTHING_SYMBOLS = {
     "leg", "skirt", "tail", "torso", "torso_pelvis",
 }
 
--- 手持/帽子等核心符号的写入日志（临时诊断，量少直接打）。
+-- 手持/帽子等核心符号的写入日志开关。默认静默（发布版日志干净）；
+-- 排查影子装备问题时把 DEBUG_SWAP_LOG 改成 true，每个影子最多打 10 行。
+local DEBUG_SWAP_LOG = false
 local function LogSwapWrite(shadow, tag, sym, b, s)
+    if not DEBUG_SWAP_LOG then return end
     if sym ~= "swap_object" and sym ~= "swap_hat" and sym ~= "swap_body" then return end
     shadow._swap_logs = (shadow._swap_logs or 0) + 1
     if shadow._swap_logs <= 10 then
@@ -498,6 +846,325 @@ local function EquipSkinBuild(item)
     return nil
 end
 
+-- 【离线实证 · 2026-09-12】这些 build 里没有装备槽要写的那个符号。
+-- 判据来源：解析游戏 anim 文件（tools/build_symbols.py + anim_fullscan.py），
+-- 用已知可用的 pickaxe_lunarplant / hat_football 反推出 Klei 的符号哈希
+-- （sdbm）后逐一核对：
+--   staff_lunarplant  缺 swap_staff_lunarplant（只有 _broken_float 变体）
+--   sword_lunarplant  缺 swap_sword_lunarplant
+--   scythe_voidcloth  缺 swap_scythe
+--   hat_lunarplant    缺 swap_hat
+--   hat_voidcloth     缺 swap_hat
+--   armor_voidcloth   缺 swap_body
+--   boomerang_voidcloth 缺 swap_boomerang
+-- 写了这种覆盖的后果：引擎会退而渲染该 build 的默认符号（残缺美术）——
+-- 这正是"戴盔后影子脑袋变小"的真凶。这些装备一律不写覆盖，改走物品美术克隆。
+local NO_SWAP_SYMBOL_BUILDS = {
+    staff_lunarplant = true,
+    sword_lunarplant = true,
+    scythe_voidcloth = true,
+    hat_lunarplant = true,
+    hat_voidcloth = true,
+    armor_voidcloth = true,
+    boomerang_voidcloth = true,
+    nightmare_axe = true,
+}
+
+-- 替补符号表：上面的 build 里没有装备槽那个符号，但【有别的符号装着本体】。
+-- 帽子两个 build 里都有 hat01（离线扫描 ascii+hash 双证），那才是盔体；
+-- 原版头盔本体走引擎的换头机制（headbase_hat），FX 只画辉光——所以照 FX 做的
+-- 克隆只能画出特效，看着像没戴。改把 hat01 挂到 swap_hat 位置上就对了。
+local ITEM_SYMBOL_FALLBACK = {
+    hat_lunarplant = "hat01",
+    hat_voidcloth = "hat01",
+}
+
+-- ============================================================================
+--  物品美术克隆（FX 克隆）
+--  离线实证（2026-09-12 解析 anim 文件）：裂隙装备的 build 里【没有】swap_* 符号 ——
+--    staff_lunarplant / sword_lunarplant / scythe_voidcloth / hat_lunarplant /
+--    hat_voidcloth 的 build 不含 swap_staff_lunarplant / swap_sword_lunarplant /
+--    swap_scythe / swap_hat 这些名字（对照组 pickaxe / shovel / hat_football
+--    都含，所以它们一直正常）。原版这些装备靠【独立 FX 实体】显示，而且不少是
+--    【多条剪辑拼装、一条剪辑一个实体】：镰刀的刀身/柄/布/辉光分属
+--    swap_loop_1 / _6 / _7 / _8 四条剪辑——只播一条就只出一部分
+--    （"暗影镰刀只显示镰刀柄"就是这么来的）。
+--  影子没有这些 FX，写符号覆盖只会是空气。这里按同一机制给影子生成克隆：
+--    bank/build 取自物品实体，剪辑按下面的表（逐条抄自原版 FX_DEFS），
+--    跟随影子符号位，明暗与影子同步，耐久状态（broken 标签）镜像。
+-- ============================================================================
+local CLONE_ANIMS = { "swap_loop", "idle", "anim" }
+-- 帽子：原版头盔 FX（hats.lua lunarplanthat_CreateFxFollowFrame）用 idle1/2/3
+-- （按朝向三档）。"anim" 是展示动画，播出来是空的。
+local CLONE_ANIMS_HAT = { "idle1", "idle2", "idle3", "anim" }
+local CLONE_ANIMS_BROKEN = { "broken" }
+
+-- 需要【多实体拼装】的 build → 剪辑表。每条 = {剪辑, frame_begin, frame_end}，
+-- 逐条抄自原版 FX_DEFS：frame_begin/frame_end 是【该部件在拼装动画里的帧位】，
+-- 原版把它俩传给 FollowSymbol。不传的话部件按默认帧位摆放 ——
+-- "镰刀多出一条往下挂的刀头 / 战斧重合一把镐" 就是这么来的。
+local CLONE_CLIPS = {
+    -- voidcloth_scythe.lua FX_DEFS
+    scythe_voidcloth = {
+        { "swap_loop_1", 0, 2 },
+        { "swap_loop_6", 5 },
+        { "swap_loop_7", 6 },
+        { "swap_loop_8", 7 },
+    },
+    -- sword_lunarplant.lua：blade1(0-3) + blade2(5-8)
+    sword_lunarplant = {
+        { "swap_loop1", 0, 3 },
+        { "swap_loop2", 5, 8 },
+    },
+    -- voidcloth_boomerang.lua FX_DEFS
+    boomerang_voidcloth = {
+        { "swap_loop_f1", 0, 2 },
+    },
+    -- shadow_battleaxe.lua FX_DEFS（"swap_level"..level.."_"..anim，默认 level 1）
+    nightmare_axe = {
+        { "swap_level1_f1", 0, 2 },
+        { "swap_level1_f4", 3 },
+        { "swap_level1_f6", 5 },
+        { "swap_level1_f7", 6 },
+        { "swap_level1_f8", 7 },
+    },
+    -- 帽子：原版 SpawnFollowFxForOwner 建 idle1/idle2/idle3 三个实体
+    -- （framebegin=1, frameend=3）。只建一个 = 只出一部分。
+    hat_lunarplant = {
+        { "idle1" }, { "idle2" }, { "idle3" },
+    },
+    hat_voidcloth = {
+        { "idle1" }, { "idle2" }, { "idle3" },
+    },
+}
+
+-- 带【等级】的装备（暗影战斧）：动画名形如 swap_level<N>_fM，物品自身动画是
+-- idle_level<N>。等级 = 耐久状态，必须镜像，否则部件来自不同等级 = 看着像
+-- 两把武器叠在一起（"战斧重合一把镐"）。f4 那条原版写死 forcelevel=1。
+local CLONE_CLIPS_LEVELED = {
+    nightmare_axe = function(lvl)
+        return {
+            { "swap_level" .. lvl .. "_f1", 0, 2 },
+            { "swap_level1_f4", 3 },
+            { "swap_level" .. lvl .. "_f6", 5 },
+            { "swap_level" .. lvl .. "_f7", 6 },
+            { "swap_level" .. lvl .. "_f8", 7 },
+        }
+    end,
+}
+
+-- 在临时实体上试播 idle_level1..4，与物品当前动画哈希对上的那一级就是它的等级。
+local function ResolveItemLevel(bank, build, item)
+    if item == nil or item.AnimState == nil
+        or item.AnimState.GetCurrentAnimationHash == nil then
+        return 1
+    end
+    local want = item.AnimState:GetCurrentAnimationHash()
+    if want == nil then return 1 end
+    local probe = CreateEntity()
+    probe.entity:AddTransform()
+    probe.entity:AddAnimState()
+    pcall(probe.AnimState.SetBank, probe.AnimState, bank)
+    pcall(probe.AnimState.SetBuild, probe.AnimState, build)
+    local lvl = 1
+    for L = 1, 4 do
+        local name = "idle_level" .. L
+        pcall(probe.AnimState.PlayAnimation, probe.AnimState, name, true)
+        if probe.AnimState.IsCurrentAnimation ~= nil
+            and probe.AnimState.GetCurrentAnimationHash ~= nil
+            and probe.AnimState:IsCurrentAnimation(name)
+            and probe.AnimState:GetCurrentAnimationHash() == want then
+            lvl = L
+            break
+        end
+    end
+    if probe:IsValid() then probe:Remove() end
+    return lvl
+end
+
+local function KillItemFx(shadow, slot)
+    local list = shadow["_itemfx_" .. slot]
+    if list ~= nil then
+        shadow["_itemfx_" .. slot] = nil
+        shadow["_itemfx_key_" .. slot] = nil
+        for i = 1, #list do
+            if list[i] ~= nil and list[i]:IsValid() then list[i]:Remove() end
+        end
+    end
+end
+
+-- 建一个克隆实体并播放指定剪辑；该剪辑不存在（验证不过）就返回 nil。
+-- fb/fe = 该部件在拼装动画里的帧位，原版经 FollowSymbol 传入。
+-- 外层 pcall：这段是引擎 API 用得最野的地方（任意 bank/build 的 SetBank /
+-- FollowSymbol），而调用它的路径跑在 DoPeriodicTask 里 —— DST 的调度器遇到
+-- 未捕获错误会【直接杀掉那个周期任务】（scheduler.lua Scheduler:Run →
+-- KillTask），一次出错就是整局所有影子不再更新（表现=影子全没了，且存盘
+-- 也修不回来，只能重进）。这里出错只丢这一个克隆，其余照常。
+local function MakeCloneEntInner(shadow, bank, build, clip, follow_sym, frame, fb, fe)
+    local fx = CreateEntity()
+    fx.entity:AddTransform()
+    fx.entity:AddAnimState()
+    fx.entity:AddFollower()
+    fx.entity:SetCanSleep(false)
+    fx.AnimState:SetBank(bank)
+    fx.AnimState:SetBuild(build)
+    pcall(fx.AnimState.PlayAnimation, fx.AnimState, clip, true)
+    if fx.AnimState.IsCurrentAnimation == nil
+        or not fx.AnimState:IsCurrentAnimation(clip) then
+        if fx:IsValid() then fx:Remove() end
+        return nil
+    end
+    if frame ~= nil and fx.AnimState.SetFrame ~= nil then
+        pcall(fx.AnimState.SetFrame, fx.AnimState, frame)
+    end
+    -- 剪影着色器 + 哨兵：装备影子也要纯色压平，否则会和本体影子风格不一致
+    -- （装备边缘的软边仍会显成线条）。必须在 SetBuild 之后挂（见函数注释）。
+    ApplyShadowShader(fx.AnimState, SHADOW_MODE_VISIBLE_FX)
+    -- 与影子本体同样的采样方式（线性 + mip）：物品克隆也常被压扁绘制，
+    -- 点采样会把刀身/杖头的细部件打成虚线（见影子创建处的同一处说明）。
+    fx.AnimState:UsePointFiltering(false)
+    -- 装备克隆在 LAYER_WORLD_BACKGROUND（晚于写深度孪生体的 LAYER_BACKGROUND）：
+    -- 本体孪生体先把深度写进去，装备影子与本体重叠的部分（在更远处）会被深度
+    -- 测试挡掉，不再和本体叠加变深。深度测试开、写入关（只挡别人、不改深度）。
+    fx.AnimState:SetLayer(LAYER_WORLD_BACKGROUND)
+    fx.AnimState:SetOrientation(ANIM_ORIENTATION.OnGround)
+    pcall(fx.AnimState.SetDepthTestEnabled, fx.AnimState, true)
+    pcall(fx.AnimState.SetDepthWriteEnabled, fx.AnimState, false)
+    -- 必须显式给颜色：新建 AnimState 的默认乘色可能全 0（=完全透明），
+    -- 那样克隆存在也不可见。先按影子当前浓度给一个，后面每轮同步。
+    local cr, cg, cb, ca = 0, 0, 0, SHADOW_MAX_ALPHA
+    if shadow.AnimState.GetMultColour ~= nil then
+        local okc, r0, g0, b0, a0 = pcall(shadow.AnimState.GetMultColour, shadow.AnimState)
+        if okc and r0 ~= nil then cr, cg, cb, ca = r0, g0, b0, a0 end
+    end
+    fx.AnimState:SetMultColour(cr, cg, cb, ca)
+    fx.Transform:SetNoFaced()
+    fx.persists = false
+    fx.entity:SetParent(shadow.entity)
+    fx:AddTag("FX")
+    fx:AddTag("NOCLICK")
+    pcall(fx.Follower.FollowSymbol, fx.Follower, shadow.GUID, follow_sym,
+        nil, nil, nil, true, nil, fb, fe)
+    return fx
+end
+
+local clone_error_reported = false
+local function MakeCloneEnt(shadow, bank, build, clip, follow_sym, frame, fb, fe)
+    local ok, fx = pcall(MakeCloneEntInner, shadow, bank, build, clip,
+        follow_sym, frame, fb, fe)
+    if not ok then
+        if not clone_error_reported then
+            clone_error_reported = true
+            print("[BCAS] 装备影子克隆失败（已忽略，不影响其它影子）: " .. tostring(fx))
+        end
+        return nil
+    end
+    return fx
+end
+
+local function SyncItemFx(shadow, slot, item, follow_sym, anims)
+    anims = anims or CLONE_ANIMS
+    if item == nil or item.AnimState == nil then
+        KillItemFx(shadow, slot)
+        return false
+    end
+    local bank = item.AnimState.GetCurrentBankName ~= nil
+        and item.AnimState:GetCurrentBankName() or nil
+    local build = item.AnimState.GetBuild ~= nil and item.AnimState:GetBuild() or nil
+    if type(bank) ~= "string" or bank == "" or type(build) ~= "string" or build == "" then
+        KillItemFx(shadow, slot)
+        return false
+    end
+    local want_broken = item.HasTag ~= nil and item:HasTag("broken")
+    -- 帽子：全覆盖盔的 FX 在原版跟随 headbase_hat（hats.lua SpawnFollowFxForOwner
+    -- 里 isfullhelm → "headbase_hat"），没有该符号时才退回 swap_hat。
+    if slot == "head" and shadow.AnimState ~= nil
+        and shadow.AnimState.BuildHasSymbol ~= nil then
+        local okh, has = pcall(shadow.AnimState.BuildHasSymbol,
+            shadow.AnimState, "headbase_hat")
+        if okh and has then follow_sym = "headbase_hat" end
+    end
+    -- 剪辑选择：损坏态 → broken；带等级的（战斧）→ 按物品当前等级取；
+    -- 多实体拼装表 → 逐条全建；其余（法杖等单体）→ 候选列表逐个试。
+    local clips, one_only, lvl_tag
+    local clip_fn = CLONE_CLIPS_LEVELED[build]
+    if want_broken then
+        clips, one_only = CLONE_ANIMS_BROKEN, true
+    elseif clip_fn ~= nil then
+        local lvl = ResolveItemLevel(bank, build, item)
+        clips, one_only, lvl_tag = clip_fn(lvl), false, "|L" .. tostring(lvl)
+    elseif CLONE_CLIPS[build] ~= nil then
+        clips, one_only = CLONE_CLIPS[build], false
+    else
+        clips, one_only = anims, true
+    end
+    local key = build .. "|" .. tostring(follow_sym) .. "|" .. tostring(slot)
+        .. (want_broken and "|b" or "|n") .. (lvl_tag or "")
+    if shadow["_itemfx_key_" .. slot] ~= key then
+        KillItemFx(shadow, slot)
+        -- 不套用"物品自身动画的帧号"：部件动画与物品动画帧数不同，套上去
+        -- 会让部件停在错位的帧（帽子最明显）。所有部件在同一轮创建、从同一帧
+        -- 起同步播放即可（原版套帧是为了跟手上动作对齐，影子不需要）。
+        local list = {}
+        for i = 1, #clips do
+            local entry = clips[i]
+            local clip, fb, fe
+            if type(entry) == "table" then
+                clip, fb, fe = entry[1], entry[2], entry[3]
+            else
+                clip = entry
+            end
+            local fx = MakeCloneEnt(shadow, bank, build, clip, follow_sym, nil, fb, fe)
+            if fx ~= nil then
+                list[#list + 1] = fx
+                if one_only then break end
+            end
+        end
+        if #list > 0 then
+            shadow["_itemfx_" .. slot] = list
+            shadow["_itemfx_key_" .. slot] = key
+        end
+    end
+    local list = shadow["_itemfx_" .. slot]
+    if list == nil then return false end
+    -- 每轮：颜色同步 + 跟随兜底
+    local cr, cg, cb, ca
+    if shadow.AnimState.GetMultColour ~= nil then
+        local okc, r0, g0, b0, a0 = pcall(shadow.AnimState.GetMultColour, shadow.AnimState)
+        if okc and r0 ~= nil then cr, cg, cb, ca = r0, g0, b0, a0 end
+    end
+    for i = 1, #list do
+        local fx = list[i]
+        if fx:IsValid() then
+            if cr ~= nil and fx.AnimState.SetMultColour ~= nil then
+                pcall(fx.AnimState.SetMultColour, fx.AnimState, cr, cg, cb, ca)
+            end
+            fx._age = (fx._age or 0) + 1
+            if fx._follow_ok == nil and fx._age >= 2 then
+                local px, py, pz = fx.Transform:GetWorldPosition()
+                fx._follow_ok = not (px == 0 and py == 0 and pz == 0)
+            end
+            if fx._follow_ok == false and shadow.Transform ~= nil then
+                pcall(fx.Transform.SetPosition, fx.Transform,
+                    shadow.Transform:GetWorldPosition())
+            end
+        end
+    end
+    return true
+end
+
+-- 影子销毁：连同它的物品美术克隆一起收掉（克隆是父级到影子的独立实体，
+-- 影子没了不清就会留下悬空 FX）。
+local function DestroyShadow(shadow)
+    if shadow == nil then return end
+    KillItemFx(shadow, "swap_object")
+    KillItemFx(shadow, "head")
+    KillItemFx(shadow, "body")
+    -- 写深度孪生体跟着影子一起销毁：留着会继续往深度缓冲写"已经没有影子"的形状
+    DropShadowTwin(shadow)
+    if shadow:IsValid() then shadow:Remove() end
+end
+
 local function SyncPlayerEquipment(source, pa, sa, shadow)
     local inv = source.replica ~= nil and source.replica.inventory or nil
 
@@ -508,12 +1175,10 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
         shadow._equip_cache = nil
         shadow._sym_cache = nil
         shadow._cloth_cache = nil
-        shadow._hbh_want = nil
         shadow._vis_key = nil
     end
 
-    -- 覆盖类扫描节流：5 帧扫一次（与参考 3794362938 的
-    -- shadow_override_scan_interval=5 一致），大幅减轻逐符号压力
+    -- 覆盖类扫描节流：5 帧扫一次，大幅减轻逐符号压力
     local counter = (shadow._equip_counter or 0) + 1
     shadow._equip_counter = counter
     if counter % 5 ~= 1 then return end
@@ -560,6 +1225,10 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
                     if type(pf) == "string" and pf:sub(-3) == "hat" then
                         default = "hat_" .. pf:sub(1, -4)
                     end
+                    -- 是否套了皮肤：按"实际 build ≠ 默认 build"判断。
+                    -- 不能用 GetSkinName()：客户端物品实体的皮肤名常常是空的，
+                    -- 日志实证 armor_marble_rockabs / backpack_dragonfly_fire
+                    -- 这类皮肤 build 会被判成 skin=false → 走普通覆盖 = 空气。
                     local is_skin
                     if default ~= nil then
                         is_skin = (actual ~= default)
@@ -569,7 +1238,7 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
                     hb_equips = hb_equips or {}
                     hb_equips[slot.name] = {
                         sym = slot.sym, build = actual, guid = item.GUID,
-                        skin = is_skin, base = default or pf,
+                        skin = is_skin, base = default or pf, ent = item,
                     }
                     reserved[slot.sym] = true
                 end
@@ -583,7 +1252,7 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
             if last == nil or last.build ~= d.build or last.guid ~= d.guid
                 or last.sym ~= d.sym or last.skin ~= d.skin then
                 eq_cache[slot_name] = { sym = d.sym, build = d.build, guid = d.guid, skin = d.skin }
-                pcall(sa.ClearOverrideSymbol, sa, d.sym)
+                BothAS(sa, "ClearOverrideSymbol", d.sym)
                 local done = false
                 if d.skin then
                     -- 皮肤 build 必须走引擎皮肤表：普通 OverrideSymbol 对皮肤
@@ -595,12 +1264,23 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
                         done = true
                         LogSwapWrite(shadow, "头身皮肤", d.sym, d.build, d.sym)
                     else
-                        pcall(sa.ClearOverrideSymbol, sa, d.sym)
+                        BothAS(sa, "ClearOverrideSymbol", d.sym)
                     end
                 end
                 if not done then
-                    pcall(sa.OverrideSymbol, sa, d.sym, d.build, d.sym)
-                    LogSwapWrite(shadow, "头身", d.sym, d.build, d.sym)
+                    local fb_sym = ITEM_SYMBOL_FALLBACK[d.build]
+                    if NO_SWAP_SYMBOL_BUILDS[d.build] and fb_sym == nil then
+                        -- 这个 build 里没有该符号、也没有替补：写覆盖会让引擎
+                        -- 渲染默认符号（残缺美术），一律不写，交克隆。
+                        BothAS(sa, "ClearOverrideSymbol", d.sym)
+                    else
+                        -- 有替补符号（帽子用 hat01）就把替补挂到装备槽位置；
+                        -- 否则按原样写。不要用 BuildHasSymbol 做守卫：日志实证
+                        -- 连源玩家自己在皮肤下对该 API 都返回 false，它不反映
+                        -- 装备符号是否存在，用它拦会把能显示的覆盖一起拦掉。
+                        BothAS(sa, "OverrideSymbol", d.sym, d.build, fb_sym or d.sym)
+                        LogSwapWrite(shadow, "头身", d.sym, d.build, fb_sym or d.sym)
+                    end
                 end
             end
         end
@@ -608,23 +1288,55 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
     for slot_name, last in pairs(eq_cache) do
         if hb_equips == nil or hb_equips[slot_name] == nil then
             eq_cache[slot_name] = nil
-            if last.sym ~= nil then pcall(sa.ClearOverrideSymbol, sa, last.sym) end
+            if last.sym ~= nil then BothAS(sa, "ClearOverrideSymbol", last.sym) end
         end
     end
 
-    -- 1b-pre) 全盔检测：原角色普通覆盖表里若有 headbase_hat → 这顶是全覆盖盔，
-    -- 1c 据此决定 HAIR / HEAD_HAT 图层（皮肤全盔读不回时会当作普通帽，也能显示）。
+    -- 1b-pre) 全盔检测：原角色普通覆盖表里若有 headbase_hat → 这顶是全覆盖盔。
     local head_equipped = hb_equips ~= nil and hb_equips["head"] ~= nil
     local head_is_fullhelm = false
     if head_equipped and pa.GetSymbolOverride ~= nil then
         local hb_build = pa:GetSymbolOverride("headbase_hat")
         head_is_fullhelm = hb_build ~= nil
     end
-    -- 1b) headbase_hat 换头路径在影子上不生效（非 player AnimState，见 1c），
-    -- 统一清掉；head_is_fullhelm 仍用于 1c 决定 HAIR / HEAD_HAT 图层。
+    -- 1b) headbase_hat 换头路径依赖 player AnimState 的 UseHeadHatExchange，
+    -- 影子（复制实体）用不了，统一清掉。全盔也走 swap_hat —— 在影子 build
+    -- 正确的前提下这条路能出完整盔型（"以前虚空风帽能显示"即此路径）。
     if shadow._hbh_cleared ~= true then
         shadow._hbh_cleared = true
-        pcall(sa.ClearOverrideSymbol, sa, "headbase_hat")
+        BothAS(sa, "ClearOverrideSymbol", "headbase_hat")
+    end
+
+    -- 1b-2) 头/身美术兜底（每轮）：符号覆盖写进去后引擎是否真的接受？
+    -- 裂隙装备的 build 里没有 swap_* 符号（见 SyncItemFx 注释），覆盖会被丢弃，
+    -- 表现为"日志写了但画面空气"。没被接受时改用物品美术克隆兜底。
+    shadow._head_art = false
+    if hb_equips ~= nil then
+        for slot_name, d in pairs(hb_equips) do
+            local applied = false
+            if d.skin == true then
+                applied = true   -- 皮肤走引擎皮肤表，另有回读确认，这里不重复判
+            elseif NO_SWAP_SYMBOL_BUILDS[d.build] and ITEM_SYMBOL_FALLBACK[d.build] == nil then
+                applied = false  -- 离线实证：该 build 无此符号、也无替补 → 必须用克隆
+            elseif d.ent ~= nil and sa.GetSymbolOverride ~= nil then
+                applied = sa:GetSymbolOverride(d.sym) ~= nil
+            end
+            if applied then
+                SyncItemFx(shadow, slot_name, nil)
+                if slot_name == "head" then
+                    -- 用替补符号画出来的盔体：保留头与头发，只显示 HAT 层
+                    shadow._head_art = (ITEM_SYMBOL_FALLBACK[d.build] ~= nil) and "fb" or true
+                end
+            else
+                -- 帽子用 idle1/idle2/idle3（原版头盔 FX 的动画），
+                -- 手持/身体用 swap_loop/idle。
+                SyncItemFx(shadow, slot_name, d.ent, d.sym,
+                    slot_name == "head" and CLONE_ANIMS_HAT or CLONE_ANIMS)
+            end
+        end
+    else
+        SyncItemFx(shadow, "head", nil)
+        SyncItemFx(shadow, "body", nil)
     end
 
     -- 1c) 图层显隐镜像（2026-09-11 关键修复）。
@@ -634,93 +1346,134 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
     -- 这正是"功能帽(swap_hat 走默认可见层)显示、全盔与护甲/背包不显示"的原因。
     -- 这里按装备情况把图层状态复刻成与原版 onequip 一致。
     local body_has = hb_equips ~= nil and hb_equips["body"] ~= nil
+    local head_art = shadow._head_art
     local vis_key = (head_equipped and "1" or "0") .. (head_is_fullhelm and "f" or "n")
         .. (body_has and "1" or "0")
+        .. (head_art == true and "a" or (head_art == "fb" and "b" or "-"))
     if shadow._vis_key ~= vis_key then
         shadow._vis_key = vis_key
-        if head_equipped and head_is_fullhelm then
-            -- 全盔：原版走 headbase_hat 换头并把 HAT 层 Hide；但换头机制在
-            -- 影子（非 player AnimState）上不生效，Hide HAT 会让已写好的
-            -- swap_hat 帽子一起消失（虚空风帽"头没了帽子也没有"的根因）。
-            -- 影子改为普通帽子路线：显示 HAT 层 + 我们的 swap_hat 覆盖，
-            -- 头盔美术本身自带整头造型，再 Hide HEAD 即可。
-            pcall(sa.Show, sa, "HAT"); pcall(sa.Hide, sa, "HAIR_HAT")
-            pcall(sa.Hide, sa, "HAIR_NOHAT"); pcall(sa.Hide, sa, "HAIR")
-            pcall(sa.Hide, sa, "HEAD")
-            pcall(sa.Show, sa, "HEAD_HAT")
-            pcall(sa.Show, sa, "HEAD_HAT_NOHELM")
-            pcall(sa.Show, sa, "HEAD_HAT_HELM")
-            pcall(sa.UseHeadHatExchange, sa, false)
-            pcall(sa.HideSymbol, sa, "face"); pcall(sa.HideSymbol, sa, "swap_face")
-            pcall(sa.HideSymbol, sa, "beard"); pcall(sa.HideSymbol, sa, "cheeks")
+        if head_equipped and head_art == "fb" then
+            -- 替补符号画出的盔体（hat01 挂在 swap_hat 上）：盔体完整覆盖头部，
+            -- 头/头发一律藏掉——实测保留头发会把盔顶掉一片。脸的部件也收起，
+            -- 免得从盔壳里穿出来。HAT 层显示（盔体就在 swap_hat 上）。
+            BothAS(sa, "Show", "HAT")
+            BothAS(sa, "Hide", "HAIR_HAT")
+            BothAS(sa, "Hide", "HAIR_NOHAT"); BothAS(sa, "Hide", "HAIR")
+            BothAS(sa, "Hide", "HEAD")
+            BothAS(sa, "Show", "HEAD_HAT")
+            BothAS(sa, "Hide", "HEAD_HAT_NOHELM")
+            BothAS(sa, "Show", "HEAD_HAT_HELM")
+            BothAS(sa, "UseHeadHatExchange", false)
+            BothAS(sa, "HideSymbol", "face"); BothAS(sa, "HideSymbol", "swap_face")
+            BothAS(sa, "HideSymbol", "beard"); BothAS(sa, "HideSymbol", "cheeks")
+        elseif head_equipped and not head_art then
+            -- 头盔美术走克隆（build 里没有 swap_hat 符号，比如亮茄头盔/虚空风帽）：
+            -- 保留角色原本的头与头发，帽子的美术由克隆实体画在上层。
+            -- 这里绝不 Hide("HEAD")，否则就是"戴盔把头吃掉"。
+            BothAS(sa, "Hide", "HAT")
+            BothAS(sa, "Show", "HEAD"); BothAS(sa, "Show", "HAIR")
+            BothAS(sa, "Show", "HAIR_NOHAT")
+            BothAS(sa, "Hide", "HEAD_HAT"); BothAS(sa, "Hide", "HEAD_HAT_HELM")
+            BothAS(sa, "UseHeadHatExchange", false)
+            BothAS(sa, "ShowSymbol", "face"); BothAS(sa, "ShowSymbol", "swap_face")
+            BothAS(sa, "ShowSymbol", "beard"); BothAS(sa, "ShowSymbol", "cheeks")
+        elseif head_equipped and head_is_fullhelm then
+            -- 全盔：完全照抄原版 fullhelm_onequip 的玩家分支（hats.lua:122）：
+            -- Hide HAT/HAIR*/HEAD，Show HEAD_HAT/HEAD_HAT_HELM，隐藏 face/beard，
+            -- 换头由上面的 headbase_hat 覆盖完成。不要再走 swap_hat —— 那不是
+            -- 全覆盖盔的路线。
+            BothAS(sa, "Hide", "HAT"); BothAS(sa, "Hide", "HAIR_HAT")
+            BothAS(sa, "Hide", "HAIR_NOHAT"); BothAS(sa, "Hide", "HAIR")
+            BothAS(sa, "Hide", "HEAD")
+            BothAS(sa, "Show", "HEAD_HAT")
+            BothAS(sa, "Hide", "HEAD_HAT_NOHELM")
+            BothAS(sa, "Show", "HEAD_HAT_HELM")
+            BothAS(sa, "UseHeadHatExchange", false)
+            BothAS(sa, "HideSymbol", "face"); BothAS(sa, "HideSymbol", "swap_face")
+            BothAS(sa, "HideSymbol", "beard"); BothAS(sa, "HideSymbol", "cheeks")
         elseif head_equipped then
-            pcall(sa.Show, sa, "HAT"); pcall(sa.Hide, sa, "HAIR_HAT")
-            pcall(sa.Show, sa, "HAIR_NOHAT"); pcall(sa.Show, sa, "HAIR")
-            pcall(sa.Hide, sa, "HEAD")
-            pcall(sa.Show, sa, "HEAD_HAT")
-            pcall(sa.Show, sa, "HEAD_HAT_NOHELM")
-            pcall(sa.Hide, sa, "HEAD_HAT_HELM")
-            pcall(sa.UseHeadHatExchange, sa, false)
-            pcall(sa.ShowSymbol, sa, "face"); pcall(sa.ShowSymbol, sa, "swap_face")
-            pcall(sa.ShowSymbol, sa, "beard"); pcall(sa.ShowSymbol, sa, "cheeks")
+            BothAS(sa, "Show", "HAT"); BothAS(sa, "Hide", "HAIR_HAT")
+            BothAS(sa, "Show", "HAIR_NOHAT"); BothAS(sa, "Show", "HAIR")
+            BothAS(sa, "Hide", "HEAD")
+            BothAS(sa, "Show", "HEAD_HAT")
+            BothAS(sa, "Show", "HEAD_HAT_NOHELM")
+            BothAS(sa, "Hide", "HEAD_HAT_HELM")
+            BothAS(sa, "UseHeadHatExchange", false)
+            BothAS(sa, "ShowSymbol", "face"); BothAS(sa, "ShowSymbol", "swap_face")
+            BothAS(sa, "ShowSymbol", "beard"); BothAS(sa, "ShowSymbol", "cheeks")
         else
-            pcall(sa.Hide, sa, "HAT")
-            pcall(sa.Show, sa, "HEAD"); pcall(sa.Show, sa, "HAIR")
-            pcall(sa.Show, sa, "HAIR_NOHAT")
-            pcall(sa.Hide, sa, "HEAD_HAT"); pcall(sa.Hide, sa, "HEAD_HAT_HELM")
-            pcall(sa.UseHeadHatExchange, sa, false)
-            pcall(sa.ShowSymbol, sa, "face"); pcall(sa.ShowSymbol, sa, "swap_face")
-            pcall(sa.ShowSymbol, sa, "beard"); pcall(sa.ShowSymbol, sa, "cheeks")
+            BothAS(sa, "Hide", "HAT")
+            BothAS(sa, "Show", "HEAD"); BothAS(sa, "Show", "HAIR")
+            BothAS(sa, "Show", "HAIR_NOHAT")
+            BothAS(sa, "Hide", "HEAD_HAT"); BothAS(sa, "Hide", "HEAD_HAT_HELM")
+            BothAS(sa, "UseHeadHatExchange", false)
+            BothAS(sa, "ShowSymbol", "face"); BothAS(sa, "ShowSymbol", "swap_face")
+            BothAS(sa, "ShowSymbol", "beard"); BothAS(sa, "ShowSymbol", "cheeks")
         end
         if body_has then
-            pcall(sa.Show, sa, "swap_body")
-            pcall(sa.ShowSymbol, sa, "swap_body")
-            pcall(sa.Show, sa, "backpack")
+            BothAS(sa, "Show", "swap_body")
+            BothAS(sa, "ShowSymbol", "swap_body")
+            BothAS(sa, "Show", "backpack")
+        else
+            -- 脱下护甲/背包：把身体图层与符号一并收起（只 Show 不 Hide
+            -- 会让上一件装备的轮廓留在影子上）。
+            BothAS(sa, "Hide", "swap_body")
+            BothAS(sa, "HideSymbol", "swap_body")
+            BothAS(sa, "Hide", "backpack")
         end
     end
 
-    -- 2) 普通装备镜像（照抄 3794362938 成熟实现）：从原角色的 pa:GetSymbolOverride 读回！
+    -- 2) 普通装备镜像：从原角色的 pa:GetSymbolOverride 读回！
     -- 原版斧头/手杖/木甲装备时，服务端把 swap_axe/swap_cane/armor_wood 写进了原角色的普通覆盖表。
     -- pa:GetSymbolOverride(sym) 能正确读出真实的 swap build 与 symbol！
+    -- 槽位读回镜像。两条硬伤（2026-09-12 日志实证）：
+    --   1) pa:GetSymbolOverride 经常返回【引擎内部哈希】（数字），拿它当 build
+    --      名写进去画不出任何东西（日志：swap_body <- 1806374379,3067666734）；
+    --   2) 源读回 nil 时清掉影子符号 —— 但穿皮肤/换装时源读回 nil 是正常的
+    --      （引擎把覆盖收进内部表），这会把我们刚用物品实体写好的覆盖抹掉
+    --      （日志：swap_body <- armor_marble_rockabs 之后紧跟 清除 nil,nil）。
+    -- 因此：只接受字符串 build；读不到不动影子符号，清理由 item-driven 路径负责。
     local function MirrorOne(sym)
         if reserved[sym] then return end
         if pa.GetSymbolOverride == nil then return end
         local sb, ssym = pa:GetSymbolOverride(sym)
+        if type(sb) ~= "string" or sb == "" then return end
+        if type(ssym) ~= "string" or ssym == "" then ssym = sb end
         local last = sym_cache[sym]
-        if sb ~= nil then
-            if last == nil or last[1] ~= sb or last[2] ~= ssym then
-                sym_cache[sym] = { sb, ssym }
-                LogSwapWrite(shadow, "槽位", sym, sb, ssym or sym)
-                sa:OverrideSymbol(sym, sb, ssym or sym)
-            end
-        elseif last ~= nil then
-            sym_cache[sym] = nil
-            LogSwapWrite(shadow, "清除", sym, nil, nil)
-            sa:ClearOverrideSymbol(sym)
+        if last == nil or last[1] ~= sb or last[2] ~= ssym then
+            sym_cache[sym] = { sb, ssym }
+            LogSwapWrite(shadow, "槽位", sym, sb, ssym)
+            BothAS(sa, "OverrideSymbol", sym, sb, ssym)
         end
     end
 
-    -- 镜像所有身体/帽子等装备槽符号
+    -- 镜像其余装备槽符号。核心三符号（手持/帽/身）一律不走这条：
+    -- 它们由物品实体驱动（步骤 1/3）唯一负责，读回路径掺和进来只会用哈希
+    -- 覆盖或清掉正确值（日志实证：swap_body <- armor_marble_rockabs 之后
+    -- 紧跟 槽位 1806374379 与 清除 nil,nil，护甲/背包因此不显示）。
+    local CORE_SYMS = { swap_object = true, swap_hat = true, swap_body = true }
     for i = 1, #PLAYER_EQUIP_SYMBOLS do
-        MirrorOne(PLAYER_EQUIP_SYMBOLS[i])
+        local sym = PLAYER_EQUIP_SYMBOLS[i]
+        if not CORE_SYMS[sym] then
+            MirrorOne(sym)
+        end
     end
 
-    -- 2b) 衣物部位镜像（"穿着空气"修复，照抄 3794362938 MirrorSkinSymbols）：
+    -- 2b) 衣物部位镜像（"穿着空气"修复）：
     -- 引擎 skinner 把衣物皮肤用 OverrideSkinSymbol 覆盖在身体部位符号上
     -- （torso/arm_upper/leg/foot...），GetSymbolOverride 可读回。注意必须
     -- 用 OverrideSkinSymbol 复刻——普通 OverrideSymbol 对皮肤部位不渲染。
+    -- 同样只接受字符串（读回哈希/空一律跳过，不清影子）。
     for i = 1, #CLOTHING_SYMBOLS do
         local sym = CLOTHING_SYMBOLS[i]
         local sb, ssym = pa:GetSymbolOverride(sym)
-        local last = cloth_cache[sym]
-        if sb ~= nil and sb ~= "" then
+        if type(sb) == "string" and sb ~= "" then
+            if type(ssym) ~= "string" or ssym == "" then ssym = sym end
+            local last = cloth_cache[sym]
             if last == nil or last[1] ~= sb or last[2] ~= ssym then
                 cloth_cache[sym] = { sb, ssym }
-                pcall(sa.OverrideSkinSymbol, sa, sym, sb, ssym or sym)
+                BothAS(sa, "OverrideSkinSymbol", sym, sb, ssym)
             end
-        elseif last ~= nil then
-            cloth_cache[sym] = nil
-            pcall(sa.ClearOverrideSymbol, sa, sym)
         end
     end
 
@@ -734,9 +1487,15 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
         has_hand_item = (pa.GetSymbolOverride ~= nil and pa:GetSymbolOverride("swap_object") ~= nil) or (reserved["swap_object"] == true)
     end
 
+    -- 3b 兜底需要用到的手持信息（在下面的分支里填充）
+    local _hand_item = nil
+    local _hand_skin_used = false
+    local _hand_build = nil
+
     -- swap_object 手持物【item-driven 自实现】（2026-09-09 定案）：
-    -- 读回方案被证伪——参考 mod 3794362938 自己的手部就是空气，v3.6.4 读回
-    -- 也时灵时不灵。原版 onequip 写的覆盖完全可从背包实体直接推导：
+    -- 读回方案被证伪——v3.6.4 用读回也时灵时不灵（普通覆盖表在换装时冻结，
+    -- 影子常拿到上一次的工具或开局空手）。原版 onequip 写的覆盖完全可从
+    -- 背包实体直接推导：
     --   工具/武器 prefab 构造时 SetBuild("swap_axe")，onequip 写
     --   OverrideSymbol("swap_object", "swap_axe", "swap_axe")——即
     --   build=实体AnimState build，symbol="swap_"..prefab。
@@ -748,6 +1507,7 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
         if inv ~= nil and inv.GetEquippedItem ~= nil then
             hand = inv:GetEquippedItem(_G.EQUIPSLOTS ~= nil and _G.EQUIPSLOTS.HANDS or "hands")
         end
+        _hand_item = hand
         local written = false
         if hand ~= nil and hand.prefab ~= nil then
             -- 原版 onequip 的权威数据源 = floater.swap_data.sym_build / sym_name
@@ -758,64 +1518,116 @@ local function SyncPlayerEquipment(source, pa, sa, shadow)
             -- 手杖/火把的背包 build 恰好就是 swap_*，所以它们能显示、工具不能。
             local swd = hand.components ~= nil and hand.components.floater ~= nil
                 and hand.components.floater.swap_data or nil
-            local swap_build = (swd ~= nil and swd.sym_build)
-                or ("swap_" .. tostring(hand.prefab))
-            local sym_name = (swd ~= nil and swd.sym_name) or swap_build
+            -- 原版 onequip 的权威数据源：swap_data.sym_build / sym_name，
+            -- 缺 sym_name 时二者同名（cane 的 swap_data 只有 sym_build）。
+            -- 不做任何后缀加工 —— 之前按 "_float" 截断把损坏态武器
+            -- （swap_staff_BROKEN_FORGEDITEM_float / scythe_base_broken_float）
+            -- 的符号名砍废了，法杖与收割者因此拿空气。
+            local swap_build = swd ~= nil and swd.sym_build or nil
+            local sym_name = swd ~= nil and swd.sym_name or nil
+            if swap_build == nil then
+                local ent_build = hand.AnimState ~= nil and hand.AnimState.GetBuild ~= nil
+                    and hand.AnimState:GetBuild() or nil
+                swap_build = (type(ent_build) == "string" and ent_build ~= "") and ent_build
+                    or ("swap_" .. tostring(hand.prefab))
+            end
+            sym_name = sym_name or swap_build
+            -- 皮肤手持：以 EquipSkinBuild 为准（GetSkinBuild 优先，实体 build
+            -- 兜底）。唯一要排除的情况是"皮肤 build 与手持 build 相同"——那不是
+            -- 皮肤而是原皮，走普通覆盖即可。不要额外要求 GetSkinName 非空：
+            -- classified 物品的皮肤名与 build 关系不规整，加了这道门手杖皮肤
+            -- 会整批掉回原皮。
             local skin = EquipSkinBuild(hand)
+            if skin == swap_build then
+                skin = nil
+            end
             if swap_build ~= nil and swap_build ~= "" then
+                _hand_build = swap_build
                 local last = sym_cache["swap_object"]
                 if skin ~= nil and skin ~= "" then
+                    _hand_skin_used = true
                     -- 带皮肤手持：引擎皮肤表路径（先清普通残留再写皮肤覆盖）
                     if last == nil or last[1] ~= skin or last[2] ~= sym_name then
                         sym_cache["swap_object"] = { skin, sym_name }
-                        pcall(sa.ClearOverrideSymbol, sa, "swap_object")
+                        BothAS(sa, "ClearOverrideSymbol", "swap_object")
                         local ok, err = pcall(sa.OverrideItemSkinSymbol, sa, "swap_object",
                             skin, sym_name, hand.GUID, swap_build)
                         LogSwapWrite(shadow, ok and "手持皮肤" or "手持皮肤拒绝",
                             "swap_object", skin, sym_name .. " err=" .. tostring(err))
                         if not ok then
-                            sa:OverrideSymbol("swap_object", swap_build, sym_name)
+                            BothAS(sa, "OverrideSymbol", "swap_object", swap_build, sym_name)
                         end
                     end
                 else
                     -- 原皮手持（工具/武器/火把）：完全复刻原版
                     -- owner.AnimState:OverrideSymbol("swap_object", swap_build, sym_name)
-                    if last == nil or last[1] ~= swap_build or last[2] ~= sym_name then
+                    if NO_SWAP_SYMBOL_BUILDS[swap_build] then
+                        -- 该 build 里没有这个符号（离线实证）：写覆盖会让引擎
+                        -- 渲染默认符号（残缺美术），一律不写，交物品美术克隆。
+                        sym_cache["swap_object"] = nil
+                        BothAS(sa, "ClearOverrideSymbol", "swap_object")
+                    elseif last == nil or last[1] ~= swap_build or last[2] ~= sym_name then
                         sym_cache["swap_object"] = { swap_build, sym_name }
-                        pcall(sa.ClearOverrideSymbol, sa, "swap_object")
+                        BothAS(sa, "ClearOverrideSymbol", "swap_object")
                         LogSwapWrite(shadow, "手持", "swap_object", swap_build, sym_name)
-                        sa:OverrideSymbol("swap_object", swap_build, sym_name)
+                        BothAS(sa, "OverrideSymbol", "swap_object", swap_build, sym_name)
                     end
                 end
                 written = true
             end
         end
         if not written and pa.GetSymbolOverride ~= nil then
-            -- 实体信息拿不到时退回读回方案（双值接收，不能写成 and/or 链）
+            -- 退回读回方案（双值接收，不能写成 and/or 链）。读回的常常是引擎
+            -- 内部哈希（数字），拿哈希当 build 名写进去画不出任何东西
+            -- （日志实证：swap_object <- 717536814,3733248833 → 手杖消失），
+            -- 所以只接受字符串，否则宁可不写。
             local sb, ssym = pa:GetSymbolOverride("swap_object")
+            if type(sb) ~= "string" or sb == "" then sb = nil end
             if sb ~= nil then
+                if type(ssym) ~= "string" or ssym == "" then ssym = sb end
                 local last = sym_cache["swap_object"]
                 if last == nil or last[1] ~= sb or last[2] ~= ssym then
                     sym_cache["swap_object"] = { sb, ssym }
-                    LogSwapWrite(shadow, "手持读回", "swap_object", sb, ssym or "swap_object")
-                    sa:OverrideSymbol("swap_object", sb, ssym or "swap_object")
+                    LogSwapWrite(shadow, "手持读回", "swap_object", sb, ssym)
+                    BothAS(sa, "OverrideSymbol", "swap_object", sb, ssym)
                 end
+            elseif sym_cache["swap_object"] ~= nil then
+                -- 原角色已无手持覆盖（FX 类武器 / 空手）：影子一并清掉，防残留上一件
+                sym_cache["swap_object"] = nil
+                BothAS(sa, "ClearOverrideSymbol", "swap_object")
             end
         end
     elseif sym_cache["swap_object"] ~= nil then
         sym_cache["swap_object"] = nil
-        sa:ClearOverrideSymbol("swap_object")
+        BothAS(sa, "ClearOverrideSymbol", "swap_object")
+    end
+
+    -- 3b) 手持美术兜底（每轮）：符号覆盖若没被引擎接受（裂隙武器的 build 里
+    -- 没有 swap_* 符号，原版靠独立 FX 实体显示），改用物品美术克隆兜底，
+    -- 跟随影子的 swap_object 符号位。接受了就收掉克隆，避免双重显示。
+    if has_hand_item and _hand_item ~= nil and not _hand_skin_used
+        and _hand_build ~= nil and _hand_build ~= "" then
+        local applied = (not NO_SWAP_SYMBOL_BUILDS[_hand_build])
+            and sa.GetSymbolOverride ~= nil
+            and sa:GetSymbolOverride("swap_object") ~= nil
+        if applied then
+            SyncItemFx(shadow, "swap_object", nil)
+        else
+            SyncItemFx(shadow, "swap_object", _hand_item, "swap_object")
+        end
+    else
+        SyncItemFx(shadow, "swap_object", nil)
     end
 
     -- 4) 手臂图层：有手部装备 → Show ARM_carry / Hide ARM_normal；否则反之。
     if has_hand_item ~= shadow._arm_carry then
         shadow._arm_carry = has_hand_item
         if has_hand_item then
-            sa:Show("ARM_carry")
-            sa:Hide("ARM_normal")
+            BothAS(sa, "Show", "ARM_carry")
+            BothAS(sa, "Hide", "ARM_normal")
         else
-            sa:Hide("ARM_carry")
-            sa:Show("ARM_normal")
+            BothAS(sa, "Hide", "ARM_carry")
+            BothAS(sa, "Show", "ARM_normal")
         end
     end
 end
@@ -835,30 +1647,38 @@ local function SyncOverrides(pa, sa, shadow)
         local sym = SWAP_SYMBOLS[i]
         if not (skip_core and (sym == "swap_object" or sym == "swap_hat" or sym == "swap_body")) then
             local b, s = pa:GetSymbolOverride(sym)
+            -- 非字符串一律视为无效（读回哈希的情况），不清影子符号
+            if type(b) ~= "string" or b == "" then
+                b = nil
+            elseif type(s) ~= "string" or s == "" then
+                s = b
+            end
             local kb, ks = "_ovb_" .. sym, "_ovs_" .. sym
             if shadow[kb] ~= b or shadow[ks] ~= s then
                 shadow[kb] = b
                 shadow[ks] = s
                 if b ~= nil then
-                    sa:OverrideSymbol(sym, b, s or sym)
+                    BothAS(sa, "OverrideSymbol", sym, b, s)
                 else
-                    sa:ClearOverrideSymbol(sym)
+                    BothAS(sa, "ClearOverrideSymbol", sym)
                 end
             end
         end
     end
 end
 
+
 local function CopyAnim(pa, sa, shadow, force, src_ent)
     if pa == nil or sa == nil then return end
 
-    -- Bank: hash first (workshop 3794362938). Name fallback for older clients.
+    -- Bank: hash first. Name fallback for older clients.
     -- 引擎态对比（影子 sa:GetBankHash vs 源 pa:GetBankHash）：force 不再
     -- 绕过对比，事件风暴（newstate/equip → sync_now）不会反复重放 SetBank。
     if pa.GetBankHash and sa.GetBankHash then
         local bank_hash = pa:GetBankHash()
         if bank_hash and bank_hash ~= sa:GetBankHash() then
             sa:SetBank(bank_hash)
+            MirrorTwin(shadow, "SetBank", bank_hash)
             shadow._last_bank_hash = bank_hash
             shadow._last_bank = nil
             shadow._last_leaf = nil
@@ -875,62 +1695,85 @@ local function CopyAnim(pa, sa, shadow, force, src_ent)
         if bank and (force or bank ~= shadow._last_bank) then
             shadow._last_bank = bank
             sa:SetBank(bank)
+            MirrorTwin(shadow, "SetBank", bank)
             shadow._last_leaf = nil
         end
     end
 
-    -- Build + 皮肤 build 镜像（2026-09-09，方案照抄工坊 3794362938）：
-    -- **引擎态对比**：SetBuild 只在影子实际 build 与源不一致时执行。
-    -- 此前 force 时无条件 SetBuild——newstate/equip 事件风暴每次都把影子
-    -- 覆盖表整个抹掉，装备符号反复蒸发（"空气装备"直接根源之一）。
-    -- GetBuild() 直接镜像（SetBuild 不打断动画），皮肤 build 用
-    -- SetSkin(skin, base) 镜像。DLC 角色基础美术在皮肤系统里，影子只有
-    -- 走同样的 SetSkin 才能渲染出正确轮廓——SetBuild(角色名) 会静默失败
-    -- （皮肤 build 不经 SetSkin 路径不渲染，"DLC 影子消失"回归的根因）。
+    -- Build + 皮肤镜像。
+    -- 【根因 · 2026-09-12 实证】皮肤名不是 build：anim 目录里只有 wilson.zip，
+    -- 没有 wilson_nature。皮肤由引擎经皮肤表索引到真实 build，所以
+    -- SetBuild("wilson_nature") 会让影子渲染一个不存在的空 build —— 该 build
+    -- 里任何符号（swap_object / swap_hat / swap_body / headbase_hat）都解析不到，
+    -- 表现就是"所有装备一起空气 + 全套盔把头吃没"。日志佐证：影子
+    -- GetBuild()=wilson_nature 时，BuildHasSymbol 对三个核心符号全为 false。
+    -- 正确做法（官方 widgets/skinspuppet_beefalo.lua:76 范式）：
+    --   SetBuild(基础build) → SetSkin(皮肤名, 基础build) → 复制符号覆盖
+    -- 绝不用 SetBuild 传皮肤名。
     local build = pa.GetBuild and pa:GetBuild()
+    local src_skin = pa.GetSkinBuild ~= nil and pa:GetSkinBuild() or nil
+    if src_skin == build then
+        build = nil   -- 皮肤名冒充 build：这一步必须让给 SetSkin
+    end
+    -- 剪影着色器在 SetBuild / SetSkin 后会被打回 build 自带的默认着色器，
+    -- 所以这一轮只要碰过 build/皮肤，结束时就重挂一次（不是逐帧调用）。
+    local shader_dirty = false
     if build ~= nil and build ~= sa:GetBuild() then
         shadow._last_build = build
         sa:SetBuild(build)
+        MirrorTwin(shadow, "SetBuild", build)
+        -- SetBuild 会清掉符号覆盖（包括我们的编号），必须重刷。
+        -- ApplySymbolKeys 内部就是【孪生体先刷、可见层后刷】，不会再出现两边档位不一致。
+        ApplySymbolKeys(sa, build)
         shadow._last_leaf = nil
         -- SetBuild 清空影子覆盖表：标记装备扫描强制重涂
         shadow._eq_dirty = true
+        shader_dirty = true
     end
     if pa.GetSkinBuild ~= nil and sa.SetSkin ~= nil then
         local sb = pa:GetSkinBuild()
         if sb ~= nil and sb ~= "" then
-            -- 源驱动对比（2026-09-10 装备空气第二根因）：引擎对 skin build
-            -- 有内部归一化，SetSkin 的入参与 GetSkinBuild 的回读值可能永不相
-            -- 等——逐帧引擎对比恒为"变了"→ 每帧 SetSkin → 每帧清空覆盖表 →
-            -- 装备符号刚涂上就被抹（"拿空气"+重涂那帧"切换闪一下"）。改为
-            -- 只对比源上一次的皮肤值：源真换肤才 SetSkin；失败最多重试 3 次。
-            if sb ~= shadow._last_skin or (shadow._skin_tries or 0) < 3 then
-                if sb ~= shadow._last_skin then
-                    shadow._last_skin = sb
-                    shadow._skin_tries = 0
-                end
-                shadow._skin_tries = (shadow._skin_tries or 0) + 1
-                shadow._skin_sets = (shadow._skin_sets or 0) + 1
-                if shadow._is_player and shadow._skin_sets == 10 then
-                    print("[BCAS] 哨兵: 影子SetSkin已累计10次 源skin="
-                        .. tostring(sb) .. " 影回读=" .. tostring(sa:GetSkinBuild())
-                        .. "（若持续增长说明回读不匹配，装备会被每帧抹除）")
-                end
-                pcall(sa.SetSkin, sa, sb, build or "")
+            -- SetSkin 第二个实参是【基础 build】（官方 skinspuppet_beefalo.lua:72
+            -- 传 prefabname.."_none"，skinner.lua:44 传 default_build），
+            -- 不能传皮肤名。取角色 prefab 名：源实体无 prefab 时回退到
+            -- 源 GetBuild() 里去掉皮肤名后的值，再不行给空串（引擎容错）。
+            local base = pa.prefab
+            if type(base) ~= "string" or base == "" or base == sb then
+                local gb = pa.GetBuild ~= nil and pa:GetBuild() or nil
+                base = (gb ~= nil and gb ~= sb) and gb or ""
+            end
+            -- 源驱动对比：引擎对 skin build 有内部归一化，SetSkin 的入参与
+            -- GetSkinBuild 的回读值可能永不相等——若逐帧对比就会每帧 SetSkin →
+            -- 每帧清空覆盖表 → 装备符号刚涂上就被抹（"拿空气"+"闪一下"）。
+            -- 因此只认"源皮肤值变化"这一个触发条件，不重试（重试同样是每帧清表）。
+            if sb ~= shadow._last_skin then
+                shadow._last_skin = sb
+                pcall(sa.SetSkin, sa, sb, base)
+                MirrorTwin(shadow, "SetSkin", sb, base)
+                -- SetSkin 同样会清掉符号覆盖（ApplySymbolKeys 会同时刷两边）
+                ApplySymbolKeys(sa, sb)
+                -- SetSkin 清空影子覆盖表：标记装备扫描立刻重涂
                 shadow._eq_dirty = true
+                shader_dirty = true
             end
             shadow._had_skin = true
         elseif shadow._had_skin then
             -- 皮肤卸下：重放基础 build 还原（SetBuild 同样清覆盖表 → 脏标记）
             shadow._had_skin = nil
             shadow._last_skin = nil
-            shadow._skin_tries = 0
-            if build ~= nil then
-                sa:SetBuild(build)
-                shadow._last_build = build
+            local base = pa.prefab
+            if type(base) == "string" and base ~= "" then
+                sa:SetBuild(base)
+                MirrorTwin(shadow, "SetBuild", base)
+                shadow._last_build = base
                 shadow._last_leaf = nil
                 shadow._eq_dirty = true
+                shader_dirty = true
             end
         end
+    end
+    if shader_dirty then
+        ApplyShadowShader(sa, SHADOW_MODE_VISIBLE)
     end
     -- Equipment/skin overrides AFTER SetBuild/SetSkin: 二者都会清 OverrideSymbol。
     -- 玩家走装备槽权威镜像（皮肤表 + replica，见 SyncPlayerEquipment 注释）；
@@ -942,6 +1785,7 @@ local function CopyAnim(pa, sa, shadow, force, src_ent)
     end
     -- Leaves AFTER SetBuild: SetBuild wipes OverrideSymbol.
     CopyLeaves(pa, sa, shadow, force)
+
 
     -- 动画镜像：以【引擎哈希】为准——比较"影子当前动画哈希"与"源当前动画哈希"，
     -- 不同就按源哈希重放。不再猜动画名（旧的 DetectAnimName 只认 mover 名表，
@@ -964,8 +1808,10 @@ local function CopyAnim(pa, sa, shadow, force, src_ent)
                 end
             end
             pcall(sa.PlayAnimation, sa, anim_hash, loop)
+            MirrorTwin(shadow, "PlayAnimation", anim_hash, loop)
             shadow._last_anim = anim_hash
             shadow._last_anim_hash = anim_hash
+            shadow._last_anim_loop = loop
             shadow._last_anim_name = nil
             shadow._last_frame = nil
         end
@@ -1003,6 +1849,7 @@ local function ApplyPose(shadow, ent, scale_y, rot, r, g, b, a, follow)
         if flip ~= shadow._last_flip then
             shadow._last_flip = flip
             sa:SetScale(flip and -1 or 1, 1)
+            MirrorTwin(shadow, "SetScale", flip and -1 or 1, 1)
         end
     else
         -- 静态影子挂在父实体下（SetParent），本地坐标恒定；逐帧
@@ -1040,12 +1887,20 @@ local function ApplyPose(shadow, ent, scale_y, rot, r, g, b, a, follow)
         shadow.Transform:SetRotation(rot)
     end
     if aq <= 0 then
+        if shadow._alpha_on ~= false then
+            shadow._alpha_on = false
+            UpdateTwinVisible(shadow)
+        end
         if shadow._last_a ~= 0 then
             shadow._last_a = 0
             shadow._last_aq = 0
             sa:SetMultColour(0, 0, 0, 0)
         end
         return
+    end
+    if shadow._alpha_on == false then
+        shadow._alpha_on = true
+        UpdateTwinVisible(shadow)
     end
     if aq ~= shadow._last_aq or rq ~= shadow._last_rq then
         shadow._last_aq, shadow._last_rq = aq, rq
@@ -1149,6 +2004,29 @@ local function BindShadowListeners(ent)
     end)
 end
 
+-- 一次性自检：把"着色器挂上没有 / 孪生体在不在 / 符号档刷了几档"写进日志。
+-- 这几样以前都是静默失效 —— 画面不对但日志干干净净，只能靠猜。留一条现场证据。
+local function ShaderSelfTest(shadow)
+    if shader_selftest_done then return end
+    shader_selftest_done = true
+    local tw = shadow._wtwin
+    local tw_ok = tw ~= nil and tw:IsValid()
+    local n, kmax = 0, 0
+    local keys = GetSymbolKeys(shadow.AnimState, shadow._last_build)
+    if keys ~= nil then
+        for _, k in pairs(keys) do
+            n = n + 1
+            if k > kmax then kmax = k end
+        end
+    end
+    local function flag(k) return shader_apply_ok[k] and "OK" or "失败" end
+    print(string.format(
+        "[BCAS] 剪影自检: 挂载 可见=%s 写深度=%s 克隆=%s | 孪生体=%s | 符号档=%d档(最大%s) | 头=%s",
+        flag(SHADOW_MODE_VISIBLE), flag(SHADOW_MODE_WRITE), flag(SHADOW_MODE_VISIBLE_FX),
+        tw_ok and "OK" or "缺失", n, tostring(kmax),
+        tostring(shadow._last_build)))
+end
+
 function SunSystem.AttachShadowToEntity(ent)
     if not master_enabled or not shadows_enabled then
         return
@@ -1223,11 +2101,26 @@ function SunSystem.AttachShadowToEntity(ent)
     shadow._budget_offset = math.random(0, 7)
     shadow._last_flip = nil
 
+    -- 纯色剪影：黑色乘色 + 剪影着色器。
+    -- rgb 恒 0（美术里的白色描边/眼睛图案乘 0 后不可能显出来），alpha 用
+    -- 引擎原样的 0.50/0.38；"没有描边"由 ApplyShadowShader 挂上的
+    -- bcas_silhouette.ksh 完成（把美术的半透明软边/排线压成单一浓度）。
     shadow.AnimState:SetMultColour(0, 0, 0, 0)
     shadow.AnimState:SetManualBB(0, 0, 0, 0)
-    shadow.AnimState:UsePointFiltering(true)
-    shadow.AnimState:SetLayer(LAYER_BACKGROUND)
+    -- 深度测试开、写入关：靠写深度孪生体（更早的图层）挡住同像素上更远的部件，
+    -- 实现"每像素只混合一次"。可见影子自己不写深度，不会裁掉后面的世界物体。
+    pcall(shadow.AnimState.SetDepthTestEnabled, shadow.AnimState, true)
+    pcall(shadow.AnimState.SetDepthWriteEnabled, shadow.AnimState, false)
+    -- 线性 + mip 采样（= 引擎默认，与普通实体美术一致）。点采样在影子被压扁
+    -- （scale 0.44~1.0）时是"最近邻缩小"：细笔画（叶尖/羽毛/发丝）会被整片
+    -- 跳过，剪影边缘和小细节变成点阵/虚线段（"影子全是碎的"有一半来自这里）。
+    shadow.AnimState:UsePointFiltering(false)
+    -- 图层必须晚于写深度孪生体（LAYER_BACKGROUND），保证"先写深度、后画可见层"
+    shadow.AnimState:SetLayer(LAYER_WORLD_BACKGROUND)
     shadow.AnimState:SetOrientation(ANIM_ORIENTATION.OnGround)
+    -- 剪影着色器 + 哨兵。这里先挂一次（源 build 为空时下方 CopyAnim 不会重挂），
+    -- 之后每次 SetBuild / SetSkin 变化时由 CopyAnim 重挂。
+    ApplyShadowShader(shadow.AnimState, SHADOW_MODE_VISIBLE)
     pcall(shadow.AnimState.Hide, shadow.AnimState, "mouseover")
     if is_mover then
         shadow.Transform:SetNoFaced()
@@ -1243,6 +2136,10 @@ function SunSystem.AttachShadowToEntity(ent)
 
     ent._bcas_shadow = shadow
     shadow._parent_ent = ent
+    -- 写深度孪生体：同 bank/build/动画/姿态，不可见，只写深度（单层混合的关键）
+    MakeWriteTwin(shadow)
+    -- 每个符号一个离散深度档（滑不滑由 build 决定，缓存）
+    ApplySymbolKeys(shadow.AnimState, shadow._last_build)
 
     -- 挂载即首次全量同步：bank/build/皮肤 build/装备 override/当前 clip
     CopyAnim(ent.AnimState, shadow.AnimState, shadow, true, ent)
@@ -1264,6 +2161,7 @@ function SunSystem.AttachShadowToEntity(ent)
     else
         static_shadows[shadow] = ent
     end
+    ShaderSelfTest(shadow)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1313,7 +2211,7 @@ end
 -- Cloud-break shafts: ground patches + engine Light (occluder rims for free)
 -- ---------------------------------------------------------------------------
 
-local SHAFT_COUNT = 3
+local SHAFT_COUNT = 4
 
 -- GROUND ids (constants.lua): ROAD=2, SAVANNA=5, GRASS=6, DESERT_DIRT=31.
 -- These palettes sit near-white under sun; shaft Light + patch stack on
@@ -1369,17 +2267,22 @@ local function MakeShaft()
     inst._tx, inst._tz = nil, nil
     inst._life = math.random() * 20
     inst._hold = 4 + math.random() * 5
-    inst._gap = 8 + math.random() * 16
+    inst._gap = 3 + math.random() * 7
     inst._phase = "gap"
     inst._alpha = 0
     inst._vis = 0
+    -- 每条光柱有自己的基准尺寸（0.8~1.5），再加上出现/消散过程的缩放，
+    -- 不再是"一小束固定大小的光"。
+    inst._scale = 0.8 + math.random() * 0.7
     return inst
 end
 
 local function PickShaftPos(player, sx, sz)
     local px, py, pz = player.Transform:GetWorldPosition()
-    local dist = 8 + math.random() * 16
-    local side = (math.random() - 0.5) * 20
+    -- 出生距离收紧到 3~14 格、横向 ±7：之前 8~24 的远位在镜头拉近（视角放低）
+    -- 时会落在画面外，玩家根本看不到。
+    local dist = 3 + math.random() * 11
+    local side = (math.random() - 0.5) * 14
     local x = px + sx * dist + sz * side
     local z = pz + sz * dist - sx * side
     local map = _G.TheWorld and _G.TheWorld.Map
@@ -1401,7 +2304,7 @@ local function PickShaftPos(player, sx, sz)
     return x, z
 end
 
-local function ApplyShaftVisual(e, vis, rot)
+local function ApplyShaftVisual(e, vis, rot, scale_k)
     e._vis = vis
     -- 亮地块压制系数更严格：防止浅色麦田/草地/白地块反光过曝
     local damp = e._bright_tile and 0.30 or 0.65
@@ -1413,12 +2316,25 @@ local function ApplyShaftVisual(e, vis, rot)
     end
     e:Show()
     e.Transform:SetRotation(rot or 0)
-    -- 光柱本身整体降低透明度（0.45 -> 0.28），颜色加深为温暖琥珀金，拒绝惨白！
-    e.AnimState:SetMultColour(1.05, 0.90, 0.70, 0.28 * vis * damp)
-    -- 额外附加点光源亮度大幅下调（0.30 -> 0.15），彻底消除和本体光晕“左脚踩右脚”的过度叠加！
-    e.Light:SetIntensity(0.15 * vis * damp)
-    e.Light:SetColour(255 / 255, 220 / 255, 160 / 255) -- 纯粹柔和暖金光
-    e.Light:SetRadius(3 + 4 * vis)
+    -- 尺寸随生命周期变化（出现时张开、稳定、消散时收拢），每条还带自己的
+    -- 基准尺寸——用户要的"有大小变化"。
+    local sc = (e._scale or 1.0) * (scale_k or 1.0)
+    e.Transform:SetScale(sc, sc, sc)
+    -- 可见度提高：光柱透明度 0.28 -> 0.42，点光源 0.15 -> 0.26，
+    -- 半径加大，让光对地面/遮挡物的交互看得见。
+    e.AnimState:SetMultColour(1.05, 0.90, 0.70, 0.42 * vis * damp)
+    local inten = 0.26 * vis * damp
+    local radius = (3 + 4 * vis) * sc
+    -- 引擎光源的每次参数改动都会触发光照图重建（白天 4 盏灯逐帧改半径
+    -- 是卡顿来源）。只在变化超过 6% 时才下发。
+    local lr, li = e._last_radius, e._last_inten
+    if lr == nil or math.abs(radius - lr) > lr * 0.06 + 0.05
+        or li == nil or math.abs(inten - li) > li * 0.06 + 0.01 then
+        e._last_radius, e._last_inten = radius, inten
+        e.Light:SetIntensity(inten)
+        e.Light:SetColour(255 / 255, 220 / 255, 160 / 255) -- 纯粹柔和暖金光
+        e.Light:SetRadius(radius)
+    end
     e.Light:Enable(true)
 end
 
@@ -1436,7 +2352,9 @@ local function UpdateShafts(dt)
         return
     end
     local scale_y, rot, a = GetSunParams()
-    local amount = shafts_amount * (a / 0.55)
+    -- 光柱可见度跟随影子浓度：用满照上限归一化（不是写死的 0.55），否则上限
+    -- 一改（0.55 → 0.96）光柱就会跟着一起变亮 1.75 倍。
+    local amount = shafts_amount * (a / SHADOW_MAX_ALPHA)
     if amount < 0.02 or a <= 0.01 then
         for i = 1, #shaft_ents do
             local e = shaft_ents[i]
@@ -1479,11 +2397,13 @@ local function UpdateShafts(dt)
                 end
                 ApplyShaftVisual(e, 0, rot)
             elseif phase == "in" then
-                local vis = math.min(1, e._life / 2.4) * math.min(1, amount)
+                local t = e._life / 2.4
+                local vis = math.min(1, t) * math.min(1, amount)
                 if e._tx then
                     e.Transform:SetPosition(e._tx, 0, e._tz)
                 end
-                ApplyShaftVisual(e, vis, rot)
+                -- 张开：0.55 -> 1.15 倍
+                ApplyShaftVisual(e, vis, rot, 0.55 + 0.60 * math.min(1, t))
                 if e._life >= 2.4 then
                     e._phase = "hold"
                     e._life = 0
@@ -1494,18 +2414,22 @@ local function UpdateShafts(dt)
                 if e._tx then
                     e.Transform:SetPosition(e._tx, 0, e._tz)
                 end
-                ApplyShaftVisual(e, vis, rot)
+                -- 稳定期缓慢收一点（1.15 -> 1.0），避免"死板定格"
+                local hold = math.max(0.1, e._hold or 4)
+                ApplyShaftVisual(e, vis, rot, 1.15 - 0.15 * math.min(1, e._life / hold))
                 if e._life >= (e._hold or 4) then
                     e._phase = "out"
                     e._life = 0
                 end
             else
-                local vis = (1 - math.min(1, e._life / 2.8)) * math.min(1, amount)
-                ApplyShaftVisual(e, vis, rot)
+                local t = math.min(1, e._life / 2.8)
+                local vis = (1 - t) * math.min(1, amount)
+                -- 收拢消散：1.0 -> 0.75 倍
+                ApplyShaftVisual(e, vis, rot, 1.0 - 0.25 * t)
                 if e._life >= 2.8 then
                     e._phase = "gap"
                     e._life = 0
-                    e._gap = 10 + math.random() * 22
+                    e._gap = 4 + math.random() * 9
                     e._tx, e._tz = nil, nil
                 end
             end
@@ -1519,7 +2443,6 @@ local function EnsureShafts()
         shaft_ents[i] = MakeShaft()
     end
 end
-
 
 -- ---------------------------------------------------------------------------
 -- Schedulers
@@ -1554,13 +2477,19 @@ local function StartGlobalScheduler()
             if ent:IsValid() and shadow:IsValid() then
                 if not shadows_enabled or a <= 0.01 or (not shadow._is_player and ParentHidden(ent)) then
                     shadow:Hide()
+                    shadow._shown = false
+                    UpdateTwinVisible(shadow)
                 else
                     local px, py, pz = ent.Transform:GetWorldPosition()
                     local dist_sq = (px - ppx) * (px - ppx) + (pz - ppz) * (pz - ppz)
                     if dist_sq > FAR_SQ and not shadow._is_player then
                         shadow:Hide()
+                        shadow._shown = false
+                        UpdateTwinVisible(shadow)
                     else
                         shadow:Show()
+                        shadow._shown = true
+                        UpdateTwinVisible(shadow)
                         if dist_sq <= NEAR_SQ or shadow._is_player then
                             nearby_movers = nearby_movers + 1
                         end
@@ -1588,6 +2517,9 @@ local function StartGlobalScheduler()
                                     shadow._lock_bank = "wilsonbeefalo"
                                     if sa and shadow._last_bank ~= "wilsonbeefalo" then
                                         sa:SetBank("wilsonbeefalo")
+                                        -- 孪生体必须一起换 bank：两边几何（骨骼/部件）不一致时，
+                                        -- 孪生体会在可见层自己那块上写下更近的深度，整块拒掉
+                                        MirrorTwin(shadow, "SetBank", "wilsonbeefalo")
                                         shadow._last_bank = "wilsonbeefalo"
                                         shadow._last_anim_name = nil
                                         shadow._last_anim = nil
@@ -1596,10 +2528,12 @@ local function StartGlobalScheduler()
                                         local m_build = mount.AnimState:GetBuild()
                                         if m_build and m_build ~= shadow._last_mount_build then
                                             if shadow._last_mount_build then
-                                                pcall(sa.ClearOverrideBuild, sa, shadow._last_mount_build)
+                                                BothAS(sa, "ClearOverrideBuild", shadow._last_mount_build)
                                             end
-                                            pcall(sa.AddOverrideBuild, sa, m_build)
+                                            BothAS(sa, "AddOverrideBuild", m_build)
                                             shadow._last_mount_build = m_build
+                                            -- 覆盖 build 变化同样重挂一次剪影着色器（只在变化时）
+                                            ApplyShadowShader(sa, SHADOW_MODE_VISIBLE)
                                         end
                                     end
                                 end
@@ -1608,6 +2542,7 @@ local function StartGlobalScheduler()
                                 shadow._height_factor = 1.0
                                 if shadow._last_mount_build and shadow.AnimState then
                                     pcall(shadow.AnimState.ClearOverrideBuild, shadow.AnimState, shadow._last_mount_build)
+                                    MirrorTwin(shadow, "ClearOverrideBuild", shadow._last_mount_build)
                                     shadow._last_mount_build = nil
                                 end
                                 shadow._lock_bank = nil
@@ -1635,7 +2570,7 @@ local function StartGlobalScheduler()
                 dynamic_shadows[shadow] = nil
                 -- 父实体已失效（被移除/换 prefab）：影子实体一并销毁，
                 -- 否则残留一具"砍了还在"的鬼影。
-                if shadow:IsValid() then shadow:Remove() end
+                DestroyShadow(shadow)
             end
         end
 
@@ -1678,6 +2613,8 @@ local function StartGlobalScheduler()
         if tick % 2 == 0 then
             UpdateShafts(2 / 30)
         end
+        if tick % 5 == 0 then
+        end
     end)
 
     local static_tick = 0
@@ -1698,13 +2635,19 @@ local function StartGlobalScheduler()
             if ent:IsValid() and shadow:IsValid() then
                 if not shadows_enabled or ParentHidden(ent) or a <= 0.01 then
                     shadow:Hide()
+                    shadow._shown = false
+                    UpdateTwinVisible(shadow)
                 else
                     local px, py, pz = ent.Transform:GetWorldPosition()
                     local dist_sq = (px - ppx) * (px - ppx) + (pz - ppz) * (pz - ppz)
                     if dist_sq > STATIC_HIDE_SQ then
                         shadow:Hide()
+                        shadow._shown = false
+                        UpdateTwinVisible(shadow)
                     else
                         shadow:Show()
+                        shadow._shown = true
+                        UpdateTwinVisible(shadow)
                         -- Pose is swept every frame in the frame-tied
                         -- scheduler below; this task only maintains the
                         -- roster (near = every frame, far = 1/3 of frames).
@@ -1753,7 +2696,7 @@ local function StartGlobalScheduler()
             else
                 static_shadows[shadow] = nil
                 -- 同上：砍掉的树/被铲植物，父实体没了就销毁影子实体
-                if shadow:IsValid() then shadow:Remove() end
+                DestroyShadow(shadow)
             end
         end
         for i = roster_n + 1, #static_roster do
@@ -1816,13 +2759,21 @@ function SunSystem.SetShadowsEnabled(enabled)
     shadows_enabled = enabled == true
     if not shadows_enabled or not master_enabled then
         for shadow, ent in pairs(dynamic_shadows) do
-            if shadow:IsValid() then shadow:Hide() end
+            if shadow:IsValid() then
+                shadow:Hide()
+                shadow._shown = false
+                UpdateTwinVisible(shadow)
+            end
             if ent and ent:IsValid() and ent.DynamicShadow ~= nil then
                 pcall(ent.DynamicShadow.Enable, ent.DynamicShadow, true)
             end
         end
         for shadow, _ent in pairs(static_shadows) do
-            if shadow:IsValid() then shadow:Hide() end
+            if shadow:IsValid() then
+                shadow:Hide()
+                shadow._shown = false
+                UpdateTwinVisible(shadow)
+            end
         end
         for i = 1, #shaft_ents do
             local e = shaft_ents[i]

@@ -44,6 +44,13 @@ def M4(name):
     return dict(name=name, type=TYPE_MAT4, a=0, count=1, ncomps=16, zeros=[0] * 16)
 
 
+def V4A(name, count):
+    """vec4 数组条目（fastanim_bones）—— 按 anim_skinned.ksh 的编码：
+    count=数组长度、ncomps=0、无 zeros"""
+    return dict(name=name, type=TYPE_VEC4, a=0, count=count,
+                ncomps=0, zeros=[])
+
+
 def S(name, arraylen):
     return dict(name=name, type=TYPE_SAMPLER2D, a=0, arraylen=arraylen)
 
@@ -290,11 +297,11 @@ def glsl_uniforms(src_text):
 
 
 def prep_entity_src(path):
-    """实体类 shader 源码：保持多行（光影包互证），统一 CRLF，ASCII 把关，NUL 收尾。
+    """实体类 shader 源码：保持多行，统一 CRLF，ASCII 把关，NUL 收尾。
 
     引擎按"读到 NUL 为止"消费源码；后处理路径有 ~4096 缓冲与换行长度 bug
-    （见 minify_glsl 注释），实体路径（AnimState effect handle）没有这些问题，
-    光影包 anim_ocean_surface.ksh 的 19KB 多行源码可正常工作。
+    （见 minify_glsl 注释），实体路径（AnimState effect handle）没有这些问题：
+    实测 19KB 的多行源码经 SetDefaultEffectHandle 挂载工作正常。
     """
     text = open(path, 'r', encoding='utf-8').read()
     bad = [(i + 1, ch) for i, line in enumerate(text.split('\n'))

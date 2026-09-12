@@ -1,0 +1,115 @@
+#if defined( GL_ES )
+precision mediump float;
+#endif
+
+// ============================================================================
+//  BCAS Studio - shadow silhouette fragment shader
+//
+//  The projected shadows are copies of the entity's own artwork, so the artwork
+//  IS the problem: DST draws shading as ink seams between symbols, hatching,
+//  dot screens and outline strokes, and all of that is painted with PARTIAL
+//  alpha. With the stock shader the shadow therefore shows those seams and
+//  strokes as lighter lines inside the silhouette (the reported seams and
+//  outline strokes).
+//
+//  This shader turns the alpha into a flat silhouette in two steps, and both
+//  steps are chosen to avoid the failure modes that were tried and rejected:
+//
+//    1. PROPORTIONAL FILL (never a cut): m = a * GAIN, clamped to 1. A hard
+//       threshold shreds the soft brush fringes (the ground shows through in
+//       chunks), so nothing is ever driven to zero here.
+//       Everything from 1/GAIN up becomes flat, and below it the fringe keeps a
+//       proportional (soft, just compressed) gradient.
+//
+//    2. TINY CLOSING PROBE: a pixel that is solid on all four sides within ~3
+//       atlas texels is INSIDE a body and gets painted solid no matter how faint
+//       its own alpha is. That erases the hatching / outline strokes inside the
+//       art. The probe must stay TINY and axis-aligned: a wide or diagonal probe
+//       reaches across the atlas's sprite borders and either stamps rectangular
+//       packing bands into the shadow, or bridges two packed
+//       sprites and grows little tabs out of the silhouette.
+//
+//  Fill/alpha details:
+//    * the fill only ever RAISES alpha, so the silhouette can only grow by the
+//      probe radius (about 1 screen pixel) - it can never lose a piece;
+//    * FLOAT_PARAMS.x is the shadow's own strength (sun/moon alpha, driven by
+//      bcas_sun_emitter.lua), so the flat fill still fades with the sun;
+//    * the colour is always flat black - one colour, and no artwork RGB (ink
+//      outlines, eye patterns, white rim light) can show through, day or night.
+//
+//  IMPORTANT - only uniforms that the code ACTUALLY uses may be declared, and
+//  the ksh entry table may only list those same slots, and each slot must be
+//  listed in the vs_refs / ps_refs trailer of the stage that uses it (the build
+//  script enforces all three; tools/glsl_check.py re-checks the compiled
+//  program against ANGLE). Anything declared-but-unused is optimised out by the
+//  compiler while the engine still binds it by table slot, which trips ANGLE's
+//  program-binary assertion (libGLESv2 ProgramBinary.cpp: mSamplersPS[...].active)
+//  and hard crashes the game - that is exactly what the first attempt hit.
+//
+//  Uniforms used, and why nothing else is:
+//    SAMPLER[0..1],[5]  atlas pages, exactly like the engine's anim.ps: the
+//                       page index arrives packed in PS_TEXCOORD.z and the
+//                       third page lives in slot 5 (TRIPLE_ATLAS variant).
+//    FLOAT_PARAMS.x     shadow alpha.
+//    MatrixP/V/W        (vertex stage) the engine's non-skinned entity
+//                       transform, copied from anim.vs line for line.
+//
+//  NOTE FOR MAINTAINERS: pure ASCII only (ANGLE rejects anything else).
+// ============================================================================
+
+uniform sampler2D SAMPLER[6];
+
+varying vec3 PS_TEXCOORD;
+
+uniform vec3 FLOAT_PARAMS;
+
+// 1/GAIN = the alpha from which upwards a pixel is painted solid.
+// 4.0 -> 0.25 and above is flat; below that the fringe stays proportional.
+#define FILL_GAIN 4.0
+
+// Closing probe radius, in atlas UV. ~3 texels of a 2048 atlas: wide enough to
+// seal 1-3 texel seams and hatching, small enough not to reach the next sprite
+// in the atlas.
+#define FILL_PROBE vec2(0.0015, 0.0015)
+
+float silhouette(sampler2D atlas, vec2 uv)
+{
+    float a = texture2D(atlas, uv).a;
+
+    // 1) proportional fill - the shape is never cut, faint paint stays paint
+    float fill = clamp(a * FILL_GAIN, 0.0, 1.0);
+
+    // 2) closing probe - solid on ALL FOUR sides within the tiny radius means
+    //    "inside a body". Requiring all four sides is what keeps the probe from
+    //    bridging across the atlas: two sprites packed next to each other always
+    //    leave one axis empty, so no foreign art can be pulled into a symbol,
+    //    and no tab grows out of the silhouette.
+    float l = texture2D(atlas, uv + vec2(-FILL_PROBE.x, 0.0)).a;
+    float r = texture2D(atlas, uv + vec2( FILL_PROBE.x, 0.0)).a;
+    float d = texture2D(atlas, uv + vec2(0.0, -FILL_PROBE.y)).a;
+    float u = texture2D(atlas, uv + vec2(0.0,  FILL_PROBE.y)).a;
+    float inside = smoothstep(0.50, 0.80, min(min(l, r), min(d, u)));
+
+    return max(fill, inside);
+}
+
+void main()
+{
+    float m;
+    if (PS_TEXCOORD.z < 0.5) {
+        m = silhouette(SAMPLER[0], PS_TEXCOORD.xy);
+    } else if (PS_TEXCOORD.z < 1.5) {
+        m = silhouette(SAMPLER[1], PS_TEXCOORD.xy);
+    } else {
+        // Third atlas page: the engine's own anim.ps keeps it in slot 5, so do
+        // the same here (same slot, same binding).
+        m = silhouette(SAMPLER[5], PS_TEXCOORD.xy);
+    }
+
+    float alpha = m * clamp(FLOAT_PARAMS.x, 0.0, 1.0);
+
+    // One flat colour: black. No RGB term at all, so no artwork detail (ink
+    // outlines, eye patterns, white rim light) can ever show inside the
+    // silhouette - and with rgb = 0 the premultiplied blend only darkens.
+    gl_FragColor = vec4(0.0, 0.0, 0.0, alpha);
+}

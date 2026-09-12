@@ -26,12 +26,22 @@ Assets = {
     Asset("SHADER", "shaders/bcas_bloom_d2.ksh"),
     Asset("SHADER", "shaders/bcas_bloom_d3.ksh"),
     Asset("ANIM", "anim/lightrays.zip"),
-    Asset("ANIM", "anim/wilson_shad.zip"),
-    Asset("ANIM", "anim/wilsonbeefalo_shad.zip"),
-    -- 海面波光层：跟随摄像机的贴地 quad，程序化法线 + 太阳镜面高光
-    -- （见 scripts/bcas_glint.lua / src_shaders/bcas_glint.ps）
     Asset("ANIM", "anim/pbr_water.zip"),
     Asset("SHADER", "shaders/bcas_glint.ksh"),
+
+    -- 影子剪影着色器（tools/make_silhouette_shader.py 从引擎 anim.ksh 派生）。
+    -- 三个固定变体，各带一份 _skinned 备用（SHADOW_SKINNED_FALLBACK 切换）：
+    --   bcas_silhouette*      可见层：alpha 硬压平 + 深度前推 LAYER_BIAS
+    --   bcas_silhouette_write* 写深度孪生体：压平 + 输出 alpha 0（只写深度）
+    --   bcas_silhouette_fx*   装备克隆：压平可见，整体后撤 FX_BACKOFF
+    -- 变体是固定逻辑、不读运行时哨兵 —— 上一版挂在 FLOAT_PARAMS.z 上，
+    -- 引擎一清就静默全失效（线条/闪烁/缺块，且日志无痕），故废弃该方案。
+    Asset("SHADER", "shaders/bcas_silhouette.ksh"),
+    Asset("SHADER", "shaders/bcas_silhouette_skinned.ksh"),
+    Asset("SHADER", "shaders/bcas_silhouette_write.ksh"),
+    Asset("SHADER", "shaders/bcas_silhouette_write_skinned.ksh"),
+    Asset("SHADER", "shaders/bcas_silhouette_fx.ksh"),
+    Asset("SHADER", "shaders/bcas_silhouette_fx_skinned.ksh"),
 
     -- BCAS Studio 设置面板图集（圆角面板/卡片/胶囊/旋钮，由 tools/build_ui_atlas.py 生成）。
     -- 必须在此声明：mod 图集不声明 Asset，引擎不会加载，面板会整块透明只剩文字。
@@ -366,7 +376,7 @@ AddClassPostConstruct("screens/playerhud", function(self)
     -- 动画统一驱动（8Hz，Lua 算好标量，GPU 零额外开销）：
     -- 1) 颗粒：TIME uniform 驱动胶片颗粒闪动（静止 TIME 只是一层死噪点）。
     -- 2) 辉光光晕呼吸：慢速多频正弦合成 0.92..1.08 标量，经 BCAS_GLOW2.w
-    --    只调制光晕层——光源核心保持稳定，"活光"感不显廉价（光影绘卷式）。
+    --    只调制光晕层——光源核心保持稳定，"活光"感不显廉价。
     self.inst:DoPeriodicTask(0.125, function()
         -- 必须 GLOBAL.PostProcessor：mod 环境启动时拷到的是 nil 空壳，
         -- 裸 PostProcessor 永远读不到引擎后来赋的真对象。

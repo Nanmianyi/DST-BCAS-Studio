@@ -103,9 +103,51 @@ State.HookVanillaFilters()
 
 local ENABLE_HDFONT = GetModConfigData("HDFONT") ~= "off"
 
-if ENABLE_HDFONT then
-    local MODROOT_ = MODROOT
+local MODROOT_ = MODROOT
+local FONT_PREFAB = "cn_fonts_bcasstudio"
+-- HDFONT 关闭时面板字体用的独立名字：绝不覆盖引擎的 normalfont，
+-- 只给我们自己的面板单独提供一份高清无描边字体。
+local PANEL_FONT_NAME = "bcaspanelfont"
+local panel_font_loaded = false
 
+-- 字体 zip 必须经预制件注册才会被引擎挂载（TheSim:LoadFont 才找得到文件）
+local function EnsureFontZip()
+    local TheSim = GLOBAL.TheSim
+    TheSim:UnloadPrefabs({FONT_PREFAB})
+    GLOBAL.RegisterPrefabs(GLOBAL.Prefab("common/" .. FONT_PREFAB, nil, {
+        GLOBAL.Asset("FONT", MODROOT_ .. "fonts/normal.zip"),
+        GLOBAL.Asset("FONT", MODROOT_ .. "fonts/normal_outline.zip"),
+    }))
+    TheSim:LoadPrefabs({FONT_PREFAB})
+end
+
+-- 设置面板字体：【无条件】用我们自带的高清无描边字体，与 HDFONT 开关无关。
+-- 起因：有的用户用描边字体 / 原版低清字体（或别的字体 mod），面板是浅底小字，
+-- 跟着他们的字体走就会糊、看不清（"字看不清"的反馈基本都来自这里）。
+-- 面板是我们自己的界面，字体自给自足最省事，不依赖任何全局字体常量：
+--   HDFONT 开 -> 复用已加载的 normalfont（同一个 zip，不重复加载）
+--   HDFONT 关 -> 独立名字 bcaspanelfont 单独加载一份（完全不动引擎字体）
+local function ApplyPanelFont()
+    if not ENABLE_HDFONT then
+        local TheSim = GLOBAL.TheSim
+        if panel_font_loaded then
+            TheSim:UnloadFont(PANEL_FONT_NAME)
+        end
+        EnsureFontZip()
+        TheSim:LoadFont(MODROOT_ .. "fonts/normal.zip", PANEL_FONT_NAME)
+        panel_font_loaded = true
+    end
+    -- strict.lua 会拦截"函数体内给未声明新全局赋值"，必须 rawset 绕过 __newindex；
+    -- 读取方 bcas_screen 用 rawget(_G, ...) 对应。
+    GLOBAL.rawset(GLOBAL, "BCAS_FONT_CLEAN",
+        ENABLE_HDFONT and "normalfont" or PANEL_FONT_NAME)
+end
+
+-- 面板字体先挂上（与 HDFONT 无关）；游戏重建预制件时会重置字体，
+-- 重挂点见下方两个分支。
+ApplyPanelFont()
+
+if ENABLE_HDFONT then
     -- 备份原字体常量，方便将来做开关恢复
     local FontNames = {
         DEFAULTFONT = GLOBAL.DEFAULTFONT,
@@ -126,20 +168,11 @@ if ENABLE_HDFONT then
         CHATFONT_OUTLINE = GLOBAL.CHATFONT_OUTLINE,
     }
 
-    local FONT_PREFAB = "cn_fonts_bcasstudio"
-
     local function ApplyHDFonts()
         local TheSim = GLOBAL.TheSim
         TheSim:UnloadFont("normalfont")
         TheSim:UnloadFont("normalfont_outline")
-        TheSim:UnloadPrefabs({FONT_PREFAB})
-
-        local assets = {
-            GLOBAL.Asset("FONT", MODROOT_ .. "fonts/normal.zip"),
-            GLOBAL.Asset("FONT", MODROOT_ .. "fonts/normal_outline.zip"),
-        }
-        GLOBAL.RegisterPrefabs(GLOBAL.Prefab("common/" .. FONT_PREFAB, nil, assets))
-        TheSim:LoadPrefabs({FONT_PREFAB})
+        EnsureFontZip()
 
         TheSim:LoadFont(MODROOT_ .. "fonts/normal.zip", "normalfont")
         TheSim:LoadFont(MODROOT_ .. "fonts/normal_outline.zip", "normalfont_outline")
@@ -175,10 +208,7 @@ if ENABLE_HDFONT then
         GLOBAL.TALKINGFONT_HERMIT = "normalfont_outline"
         GLOBAL.TALKINGFONT_TRADEIN = "normalfont_outline"
 
-        -- BCAS 面板专用：浅底 UI 一律无描边（bcas_screen 读取，未注入时回落 UIFONT）
-        -- strict.lua 会拦截"函数体内给未声明新全局赋值"（main chunk 例外），
-        -- 必须 rawset 绕过 __newindex；读取方 bcas_screen 用 rawget(_G, ...) 对应。
-        GLOBAL.rawset(GLOBAL, "BCAS_FONT_CLEAN", "normalfont")
+        -- 面板字体由 ApplyPanelFont 无条件负责（HDFONT 开时它就是 normalfont）
     end
 
     -- ⚠ 字体历史（2026-09-09/10）：自铸字模细淡 → 自研"增强+42px 小字模"
@@ -208,6 +238,7 @@ if ENABLE_HDFONT then
     local oldUnregisterAllPrefabs = SimIndex.UnregisterAllPrefabs
     SimIndex.UnregisterAllPrefabs = function(self, ...)
         oldUnregisterAllPrefabs(self, ...)
+        ApplyPanelFont()
         ApplyHDFonts()
         ApplyFontFallbacks()
     end
@@ -215,18 +246,51 @@ if ENABLE_HDFONT then
     local oldRegisterPrefabs = GLOBAL.ModManager.RegisterPrefabs
     GLOBAL.ModManager.RegisterPrefabs = function(self, ...)
         oldRegisterPrefabs(self, ...)
+        ApplyPanelFont()
         ApplyHDFonts()
         ApplyFontFallbacks()
     end
 
     local oldStart = GLOBAL.Start
     GLOBAL.Start = function(...)
+        ApplyPanelFont()
         ApplyHDFonts()
         ApplyFontFallbacks()
         return oldStart(...)
     end
 
+    ApplyPanelFont()
     ApplyHDFonts()
+else
+    -- ── HDFONT 关闭：完全不碰游戏全局字体，只保证【设置面板】用我们的高清字体 ──
+    -- 面板是浅底小字，跟着用户的描边字体/原版低清字体走就会糊；用户关掉高清字体
+    -- 只是想改游戏观感，没理由让他连我们自己的面板都看不清。
+    -- 同样只在 LoadFonts 之后的重挂点里设 fallback（见上方崩溃记录）。
+    local function ApplyPanelFallbacks()
+        GLOBAL.TheSim:SetupFontFallbacks(PANEL_FONT_NAME, GLOBAL.DEFAULT_FALLBACK_TABLE)
+    end
+
+    local SimIndex = GLOBAL.getmetatable(GLOBAL.TheSim).__index
+    local oldUnregisterAllPrefabs = SimIndex.UnregisterAllPrefabs
+    SimIndex.UnregisterAllPrefabs = function(self, ...)
+        oldUnregisterAllPrefabs(self, ...)
+        ApplyPanelFont()
+        ApplyPanelFallbacks()
+    end
+
+    local oldRegisterPrefabs = GLOBAL.ModManager.RegisterPrefabs
+    GLOBAL.ModManager.RegisterPrefabs = function(self, ...)
+        oldRegisterPrefabs(self, ...)
+        ApplyPanelFont()
+        ApplyPanelFallbacks()
+    end
+
+    local oldStart = GLOBAL.Start
+    GLOBAL.Start = function(...)
+        ApplyPanelFont()
+        ApplyPanelFallbacks()
+        return oldStart(...)
+    end
 end
 
 -- ==========================================================================

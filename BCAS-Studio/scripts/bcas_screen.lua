@@ -19,8 +19,18 @@ local TextEdit = require "widgets/textedit"
 
 local State = require "bcas_state"
 
--- 无描边干净字体（HDFONT 开启时注入，关闭时回落 UIFONT）
-local F_CLEAN = rawget(_G, "BCAS_FONT_CLEAN") or UIFONT
+-- 面板字体：modmain 无条件注入 BCAS_FONT_CLEAN（自带高清无描边字体，
+-- 与用户的 HDFONT 开关、以及用户自己装的描边/低清字体 mod 都无关 ——
+-- 面板是我们自己的浅底小字界面，字体自给自足才不会糊）。
+-- 这里每次取用实时读，避免模块加载顺序一变就把回退值锁死。
+local function F_CLEAN()
+    -- 兜底顺序：注入值 -> BUTTONFONT（正文非描边）-> UIFONT。
+    -- 不要直接用 UIFONT 兜底：HDFONT 开启时 modmain 会把它设成【描边】字体，
+    -- 浅底面板上描边字反而更难读。
+    return rawget(_G, "BCAS_FONT_CLEAN")
+        or rawget(_G, "BUTTONFONT")
+        or UIFONT
+end
 
 -- ==== 1. 实验室签名调色板 (OPTICAL LAB PALETTE) ==============================
 local C = {
@@ -79,7 +89,7 @@ local BCASButton = Class(Button, function(self, w, h, label, fontsize)
     part("p" .. h .. "l.tex", cap, h, -(w / 2 - cap / 2))
     part("p" .. h .. "r.tex", cap, h, w / 2 - cap / 2)
 
-    self.text:SetFont(F_CLEAN)
+    self.text:SetFont(F_CLEAN())
     self.text:SetSize(fontsize or 14)
     self.text:SetString(label or "")
     self.text:SetRegionSize(w, h)
@@ -517,7 +527,7 @@ end
 -- 安全文本排版
 function BCASScreen:Label(parent, x, y, w, size, str, col, halign, h)
     local ha = halign or ANCHOR_LEFT
-    local t = parent:AddChild(Text(F_CLEAN, size, str))
+    local t = parent:AddChild(Text(F_CLEAN(), size, str))
     local cx = x
     if ha == ANCHOR_LEFT then
         cx = x + w / 2
@@ -716,7 +726,7 @@ function BCASScreen:BuildRow(key, y)
     value_btn:SetImageNormalColour(C.CARD_WHITE[R], C.CARD_WHITE[G], C.CARD_WHITE[B], 1)
     value_btn:SetImageFocusColour(C.AMBER[R], C.AMBER[G], C.AMBER[B], 0.25)
 
-    local value_text = value_btn:AddChild(Text(F_CLEAN, 14, ""))
+    local value_text = value_btn:AddChild(Text(F_CLEAN(), 14, ""))
     value_text:SetRegionSize(56, 24)
     value_text:SetPosition(0, 0)
     value_text:SetHAlign(ANCHOR_MIDDLE)
@@ -786,7 +796,7 @@ end
 -- ==== 8. 数值输入交互 (TextEdit) ============================================
 
 function BCASScreen:MakeEdit(parent, tag, x, y, w, h, value_text, setter, getter, after)
-    local edit = parent:AddChild(TextEdit(F_CLEAN, 14, "", C.ESPRESSO))
+    local edit = parent:AddChild(TextEdit(F_CLEAN(), 14, "", C.ESPRESSO))
     edit:SetPosition(x, y)
     edit:SetRegionSize(w - 6, h)
     edit:SetHAlign(ANCHOR_MIDDLE)
@@ -1121,7 +1131,7 @@ function BCASScreen:BuildWBPopup()
         value_btn:SetImageNormalColour(C.CARD_WHITE[R], C.CARD_WHITE[G], C.CARD_WHITE[B], 1)
         value_btn:SetImageFocusColour(C.AMBER[R], C.AMBER[G], C.AMBER[B], 0.3)
 
-        local value_text = value_btn:AddChild(Text(F_CLEAN, 14, "1.00"))
+        local value_text = value_btn:AddChild(Text(F_CLEAN(), 14, "1.00"))
         value_text:SetRegionSize(58, 26)
         value_text:SetPosition(0, 0)
         value_text:SetHAlign(ANCHOR_MIDDLE)
@@ -1179,7 +1189,7 @@ function BCASScreen:BuildWBPopup()
 end
 
 function BCASScreen:MakeGainEdit(parent, i, value_text)
-    local edit = parent:AddChild(TextEdit(F_CLEAN, 14, "", C.ESPRESSO))
+    local edit = parent:AddChild(TextEdit(F_CLEAN(), 14, "", C.ESPRESSO))
     edit:SetPosition(VAL_X, 0)
     edit:SetRegionSize(52, 26)
     edit:SetHAlign(ANCHOR_MIDDLE)

@@ -236,9 +236,10 @@ local PRESETS = {
         DeconvGate = 0.025, DeconvPenetr = 0.80,
         -- 02 进阶
         RangeSigma = 0.26, SpatialSigma = 1.10, CenterWeight = 1.0, NoiseFloor = 0.01,
-        AR_Threshold = 0.0, AR_L_Overshoot = 0.0, AR_D_Overshoot = 0.0, ChromaProtect = 1.0,
-        -- 03 色彩（白平衡轮 #FFEFE4 = Temp 0.40 / Tint -0.11）
-        ExposureEV = 0.06, Temp = 0.40, Tint = -0.11, Saturation = 0.99,
+        AR_Threshold = 0.0, AR_L_Overshoot = 0.0, AR_D_Overshoot = 0.0, ChromaProtect = 0.21,
+        -- 03 色彩（白平衡轮 #FFFFE4 = Temp 0.404 / Tint 0.673，按 GainToTempTint 的
+        -- 增益模型反解：r=g 同时取到归一化上限时 Ti = 5T/3，b/r = 2^(-0.4T) = 228/255）
+        ExposureEV = 0.06, Temp = 0.404, Tint = 0.673, Saturation = 0.99,
         Vibrance = 0.27, Contrast = 0.03, Lightness = 0, Gamma = 1.0,
         Filmic = 0.32, HL_Desat = 0.41, OriginalMix = 0.10,
         -- 04 调色 CDL 一级

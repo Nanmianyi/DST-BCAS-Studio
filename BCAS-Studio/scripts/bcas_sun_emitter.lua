@@ -108,6 +108,33 @@ local symbol_key_cache = {}
 -- 可见影子 AnimState -> 写深度孪生体 AnimState（弱键：实体销毁后自动回收）
 local twin_as_of = setmetatable({}, { __mode = "k" })
 
+-- 影子实体深度档位（跨实体单层混合）：AnimState -> tier（弱键，随实体回收）
+-- 为什么需要：两张不同实体的影子都贴在地面上，同一个屏幕像素对应同一块地面，
+-- 深度完全相同 —— 不分档位时两边各自混合一次，叠一层深一层（树林最明显）。
+-- 档位间距由着色器 TIER_STEP 固定，且大于【单实体内部错位总跨度】，所以高档
+-- 整体压过低档：缓冲里留下覆盖该像素的最高档，只有那一档的可见层能通过。
+-- 同一影子的【可见层 / 写深度孪生体 / 装备克隆】必须共用同一个档位，
+-- 否则实体内部的近远关系会被打乱（那正是单实体不出问题的原因）。
+local tier_of = setmetatable({}, { __mode = "k" })
+local SHADOW_TIER_COUNT = 8
+-- 与档位数互质的步长：连续创建的影子档位尽量错开，相邻影子恰好同档的概率低
+local SHADOW_TIER_STRIDE = 5
+local shadow_tier_seq = 0
+
+-- 给一个影子分配档位：创建序号（乘互质步长）+ 世界坐标粗网格哈希。
+-- 屏幕上互相重叠的影子在空间上往往就是先后创建的，两者混合后档位更分散。
+local function NextShadowTier(ent)
+    shadow_tier_seq = shadow_tier_seq + 1
+    local t = shadow_tier_seq * SHADOW_TIER_STRIDE
+    if ent ~= nil and ent.Transform ~= nil then
+        local ok, tx, _, tz = pcall(ent.Transform.GetWorldPosition, ent.Transform)
+        if ok and tx ~= nil then
+            t = t + math.floor(tx / 4) + math.floor(tz / 4) * 3
+        end
+    end
+    return t % SHADOW_TIER_COUNT
+end
+
 -- 【唯一入口】把一次"符号级"AnimState 调用同时下发到可见层与写深度孪生体。
 -- 孪生体是"每像素只留最近一层"的关键，它必须与可见层【几何完全一致】：
 -- 只要有一处显隐/覆盖只落在可见层，孪生体就会在那些像素上照旧画出那块美术，
@@ -228,10 +255,12 @@ local function ApplyShadowShader(sa, kind)
     -- build / 皮肤之后都要重挂一次（只在变化时调用，不逐帧）。
     local ok = pcall(sa.SetDefaultEffectHandle, sa, path)
     shader_apply_ok[kind] = ok
-    -- FLOAT_PARAMS 归零：着色器拿它的 .y 当"美术上界"（0 -> 512 默认），
-    -- .z 必须为 0，否则引擎会给顶点加 ±0.025 的浮动（floater 用的）。
+    -- FLOAT_PARAMS：x = 本影子的深度档位（跨实体分层，见 NextShadowTier），
+    -- y = 美术上界（0 -> 着色器取 512 默认），z 必须为 0（非 0 会让引擎给顶点
+    -- 加 ±0.025 的浮动，那是 floater 用的）。SetBuild/SetSkin 会重置这些值，
+    -- 所以每次重挂着色器都要一并重发。
     if sa.SetFloatParams ~= nil then
-        pcall(sa.SetFloatParams, sa, 0, 0, 0)
+        pcall(sa.SetFloatParams, sa, tier_of[sa] or 0, 0, 0)
     end
     return ok
 end
@@ -347,6 +376,8 @@ local function MakeWriteTwin(shadow)
     -- 登记进"可见层 -> 孪生体"表：此后所有符号级调用（BothAS）都会同时下发，
     -- 保证两边几何逐像素一致 —— 这是"不带描边又不缺块"的前提。
     twin_as_of[shadow.AnimState] = tw.AnimState
+    -- 孪生体与可见层同档位（在 ApplyShadowShader 之前登记才发得出去）
+    tier_of[tw.AnimState] = shadow._tier or 0
     -- 先关着：等首轮姿态/alpha 同步确认后再亮，避免拿空状态写深度
     shadow._alpha_on = true
     if shadow._shown == nil then shadow._shown = true end
@@ -1017,7 +1048,10 @@ local function MakeCloneEntInner(shadow, bank, build, clip, follow_sym, frame, f
     if frame ~= nil and fx.AnimState.SetFrame ~= nil then
         pcall(fx.AnimState.SetFrame, fx.AnimState, frame)
     end
-    -- 剪影着色器 + 哨兵：装备影子也要纯色压平，否则会和本体影子风格不一致
+    -- 装备克隆与本体同档位：它和本体是"同一个影子的两块美术"，
+    -- 档位必须一致，否则跨实体分层会把本体或克隆整体压掉。
+    tier_of[fx.AnimState] = shadow._tier or 0
+    -- 剪影着色器：装备影子也要纯色压平，否则会和本体影子风格不一致
     -- （装备边缘的软边仍会显成线条）。必须在 SetBuild 之后挂（见函数注释）。
     ApplyShadowShader(fx.AnimState, SHADOW_MODE_VISIBLE_FX)
     -- 与影子本体同样的采样方式（线性 + mip）：物品克隆也常被压扁绘制，
@@ -2021,9 +2055,11 @@ local function ShaderSelfTest(shadow)
     end
     local function flag(k) return shader_apply_ok[k] and "OK" or "失败" end
     print(string.format(
-        "[BCAS] 剪影自检: 挂载 可见=%s 写深度=%s 克隆=%s | 孪生体=%s | 符号档=%d档(最大%s) | 头=%s",
+        "[BCAS] 剪影自检: 挂载 可见=%s 写深度=%s 克隆=%s | 孪生体=%s | 符号档=%d档(最大%s)"
+        .. " | 实体档位=%s/%d | 头=%s",
         flag(SHADOW_MODE_VISIBLE), flag(SHADOW_MODE_WRITE), flag(SHADOW_MODE_VISIBLE_FX),
         tw_ok and "OK" or "缺失", n, tostring(kmax),
+        tostring(shadow._tier), SHADOW_TIER_COUNT,
         tostring(shadow._last_build)))
 end
 
@@ -2098,6 +2134,9 @@ function SunSystem.AttachShadowToEntity(ent)
         end
     end
     shadow._height_factor = hf
+    -- 跨实体深度档位（必须在下面首次 ApplyShadowShader 之前定好）
+    shadow._tier = NextShadowTier(ent)
+    tier_of[shadow.AnimState] = shadow._tier
     shadow._budget_offset = math.random(0, 7)
     shadow._last_flip = nil
 

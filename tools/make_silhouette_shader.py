@@ -74,6 +74,17 @@ PAGE_KEY = 0.0000001
 # 编号 k=1..40，顶点着色器当 PARAMS.y 读出来乘 PARAMS_KEY。
 PARAMS_KEY = 0.000002
 PARAMS_BASE = 0.000001
+# 【跨实体分层】每个影子实体一个整数档位，Lua 经 FLOAT_PARAMS.x 下发。
+# 为什么必须要有：两张不同实体的影子都贴在地面上，同一个屏幕像素对应同一块
+# 地面 -> 它们的深度【完全相同】，靠内部错位无法分出胜负，于是各自混合一次，
+# 叠一层深一层（树林里最明显，用户实测："单个实体没事，多个影子叠在一起就
+# 又出线条/闪烁"）。给每个影子一个档位后：档位间距 TIER_STEP 大于【单实体内部
+# 错位总跨度】(ART_K*512 + PARAMS_KEY*40 + u/page ≈ 1.33e-4)，于是高档整体压过
+# 低档 —— 深度缓冲里留下覆盖该像素的最高档，也只有那一档的可见层能通过。
+# 同一档位的两张影子偶发重合时，两边各自的内部错位值不同，绝大多数像素仍能
+# 分出胜负（真打平也只是那一小块静默变深，不会闪）。
+# 8 档 × 1.6e-4 = 1.12e-3 NDC，量级仍远小于已知安全的 1e-2。
+TIER_STEP = 0.00016
 # 装备克隆整体再往远处偏一点（它和本体局部高度可能几乎一样）。
 # 相减后仍为正：ART_FLOOR + PARAMS_BASE - FX_BACKOFF = 1.95e-5 > 0
 # （上一版这里是负数，等于把装备克隆推到地平面之后，被地面整块裁掉）。
@@ -155,15 +166,20 @@ def vs_depth_patch(extra_bias):
             float bcasU = POS2D_UV.z - 2.0 * bcasPage;
             float bcasArt = clamp(bcasTop - POS2D_UV.y, 0.0, bcasTop);
             float bcasSym = PARAMS.y * %(params_key)s + %(params_base)s;
+            // Cross-entity tier (Lua passes it via SetFloatParams(tier, 0, 0)).
+            // The visible layer, the depth-writing twin and the equipment clone of
+            // one shadow share the tier, so the intra-entity ordering is untouched.
+            float bcasTier = FLOAT_PARAMS.x * %(tier_step)s;
             gl_Position.z -= (%(art_k)s * bcasArt + %(u_key)s * bcasU
                 + %(page_key)s * bcasPage + bcasSym + %(art_floor)s
-                + (%(bias)s)) * gl_Position.w;
+                + bcasTier + (%(bias)s)) * gl_Position.w;
         }
         // <<< BCAS
 """ % {
         "art_k": repr(ART_K), "u_key": repr(U_KEY), "page_key": repr(PAGE_KEY),
         "params_key": repr(PARAMS_KEY), "params_base": repr(PARAMS_BASE),
         "art_floor": repr(ART_FLOOR), "bias": repr(extra_bias),
+        "tier_step": repr(TIER_STEP),
     }).replace("\n", "\r\n")
 
 

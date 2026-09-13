@@ -14,8 +14,6 @@
 [img]https://raw.githubusercontent.com/Nanmianyi/DST-BCAS-Studio/main/docs/images/v8/sunbeams.jpg[/img]
 [img]https://raw.githubusercontent.com/Nanmianyi/DST-BCAS-Studio/main/docs/images/v8/water_after.jpg[/img]
 [img]https://raw.githubusercontent.com/Nanmianyi/DST-BCAS-Studio/main/docs/images/v8/water_shallow.jpg[/img]
-[img]https://raw.githubusercontent.com/Nanmianyi/DST-BCAS-Studio/main/docs/images/v8/deconv_after.jpg[/img]
-[img]https://raw.githubusercontent.com/Nanmianyi/DST-BCAS-Studio/main/docs/images/v8/sharpen_after.jpg[/img]
 [img]https://raw.githubusercontent.com/Nanmianyi/DST-BCAS-Studio/main/docs/images/v8/glow_after.jpg[/img]
 [img]https://raw.githubusercontent.com/Nanmianyi/DST-BCAS-Studio/main/docs/images/v8/showcase_shadow.jpg[/img]
 [img]https://raw.githubusercontent.com/Nanmianyi/DST-BCAS-Studio/main/docs/images/v8/ui_panel.jpg[/img]

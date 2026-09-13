@@ -20,7 +20,7 @@ pass**，8 个页签 60 项参数实时可调、自动保存。
 
 | 原版 | 开启后 |
 | :---: | :---: |
-| ![原版](docs/images/v8/compare_before.jpg) | ![开启后](docs/images/v8/compare_after.jpg) |
+| ![原版](docs/images/v8/pairs/compare_before.jpg) | ![开启后](docs/images/v8/pairs/compare_after.jpg) |
 
 阳光变成**有方向的世界空间光源**：建筑、树木投下贴地长影，林间透出光束，
 画面同时获得通透感与材质细节——这是在原版手绘美学之上"调到最好"，而不是换一套画风。
@@ -35,11 +35,11 @@ pass**，8 个页签 60 项参数实时可调、自动保存。
 
 | 原版水面 | 开启后 |
 | :---: | :---: |
-| ![原版水面](docs/images/v8/water_before.jpg) | ![开启后水面](docs/images/v8/water_after.jpg) |
+| ![原版水面](docs/images/v8/pairs/water_before.jpg) | ![开启后水面](docs/images/v8/pairs/water_after.jpg) |
 
 | 浅滩波光与沙底 | 深海 / 浅海丝滑过渡 | 焦散光网近景 |
 | :---: | :---: | :---: |
-| ![浅滩](docs/images/v8/water_shallow.jpg) | ![深浅过渡](docs/images/v8/water_depth.jpg) | ![波光近景](docs/images/v8/water_caustics.jpg) |
+| ![浅滩](docs/images/v8/pairs/water_shallow.jpg) | ![深浅过渡](docs/images/v8/pairs/water_depth.jpg) | ![波光近景](docs/images/v8/pairs/water_caustics.jpg) |
 
 叠加在原版水体之上的程序化 caustics 光网 + 海洋地皮调色：浅滩能看到沙底与光斑，
 深浅海之间有过透视的连续过渡，而不是一格一格的色块。
@@ -48,7 +48,7 @@ pass**，8 个页签 60 项参数实时可调、自动保存。
 
 | 关闭 | 开启 |
 | :---: | :---: |
-| ![墨线修复关](docs/images/v8/deconv_before.jpg) | ![墨线修复开](docs/images/v8/deconv_after.jpg) |
+| ![墨线修复关](docs/images/v8/pairs/deconv_before.jpg) | ![墨线修复开](docs/images/v8/pairs/deconv_after.jpg) |
 
 饥荒的美术资产经过图集合成与双线性采样，手绘轮廓线的高频信息衰减严重。
 本模组在游戏内做在线反卷积重置，把被"磨掉"的墨线重新拉回来。
@@ -57,7 +57,7 @@ pass**，8 个页签 60 项参数实时可调、自动保存。
 
 | 关闭 | 开启 |
 | :---: | :---: |
-| ![锐化关](docs/images/v8/sharpen_before.jpg) | ![锐化开](docs/images/v8/sharpen_after.jpg) |
+| ![锐化关](docs/images/v8/pairs/sharpen_before.jpg) | ![锐化开](docs/images/v8/pairs/sharpen_after.jpg) |
 
 树叶边缘与地面草纹的清晰度差异——CAS 级采样开销、离线双边锐化的自然度，
 带 AURA 抗振铃与暗部保护，不会出现白边与过冲。
@@ -66,11 +66,11 @@ pass**，8 个页签 60 项参数实时可调、自动保存。
 
 | 关闭 | 开启 |
 | :---: | :---: |
-| ![辉光关](docs/images/v8/glow_before.jpg) | ![辉光开](docs/images/v8/glow_after.jpg) |
+| ![辉光关](docs/images/v8/pairs/glow_before.jpg) | ![辉光开](docs/images/v8/pairs/glow_after.jpg) |
 
 | 关闭 | 开启 |
 | :---: | :---: |
-| ![辉光关 2](docs/images/v8/glow2_before.jpg) | ![辉光开 2](docs/images/v8/glow2_after.jpg) |
+| ![辉光关 2](docs/images/v8/pairs/glow2_before.jpg) | ![辉光开 2](docs/images/v8/pairs/glow2_after.jpg) |
 
 原生 Bloom 被置空，替换为 mip 金字塔柔光；长时间不刺眼，光源周围有暖度与长尾。
 
@@ -80,11 +80,11 @@ pass**，8 个页签 60 项参数实时可调、自动保存。
 
 | 森林光影 | 树下的贴地影子 |
 | :---: | :---: |
-| ![森林](docs/images/v8/showcase_forest.jpg) | ![树下影子](docs/images/v8/showcase_shadow.jpg) |
+| ![森林](docs/images/v8/pairs/showcase_forest.jpg) | ![树下影子](docs/images/v8/pairs/showcase_shadow.jpg) |
 
 | 人物与光影 | 人物特写 |
 | :---: | :---: |
-| ![人物](docs/images/v8/showcase_char1.jpg) | ![人物特写](docs/images/v8/showcase_char2.jpg) |
+| ![人物](docs/images/v8/pairs/showcase_char1.jpg) | ![人物特写](docs/images/v8/pairs/showcase_char2.jpg) |
 
 影子是**纯色半透明剪影**：没有美术自带的描边线，部件重叠不会变深，
 多实体的影子叠在一起也不会"叠一层深一层"。
@@ -93,7 +93,7 @@ pass**，8 个页签 60 项参数实时可调、自动保存。
 
 | 参数面板 | 白平衡与色彩页 |
 | :---: | :---: |
-| ![面板](docs/images/v8/ui_panel.jpg) | ![面板 2](docs/images/v8/ui_panel2.jpg) |
+| ![面板](docs/images/v8/pairs/ui_panel.jpg) | ![面板 2](docs/images/v8/pairs/ui_panel2.jpg) |
 
 8 个页签、60 项参数，拖动即实时预览，全参数自动保存。
 

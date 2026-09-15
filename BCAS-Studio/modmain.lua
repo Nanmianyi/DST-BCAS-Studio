@@ -115,12 +115,44 @@ local panel_font_loaded = false
 -- 字体 zip 必须经预制件注册才会被引擎挂载（TheSim:LoadFont 才找得到文件）
 local function EnsureFontZip()
     local TheSim = GLOBAL.TheSim
-    TheSim:UnloadPrefabs({FONT_PREFAB})
+    pcall(TheSim.UnloadPrefabs, TheSim, {FONT_PREFAB})
     GLOBAL.RegisterPrefabs(GLOBAL.Prefab("common/" .. FONT_PREFAB, nil, {
         GLOBAL.Asset("FONT", MODROOT_ .. "fonts/normal.zip"),
         GLOBAL.Asset("FONT", MODROOT_ .. "fonts/normal_outline.zip"),
     }))
-    TheSim:LoadPrefabs({FONT_PREFAB})
+    local ok, err = pcall(TheSim.LoadPrefabs, TheSim, {FONT_PREFAB})
+    return ok, err
+end
+
+-- ⚠ 字体加载失败会被引擎【直接断言】带崩游戏（实测 simluaproxy.cpp:2715：
+-- 进世界重载 mod 的那一次 LoadFont 返回 false → 断言 → 崩溃转储），前端那一次
+-- 却是好的（低显存机器 + ReShade 叠加时最容易撞上）。所以这里三级保护：
+--   1) 先解析路径，确认资源真的挂上了（没挂上就根本不调引擎）；
+--   2) 所有 TheSim 调用都 pcall 包住；
+--   3) 失败时【不】改动全局字体常量 —— 游戏照常用自己的字体，只是这一轮没有
+--      高清字体，并由 Start / RegisterPrefabs 的重挂点自动再试。
+local font_fail_logged = false
+local function FontAssetReady(path)
+    local f = GLOBAL.resolvefilepath
+    if type(f) ~= "function" then return true end     -- 拿不到解析器就不拦
+    local ok, p = pcall(f, path)
+    return ok and type(p) == "string" and p ~= ""
+end
+
+local function SafeLoadFont(path, name)
+    if not FontAssetReady(path) then return false, "asset-not-mounted" end
+    local TheSim = GLOBAL.TheSim
+    local ok, err = pcall(TheSim.LoadFont, TheSim, path, name)
+    if not ok then return false, tostring(err) end
+    return true
+end
+
+local function WarnFontFail(where, err)
+    if font_fail_logged then return end
+    font_fail_logged = true
+    print("[BCAS] 高清字体这一轮没加载上（" .. tostring(where) .. "：" .. tostring(err)
+        .. "），已自动退回游戏默认字体，不会影响进游戏；")
+    print("[BCAS] 若一直如此，多半是显存/资源被 ReShade 等叠加占满，可在设置里关掉高清字体。")
 end
 
 -- 设置面板字体：【无条件】用我们自带的高清无描边字体，与 HDFONT 开关无关。
@@ -133,16 +165,24 @@ local function ApplyPanelFont()
     if not ENABLE_HDFONT then
         local TheSim = GLOBAL.TheSim
         if panel_font_loaded then
-            TheSim:UnloadFont(PANEL_FONT_NAME)
+            pcall(TheSim.UnloadFont, TheSim, PANEL_FONT_NAME)
+            panel_font_loaded = false
         end
-        EnsureFontZip()
-        TheSim:LoadFont(MODROOT_ .. "fonts/normal.zip", PANEL_FONT_NAME)
-        panel_font_loaded = true
+        local ok_zip, err_zip = EnsureFontZip()
+        local ok, err = false, err_zip
+        if ok_zip then
+            ok, err = SafeLoadFont(MODROOT_ .. "fonts/normal.zip", PANEL_FONT_NAME)
+            panel_font_loaded = ok
+        end
+        if not ok then WarnFontFail("面板字体", err) end
     end
     -- strict.lua 会拦截"函数体内给未声明新全局赋值"，必须 rawset 绕过 __newindex；
     -- 读取方 bcas_screen 用 rawget(_G, ...) 对应。
+    -- 面板字体没加载上时回落到游戏默认字体名，别让面板去引用一个不存在的字体
+    -- （那会另开一条崩溃路径）。
     GLOBAL.rawset(GLOBAL, "BCAS_FONT_CLEAN",
-        ENABLE_HDFONT and "normalfont" or PANEL_FONT_NAME)
+        ENABLE_HDFONT and "normalfont"
+        or (panel_font_loaded and PANEL_FONT_NAME or "normalfont"))
 end
 
 -- 面板字体先挂上（与 HDFONT 无关）；游戏重建预制件时会重置字体，
@@ -172,12 +212,22 @@ if ENABLE_HDFONT then
 
     local function ApplyHDFonts()
         local TheSim = GLOBAL.TheSim
-        TheSim:UnloadFont("normalfont")
-        TheSim:UnloadFont("normalfont_outline")
-        EnsureFontZip()
+        pcall(TheSim.UnloadFont, TheSim, "normalfont")
+        pcall(TheSim.UnloadFont, TheSim, "normalfont_outline")
+        local ok_zip, err_zip = EnsureFontZip()
 
-        TheSim:LoadFont(MODROOT_ .. "fonts/normal.zip", "normalfont")
-        TheSim:LoadFont(MODROOT_ .. "fonts/normal_outline.zip", "normalfont_outline")
+        local ok1, err1 = false, err_zip
+        local ok2 = false
+        if ok_zip then
+            ok1, err1 = SafeLoadFont(MODROOT_ .. "fonts/normal.zip", "normalfont")
+            ok2 = SafeLoadFont(MODROOT_ .. "fonts/normal_outline.zip", "normalfont_outline")
+        end
+        if not (ok1 and ok2) then
+            -- 全局字体常量【不能】动：指向没加载上的字体比不用高清字体的后果严重得多
+            -- （见上方 WarnFontFail 的说明：引擎会直接断言）。重挂点会自动再试。
+            WarnFontFail("全局高清字体", ok1 and "outline 变体失败" or err1)
+            return
+        end
 
         -- v3.8.1 字体定版：fonts/normal.zip、normal_outline.zip = 工坊
         -- 1418746242（Chinese++）的 zip 原样照搬（fnt+tex 成对，多年实机

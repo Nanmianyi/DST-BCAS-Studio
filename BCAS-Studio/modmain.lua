@@ -26,7 +26,9 @@ Assets = {
     Asset("SHADER", "shaders/bcas_bloom_d2.ksh"),
     Asset("SHADER", "shaders/bcas_bloom_d3.ksh"),
     Asset("ANIM", "anim/lightrays.zip"),
-    Asset("ANIM", "anim/pbr_water.zip"),
+    -- 波光层载体：自建 anim 包（bank/build 均为 bcas_wave、符号 canvas、动画 idle；
+    -- 图集为纯白占位，着色器不采样）
+    Asset("ANIM", "anim/bcas_surface.zip"),
     Asset("SHADER", "shaders/bcas_glint.ksh"),
 
     -- 影子剪影着色器（tools/make_silhouette_shader.py 从引擎 anim.ksh 派生）。

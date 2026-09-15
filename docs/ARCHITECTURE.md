@@ -8,12 +8,13 @@ BCAS-Studio/                 ← Mod 本体（整体复制到 DST mods 目录即
 ├── modmain.lua              ← 官方钩子接入、热键、面板入口、高清字体整合
 ├── scripts/
 │   ├── bcas_state.lua       ← 参数状态机：VEC 定义 / 预设 / 打包下发 / 持久化
-│   ├── bcas_screen.lua      ← 画质工作室面板：7 页签 / 拖拽行 / 白平衡色轮
+│   ├── bcas_screen.lua      ← 画质工作室面板：8 页签 / 拖拽行 / 白平衡色轮
 │   ├── bcas_sun_emitter.lua ← 动态太阳：日晷模型 / 剪影投影 / 透云光束
+│   ├── bcas_glint.lua       ← 海面波光层（程序化 caustics 光网 quad）
 │   └── bcas_ocean.lua       ← 海洋地皮调色（世界生成时烘焙）
-├── shaders/                 ← 构建产物（bcas_cinema/studio/glow + bloom_pre/d1..d3，勿手改）
-├── fonts/                   ← 思源黑体 85px 视网膜重铸版（见 ATTRIBUTION.txt）
-└── anim/                    ← 投影剪影动画（wilson_shad / wilsonbeefalo_shad）
+├── shaders/                 ← 构建产物（调色/辉光/Bloom 链 + bcas_silhouette 六变体，勿手改）
+├── fonts/                   ← 思源黑体 85px 视网膜字模（取自 Chinese++，见 ATTRIBUTION.txt）
+└── anim/                    ← 资源：lightrays（游戏本体提取）/ bcas_surface（自建空白方块载体）
 src_shaders/                 ← 全部 GLSL ES 源码
 ├── bcas_cinema.ps           ← PASS 1 电影调色引擎
 ├── bcas_studio.ps           ← PASS 2 锐化与终合成

@@ -78,8 +78,10 @@ local function MakeSurface(scale)
     inst:AddTag("NOCLICK")
     inst:AddTag("CLASSIFIED")
 
-    inst.AnimState:SetBank("pbr_water")
-    inst.AnimState:SetBuild("pbr_water")
+    -- 载体 = 自建 anim 包 bcas_surface.zip（100 单位方块 + idle；图集纯白，
+    -- 着色器不采样）
+    inst.AnimState:SetBank("bcas_wave")
+    inst.AnimState:SetBuild("bcas_wave")
     inst.AnimState:PlayAnimation("idle", false)
     inst.AnimState:SetFloatParams(0.55, 0.93, 1.0)
     inst.AnimState:SetScale(scale, scale, scale)

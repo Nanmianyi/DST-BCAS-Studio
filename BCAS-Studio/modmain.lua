@@ -13,6 +13,14 @@
 
 local TheNet = GLOBAL.TheNet
 
+-- ⚠ modmain 跑在 mod 沙箱环境里，pcall / type / tostring 这些基础函数【不可见】
+-- （见下方字体历史注释："构造沙箱环境连 GetFont/pcall 都不可见"；2026-09-15 实测
+-- 在 modmain 里直接写 pcall(...) 会 MOD ERROR: attempt to call global 'pcall'）。
+-- modmain 里要用一律先取真身；scripts/*.lua 经 require 加载，环境不同，不受影响。
+local pcall = GLOBAL.pcall
+local type = GLOBAL.type
+local tostring = GLOBAL.tostring
+
 if TheNet:IsDedicated() then
     return -- 专用服务器无渲染，直接退出
 end

@@ -39,6 +39,41 @@ local SHADOW_MAX_ALPHA = 0.50
 local SHADOW_MOON_ALPHA = 0.38
 
 -- ---------------------------------------------------------------------------
+-- 半影（v2 观感）：柔边 + 随高度扩散 + 随高度变淡
+-- ---------------------------------------------------------------------------
+-- 着色器侧（bcas_silhouette*.ksh）不再做"一刀切"：alpha 走 smoothstep 过渡带，
+-- 并且按【离地高度】扩散 4 次屏幕空间采样 —— 越高半影越宽、越淡，于是影子
+-- 有了"贴着地面最实、往上化开"的层次；真实半影正是这么来的（投影体离受体越远，
+-- 半影越宽，能量守恒 → 越淡）。
+--
+-- "离地高度"由顶点着色器算：把顶点相对贴地点的位移，投影到美术自己的竖直轴上
+-- 再取绝对值 —— 这个"在 VS 里用绘制矩阵反推局部空间尺度"的手法来自
+-- 「时光建筑 · Daylight Architecture」（B 站：三黑无糖 / Steam：白粥）贡献的
+-- 精灵表面光照代码（它用同一手法算 DA_LOCAL_METRES）。取绝对值是为了不依赖
+-- "美术 y 朝上还是朝下"这个发布文件里没有定义的约定。
+--
+-- 这里只负责把"太阳有多低"翻译成柔度，送进 FLOAT_PARAMS.z：
+--   * 用影子长度当太阳高度角的代理量（长度 = 1/tan 高度角，正是已有的 scale_y）
+--     → 正午最短最锐，日出日落最长最柔，不需要额外天文计算。
+--   * 必须 < 1.5：顶点着色器把 z∈(0,1.5) 当合法柔度，超出会触发引擎的 floater
+--     浮动（gl_Position.y ±0.025，影子会整块离地飘）。
+local SHADOW_SOFT_MAX = 1.00
+-- 雨/雪天：天空漫射光占比大，影子本来就该更柔更淡。
+local SHADOW_SOFT_WEATHER = 0.18
+-- 半影柔度在数值上只需 1/32 的台阶（太阳约 1.2 度/秒，肉眼看不出台阶）。
+local SHADOW_SOFT_STEPS = 32.0
+-- 影子色调（乘色 rgb，着色器已把美术 RGB 压成常数，所以这里是"整块影子一个色"）。
+-- 纯黑在夜里显得比地面还黑一档，稍微抬一点冷色更像环境天光；数值刻意很小，
+-- 抬多了影子就"灰"而不"沉"了。见 GetSunParams。
+local SHADOW_TINT_DAY   = { 0.040, 0.055, 0.095 }
+local SHADOW_TINT_DUSK  = { 0.070, 0.050, 0.060 }
+local SHADOW_TINT_MOON  = { 0.050, 0.070, 0.130 }
+-- 当前柔度（GetSunParams 每次重算缓存时更新；ApplyShadowShader / ApplyPose 读它）。
+-- 用模块级 upvalue 而不是函数返回值，是为了避免"引用后声明的局部函数"（strict.lua
+-- 会把前向引用当未声明全局直接报错）。
+local shadow_soft_now = 0
+
+-- ---------------------------------------------------------------------------
 -- 影子剪影着色器：纯色 + 均匀透明度（"没有描边"的真正来源）
 -- ---------------------------------------------------------------------------
 -- 影子是实体美术的黑色副本，所以**美术本身就是问题**：DST 的明暗/质感是一笔
@@ -256,11 +291,11 @@ local function ApplyShadowShader(sa, kind)
     local ok = pcall(sa.SetDefaultEffectHandle, sa, path)
     shader_apply_ok[kind] = ok
     -- FLOAT_PARAMS：x = 本影子的深度档位（跨实体分层，见 NextShadowTier），
-    -- y = 美术上界（0 -> 着色器取 512 默认），z 必须为 0（非 0 会让引擎给顶点
-    -- 加 ±0.025 的浮动，那是 floater 用的）。SetBuild/SetSkin 会重置这些值，
-    -- 所以每次重挂着色器都要一并重发。
+    -- y = 美术上界（0 -> 着色器取 512 默认），z = 半影柔度（0..1.2，见
+    -- SHADOW_SOFT_MAX。顶点着色器把 (0,1.5) 视为合法柔度区间，不会触发引擎的
+    -- floater 浮动）。SetBuild/SetSkin 会重置这些值，所以每次重挂着色器都要一并重发。
     if sa.SetFloatParams ~= nil then
-        pcall(sa.SetFloatParams, sa, tier_of[sa] or 0, 0, 0)
+        pcall(sa.SetFloatParams, sa, tier_of[sa] or 0, 0, shadow_soft_now)
     end
     return ok
 end
@@ -618,17 +653,21 @@ local function GetSunParams()
             scale_y = math.sqrt(leg1 * leg1 + SHADOW_MIN_LENGTH * SHADOW_MIN_LENGTH)
             rot = math.deg(math.atan(leg1 / SHADOW_MIN_LENGTH))
             a = SHADOW_MAX_ALPHA * math.min(1, time / FADE)
+            r, g, b = SHADOW_TINT_DAY[1], SHADOW_TINT_DAY[2], SHADOW_TINT_DAY[3]
         elseif phase == "dusk" then
             scale_y = DUSK_HYPOT
             rot = DUSK_ROTATION
             a = SHADOW_MAX_ALPHA * (1 - progress)
+            r, g, b = SHADOW_TINT_DUSK[1], SHADOW_TINT_DUSK[2], SHADOW_TINT_DUSK[3]
         elseif phase == "night" and moon == 1 then
             local leg1 = TWICE_MAX * (progress - 0.5)
             scale_y = math.sqrt(leg1 * leg1 + SHADOW_MIN_LENGTH * SHADOW_MIN_LENGTH)
             rot = math.deg(math.atan(leg1 / SHADOW_MIN_LENGTH))
             a = SHADOW_MOON_ALPHA * math.min(1, progress / FADE)
-            -- 影子只能有一个颜色：满月也不染色。染色会乘进美术 RGB，
-            -- 把白色描边/眼睛图案从影子里透出来（用户反复反馈的那个）。
+            -- 满月也是"月光色"而不是纯黑：着色器已经把美术 RGB 压成常数
+            -- （colour.rgb = 1.0），所以影子里是【一整块】这个颜色，
+            -- 不会把描边/眼睛图案从影子里透出来（那是老架构的问题）。
+            r, g, b = SHADOW_TINT_MOON[1], SHADOW_TINT_MOON[2], SHADOW_TINT_MOON[3]
         end
         -- 季节/天气只压一点点：浓度一旦掉回 0.8 出头，多层叠加的深浅块就会
         -- 重新露出来（见 SHADOW_MAX_ALPHA 的说明），所以这里不再大幅下调。
@@ -637,6 +676,19 @@ local function GetSunParams()
         if state.precipitation == "rain" or state.precipitation == "snow" then
             a = a * 0.80
         end
+        -- 半影柔度：影子越长 = 太阳越低 = 投影体离受体越"远"，半影越宽越淡。
+        -- 正午 scale_y = SHADOW_MIN_LENGTH → 0（最锐），拉到最长（2.53）→ 满柔度。
+        -- 这是代理量而不是真算高度角：scale_y 本来就是 1/tan(高度角) 的形状。
+        local soft = (scale_y - SHADOW_MIN_LENGTH) / (DUSK_HYPOT - SHADOW_MIN_LENGTH)
+        if soft < 0 then soft = 0 elseif soft > 1 then soft = 1 end
+        if state.precipitation == "rain" or state.precipitation == "snow" then
+            soft = soft + SHADOW_SOFT_WEATHER
+        end
+        soft = soft * SHADOW_SOFT_MAX
+        -- 硬上界：>1.5 会踩到引擎的 floater 浮动（顶点 ±0.025，影子整体离地飘）
+        if soft > 1.2 then soft = 1.2 end
+        _cache.soft = soft
+        shadow_soft_now = soft
         _cache.scale_y, _cache.rot, _cache.a = scale_y, rot, a
         _cache.r, _cache.g, _cache.b = r, g, b
     end
@@ -1919,6 +1971,15 @@ local function ApplyPose(shadow, ent, scale_y, rot, r, g, b, a, follow)
     if rotq ~= shadow._last_rotq then
         shadow._last_rotq = rotq
         shadow.Transform:SetRotation(rot)
+    end
+    -- 半影柔度跟着太阳走（日出日落最柔）：同样走 1/32 台阶，只有跨台阶才重发
+    -- 一次 SetFloatParams —— 几百个影子 × 每帧一次引擎调用是纯浪费。
+    local sq = math.floor(shadow_soft_now * SHADOW_SOFT_STEPS + 0.5)
+    if sq ~= shadow._last_sq then
+        shadow._last_sq = sq
+        if sa.SetFloatParams ~= nil then
+            pcall(sa.SetFloatParams, sa, tier_of[sa] or 0, 0, shadow_soft_now)
+        end
     end
     if aq <= 0 then
         if shadow._alpha_on ~= false then

@@ -90,23 +90,45 @@ TIER_STEP = 0.00016
 # （上一版这里是负数，等于把装备克隆推到地平面之后，被地面整块裁掉）。
 FX_BACKOFF = 0.0000015
 
-# 变体：(输出名, 额外的深度偏置, 强制输出 alpha；None = 保留乘色 alpha)
+# 变体：(输出名, 额外的深度偏置, 强制输出 alpha；None = 保留乘色 alpha, 是否做半影扩散)
 VARIANTS = [
-    ("bcas_silhouette", LAYER_BIAS, None),
-    ("bcas_silhouette_write", 0.0, 0.0),
-    ("bcas_silhouette_fx", -FX_BACKOFF, None),
+    ("bcas_silhouette", LAYER_BIAS, None, True),
+    ("bcas_silhouette_write", 0.0, 0.0, False),
+    ("bcas_silhouette_fx", -FX_BACKOFF, None, True),
 ]
 
+# ---------------------------------------------------------------------------
+# 影子观感（v2）：物理味道的半影
+#   * 柔边：硬裁 → smoothstep 过渡带，保留美术自带的抗锯齿软边
+#   * 半影：4 次屏幕空间采样，半径随【离地高度】增大 —— 贴地处锐利、越高越糊
+#     （真实半影就是这么来的：投影体离受体越远，半影越宽；能量守恒 → 越淡）
+#   * 浓度：mix(1, DENS_MIN, h^DENS_K)，所以树冠/帽子那一片是淡的，
+#           影子不再是"整块美术剪影"，而是"贴地最实、往上化开"
+#   FLOAT_PARAMS.z = 柔度（Lua 按太阳高度角下发：正午 0 = 最锐，黄昏趋近 1 = 最柔）
+# ---------------------------------------------------------------------------
+CUT_LO = 0.05          # 低于此值完全丢弃（噪声底）
+CUT_HI = 0.52          # 高于此值完全实心（正午）
+CUT_HI_SOFT = 0.86     # 黄昏：过渡带拉宽到整个量程，边缘像烟一样散开
+SPREAD_BASE = 0.8      # 半影采样半径下限（屏幕像素）
+SPREAD_H = 3.0         # 随高度增加的半径（屏幕像素）
+SOFT_SPREAD = 0.6      # 柔度对半径的额外加成（黄昏 ×1.6）
+DENS_MIN = 0.42        # 最高处的浓度（占贴地处浓度的比例）
+DENS_K = 1.30          # 浓度随高度的衰减曲线指数
+TWIN_CUT_LO = 0.03     # 写深度孪生体：覆盖必须 ≥ 可见层，用更宽的带、不做扩散
+TWIN_CUT_HI = 0.45
+
 PS_ANCHOR = "gl_FragColor.rgba = colour.rgba * COLOUR_XFORM;"
+PS_UNIFORM_ANCHOR = "uniform vec3 FLOAT_PARAMS;"
+PS_MAIN_ANCHOR = "void main()"
 VS_BOB_OLD = "if(FLOAT_PARAMS.z > 0.0)"
 VS_BOB_NEW = "if(FLOAT_PARAMS.z > 0.0 && FLOAT_PARAMS.z < 1.5)"
 VS_HOLO_ANCHOR = "\t#if defined( HOLO )"
 VS_UNIFORM_ANCHOR = "uniform vec4 TIMEPARAMS;"
-# 引擎的 alpha 测试：它对"贴图原始 alpha"做 discard。剪影着色器自己已经有硬裁剪，
+# 引擎的 alpha 测试：它对"贴图原始 alpha"做 discard。剪影着色器自己已经有裁剪，
 # 两个闸门同时存在只会让结果依赖 PARAMS.x（引擎按实体状态设置，不是我们能控的），
 # 所以在这个着色器里把它关掉（只影响影子自己用的这个 ksh）。
 PS_ALPHATEST_OLD = "if (ALPHA_TEST > 0.0)"
-PS_ALPHATEST_NEW = "if (false) // BCAS: silhouette shader does its own hard cut"
+PS_ALPHATEST_NEW = "if (false) // BCAS: silhouette shader does its own soft cut"
 
 # 引擎 PS 里"按 FLOAT_PARAMS.y/x 把低于某高度的片元丢掉"的那段：剪影不需要，
 # 而且它的存在会让影子在某些取值下整块消失。
@@ -121,22 +143,72 @@ PS_HEIGHT_CUT_OLD = """    if(FLOAT_PARAMS.y > 0.0)
 PS_HEIGHT_CUT_NEW = """    // BCAS: engine's optional height cut removed for the silhouette shader.
 """
 
-# 注入的源码必须纯 ASCII：GLSL 字符集有限制，中文注释在 ANGLE 下可能直接编译失败
-# （失败 = 引擎回退 = 影子又变成带描边的软边），所以注释一律英文。
-PS_PATCH = """        // >>> BCAS silhouette: hard alpha flatten (no runtime uniform involved)
-        // alpha >= CUT becomes fully solid, so every pixel of the silhouette carries
-        // exactly ONE alpha value (the entity's mult colour). Painted strokes, hatching,
-        // eye patterns and the soft 1-2px artwork rim can then no longer show up as
-        // internal lines; below CUT the fragment is DISCARDED instead of blended (a soft
-        // rim left in the blend lands on a neighbouring symbol and darkens into a line).
-        if (colour.a < %(cut)s) discard;
-        colour.a = 1.0;
+# 屏幕空间采样要导数；GLES2 下必须显式打开扩展（引擎自身没用导数）。
+PS_EXTENSION = "#extension GL_OES_standard_derivatives : enable\n"
+PS_HELPERS = """
+varying float BCAS_H;      // 0 = grounded end (feet / trunk base), 1 = artwork top
+
+// Same atlas page selection the engine's own PS uses (shadows may be multi-page)
+float BCAS_TapA( vec2 uv, float page )
+{
+#if defined( TRIPLE_ATLAS )
+    if( page < 0.5 ) return texture2D( SAMPLER[0], uv ).a;
+    else if( page < 1.5 ) return texture2D( SAMPLER[1], uv ).a;
+    else return texture2D( SAMPLER[5], uv ).a;
+#else
+    if( page < 0.5 ) return texture2D( SAMPLER[0], uv ).a;
+    else return texture2D( SAMPLER[1], uv ).a;
+#endif
+}
+"""
+
+
+PS_RGB_FLAT = """        // The silhouette is a flat wash: drop the artwork's own RGB entirely.
+        // COLOUR_XFORM (the entity's SetMultColour) then decides the single colour the
+        // whole shadow carries. Without this, any surviving bright pixel (eye highlight,
+        // white ink stroke) would multiply through and show up as a light spot inside the
+        // shadow -- and a tint (rgb > 0) would resurrect that pattern.
+        colour.rgb = vec3( 1.0 );
+"""
+
+
+def ps_patch(spread):
+    """可见层：柔边 + 随高度扩散的半影 + 随高度衰减的浓度。"""
+    if not spread:
+        return PS_RGB_FLAT + """        // >>> BCAS silhouette v2 (twin: wide coverage, no spread -- depth only)
+        colour.a = step( %(lo)s, colour.a );
         // <<< BCAS
-""" % {"cut": repr(CUT)}
+""" % {"lo": repr(TWIN_CUT_LO)}
+    return PS_RGB_FLAT + """        // >>> BCAS silhouette v2: soft penumbra that spreads with caster height
+        // No runtime sentinel: plain maths on vertex-supplied BCAS_H plus the
+        // softness scale in FLOAT_PARAMS.z. Physically: the further the caster is
+        // from the ground, the wider (and therefore fainter) its penumbra is.
+        {
+            float bcasH    = BCAS_H;
+            float bcasSoft = clamp( FLOAT_PARAMS.z, 0.0, 1.4 );
+            vec2  bcasDU   = dFdx( PS_TEXCOORD.xy );
+            vec2  bcasDV   = dFdy( PS_TEXCOORD.xy );
+            float bcasR    = ( %(spread_base)s + %(spread_h)s * bcasH ) * ( 1.0 + %(soft_spread)s * bcasSoft );
+            float bcasHi   = mix( %(cut_hi)s, %(cut_hi_soft)s, bcasSoft );
+            float bcasLo   = %(cut_lo)s;
+            float bcasM    = smoothstep( bcasLo, bcasHi, colour.a );
+            bcasM += smoothstep( bcasLo, bcasHi, BCAS_TapA( PS_TEXCOORD.xy + bcasDU * bcasR, PS_TEXCOORD.z ) );
+            bcasM += smoothstep( bcasLo, bcasHi, BCAS_TapA( PS_TEXCOORD.xy - bcasDU * bcasR, PS_TEXCOORD.z ) );
+            bcasM += smoothstep( bcasLo, bcasHi, BCAS_TapA( PS_TEXCOORD.xy + bcasDV * bcasR, PS_TEXCOORD.z ) );
+            bcasM += smoothstep( bcasLo, bcasHi, BCAS_TapA( PS_TEXCOORD.xy - bcasDV * bcasR, PS_TEXCOORD.z ) );
+            bcasM *= 0.2;
+            bcasM *= mix( 1.0, %(dens_min)s, pow( bcasH, %(dens_k)s ) );
+            colour.a = bcasM;
+        }
+        // <<< BCAS
+""" % {"cut_lo": repr(CUT_LO), "cut_hi": repr(CUT_HI), "cut_hi_soft": repr(CUT_HI_SOFT),
+       "spread_base": repr(SPREAD_BASE), "spread_h": repr(SPREAD_H),
+       "soft_spread": repr(SOFT_SPREAD), "dens_min": repr(DENS_MIN), "dens_k": repr(DENS_K)}
 
 VS_UNIFORM_PATCH = """
 uniform vec3 PARAMS;   // x=ALPHA_TEST, y=LIGHT_OVERRIDE (shadows reuse it as a
                        // per-symbol depth index), z=BLOOM_TOGGLE
+varying float BCAS_H;  // 0 = grounded end (feet / trunk base), 1 = top of the artwork
 """
 
 
@@ -165,8 +237,32 @@ def vs_depth_patch(extra_bias):
             float bcasPage = floor(POS2D_UV.z / 2.0);
             float bcasU = POS2D_UV.z - 2.0 * bcasPage;
             float bcasArt = clamp(bcasTop - POS2D_UV.y, 0.0, bcasTop);
+            // How far up the artwork this vertex sits, measured from the point where the
+            // artwork touches the ground: the shadow transform's origin IS that point (the
+            // entity position), so the displacement from it, projected onto the artwork's
+            // own vertical axis and renormalised, is the art-space height in pixels.
+            // abs() on purpose: it makes the result independent of which way the art's y
+            // axis is signed (nothing in the shipped files documents that, and guessing it
+            // wrong would put the soft fade on the contact end instead of the top).
+            // FLOAT_PARAMS MUST stay referenced: the ksh trailer lists it as a vertex-stage
+            // uniform, and a dropped uniform binds at location -1 -> ANGLE assert crash.
+            // Its .y is the artwork top (0 -> 512 default).
+#if defined( SKINNED )
+            vec3 bcasAxis = mat[1].xyz;
+            vec3 bcasDisp = (mat * vec4(POS2D_UV.xy, 0.0, 1.0)).xyz - fastanim_xform[3].xyz;
+#else
+            vec3 bcasAxis = MatrixW[1].xyz;
+            vec3 bcasDisp = world_pos.xyz - MatrixW[3].xyz;
+#endif
+            float bcasAxisLen = length(bcasAxis);
+            float bcasUp = (bcasAxisLen > 1e-6)
+                ? abs(dot(bcasDisp, bcasAxis / bcasAxisLen)) / bcasAxisLen : 0.0;
+            // 0 = grounded end (feet / trunk base), 1 = top of the artwork. The fragment
+            // stage widens the penumbra with it: a caster further from its receiver casts
+            // a wider, fainter shadow -- that is what makes the silhouette read physical.
+            BCAS_H = clamp(bcasUp / bcasTop, 0.0, 1.0);
             float bcasSym = PARAMS.y * %(params_key)s + %(params_base)s;
-            // Cross-entity tier (Lua passes it via SetFloatParams(tier, 0, 0)).
+            // Cross-entity tier (Lua passes it via SetFloatParams(tier, 0, soft)).
             // The visible layer, the depth-writing twin and the equipment clone of
             // one shadow share the tier, so the intra-entity ordering is untouched.
             float bcasTier = FLOAT_PARAMS.x * %(tier_step)s;
@@ -183,7 +279,7 @@ def vs_depth_patch(extra_bias):
     }).replace("\n", "\r\n")
 
 
-def patch_sources(vs_text, ps_text, extra_bias, force_alpha):
+def patch_sources(vs_text, ps_text, extra_bias, force_alpha, spread):
     # ---- PS ----
     if PS_ANCHOR not in ps_text:
         raise SystemExit("PS 锚点未找到：" + PS_ANCHOR)
@@ -201,7 +297,16 @@ def patch_sources(vs_text, ps_text, extra_bias, force_alpha):
         ps_text = ps_text.replace(cut_old, PS_HEIGHT_CUT_NEW.replace("\n", "\r\n"), 1)
     if "BCAS silhouette" in ps_text:
         raise SystemExit("PS 里已有 BCAS 注入，拒绝重复注入")
-    ps_out = ps_text.replace(PS_ANCHOR, PS_PATCH.replace("\n", "\r\n") + PS_ANCHOR, 1)
+    if spread:
+        # 导数扩展必须在源码最前面（#version 之后、任何语句之前）
+        if not ps_text.startswith(PS_EXTENSION):
+            ps_text = PS_EXTENSION + ps_text
+        if ps_text.count(PS_MAIN_ANCHOR) != 1:
+            raise SystemExit("PS 里 void main() 出现 %d 次，无法安全注入 BCAS_H 声明"
+                             % ps_text.count(PS_MAIN_ANCHOR))
+        ps_text = ps_text.replace(
+            PS_MAIN_ANCHOR, PS_HELPERS.replace("\n", "\r\n") + PS_MAIN_ANCHOR, 1)
+    ps_out = ps_text.replace(PS_ANCHOR, ps_patch(spread).replace("\n", "\r\n") + PS_ANCHOR, 1)
     # 强制 alpha 必须插在乘色之后（乘色会重写整条 rgba，插前面会被它盖掉）
     force = ps_force_alpha(force_alpha)
     if force:
@@ -226,13 +331,13 @@ def patch_sources(vs_text, ps_text, extra_bias, force_alpha):
     return vs_out, ps_out
 
 
-def build_variant(src_ksh, out_path, extra_bias, force_alpha, prepend_define=None):
+def build_variant(src_ksh, out_path, extra_bias, force_alpha, spread, prepend_define=None):
     r = ksh_parse.parse(str(src_ksh))
     vs = r["vs_src"].decode("utf-8")
     ps = r["ps_src"].decode("utf-8")
     if prepend_define is not None and not vs.startswith("#define " + prepend_define):
         vs = "#define " + prepend_define + "\n" + vs
-    vs_out, ps_out = patch_sources(vs, ps, extra_bias, force_alpha)
+    vs_out, ps_out = patch_sources(vs, ps, extra_bias, force_alpha, spread)
 
     # trailer 结构 = [vs 槽位数][vs 槽位...][ps 槽位数][ps 槽位...]，原样抄引擎的表。
     # PARAMS 只在 ps_refs 里，我们要在 VS 读 PARAMS.y -> 把它补进 vs_refs。
@@ -261,21 +366,31 @@ def build_variant(src_ksh, out_path, extra_bias, force_alpha, prepend_define=Non
     assert back["trailer"] == r["trailer"], "trailer 被改动"
     assert "BCAS silhouette" in back["ps_src"].decode("utf-8")
     assert "BCAS shadow depth staging" in back["vs_src"].decode("utf-8")
-    assert b"\xe2" not in data or True
+    vs_back = back["vs_src"].decode("utf-8")
+    ps_back = back["ps_src"].decode("utf-8")
+    # 半影依赖顶点送来的高度；两侧必须成对声明，否则链接失败
+    assert "varying float BCAS_H;" in vs_back, "VS 缺少 BCAS_H 声明"
+    if spread:
+        assert "varying float BCAS_H;" in ps_back, "PS 缺少 BCAS_H 声明"
+        assert "dFdx(" in ps_back and "dFdy(" in ps_back, "可见层没有半影采样"
+        assert ps_back.startswith(PS_EXTENSION), "导数扩展不在源码最前"
+    else:
+        assert "dFdx(" not in ps_back, "写深度孪生体不应使用导数（它只需要覆盖）"
     for chunk in (back["vs_src"], back["ps_src"]):
         chunk.decode("ascii")           # 注入源码必须纯 ASCII
-    print("[OK] %-44s %6dB  bias=%+g  alpha_out=%s"
-          % (str(out_path.relative_to(ROOT)), len(data), extra_bias, force_alpha))
+    print("[OK] %-44s %6dB  bias=%+g  alpha_out=%s  spread=%s"
+          % (str(out_path.relative_to(ROOT)), len(data), extra_bias, force_alpha,
+             "on" if spread else "off"))
     return data
 
 
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     print("源: %s / %s" % (ENGINE / "anim.ksh", ENGINE / "anim_skinned.ksh"))
-    for name, bias, force_alpha in VARIANTS:
-        build_variant(ENGINE / "anim.ksh", OUT_DIR / (name + ".ksh"), bias, force_alpha)
+    for name, bias, force_alpha, spread in VARIANTS:
+        build_variant(ENGINE / "anim.ksh", OUT_DIR / (name + ".ksh"), bias, force_alpha, spread)
         build_variant(ENGINE / "anim_skinned.ksh", OUT_DIR / (name + "_skinned.ksh"),
-                      bias, force_alpha, prepend_define="SKINNED")
+                      bias, force_alpha, spread, prepend_define="SKINNED")
     return 0
 
 

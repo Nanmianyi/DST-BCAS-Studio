@@ -311,6 +311,17 @@ local PRESETS = {
         GlowTail = 1.00, LightWrap = 1.00, GlowRim = 0.05, GodRays = 2.0, SunFill = 1.0,
         -- 08 水面
         GlintOn = 1, GlintStrength = 0.33, GlintDensity = 0.99, GlintGrain = 0.74, GlintSoft = 1.00,
+        -- 09 影子 / 10 立体光照（作者实机调校 2026-09-22 定版：用户面板截图逐项对齐）
+        --
+        -- ⚠ 之前这两页**一个键都没进预设**，而 ApplyPreset 对未列出的键一律回落
+        -- meta.default（见本文件 1028-1030）⇒ 玩家选「特调方案」拿到的其实是中性出厂值
+        -- （ShadeCool/ShadeDark 都是 0.5、背光与上一版逐位一致），作者调好的观感谁都没吃到。
+        ShadowProj = 1, ShadowDensity = 0.46, ShadowSoft = 1.92,
+        ShadowTintR = 0.10, ShadowTintG = 0.12, ShadowTintB = 0.93,
+        ShadowNight = 1,
+        SurfaceLight = 1, SurfaceLightStrength = 1.00,
+        ShadeWarm = 1.00, ShadeContrast = 0.16,
+        ShadeCool = 1.00, ShadeDark = 0.00,
     },
     -- 轻量画质：作者特调的收敛版（低配 / 长时间游玩），保留同一色彩基调
     light = {
@@ -333,6 +344,13 @@ local PRESETS = {
         BloomOn = 1,
         GlowTail = 0.80, LightWrap = 0.80, GlowRim = 0.03, GodRays = 1.20, SunFill = 0.90,
         GlintOn = 1, GlintStrength = 0.28, GlintDensity = 0.99, GlintGrain = 0.74, GlintSoft = 1.00,
+        -- 09/10 两页的观感跟着特调走（同观感，只有 01~08 页按低配收敛）
+        ShadowProj = 1, ShadowDensity = 0.46, ShadowSoft = 1.92,
+        ShadowTintR = 0.10, ShadowTintG = 0.12, ShadowTintB = 0.93,
+        ShadowNight = 1,
+        SurfaceLight = 1, SurfaceLightStrength = 1.00,
+        ShadeWarm = 1.00, ShadeContrast = 0.16,
+        ShadeCool = 1.00, ShadeDark = 0.00,
     },
     -- 电影胶片：作者特调的加重版（截图 / 录视频），暖调、暗角、颗粒、重辉光
     cinema = {
@@ -355,6 +373,13 @@ local PRESETS = {
         BloomOn = 1,
         GlowTail = 1.00, LightWrap = 1.00, GlowRim = 0.08, GodRays = 2.0, SunFill = 1.0,
         GlintOn = 1, GlintStrength = 0.40, GlintDensity = 0.99, GlintGrain = 0.74, GlintSoft = 1.00,
+        -- 09/10 两页的观感跟着特调走（电影胶片只加重 01~08 页）
+        ShadowProj = 1, ShadowDensity = 0.46, ShadowSoft = 1.92,
+        ShadowTintR = 0.10, ShadowTintG = 0.12, ShadowTintB = 0.93,
+        ShadowNight = 1,
+        SurfaceLight = 1, SurfaceLightStrength = 1.00,
+        ShadeWarm = 1.00, ShadeContrast = 0.16,
+        ShadeCool = 1.00, ShadeDark = 0.00,
     },
     off = {
         OceanOn = 0, LightingMaster = 0, GlintOn = 0,
@@ -369,6 +394,8 @@ local PRESETS = {
         BloomOn = 0,
         SanityColourOn = 0, DistortFree = 0, SnowCap = 3, SandFilter = 0,
         VanillaGrade = 1, GlowTail = 0, LightWrap = 0, GlowRim = 0, GodRays = 0,
+        -- 原版关闭：立体光照与地面影子一并关掉（不然「关闭」还留着一遍逐实体着色）
+        SurfaceLight = 0, ShadowProj = 0, ShadowNight = 0,
         DeconvStrength = 0, DeconvGate = 0.025, DeconvPenetr = 0,
     },
 }

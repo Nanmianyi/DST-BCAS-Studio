@@ -9,10 +9,11 @@ BCAS-Studio/                 ← Mod 本体（整体复制到 DST mods 目录即
 ├── scripts/
 │   ├── bcas_state.lua       ← 参数状态机：VEC 定义 / 预设 / 打包下发 / 持久化
 │   ├── bcas_screen.lua      ← 画质工作室面板：8 页签 / 拖拽行 / 白平衡色轮
-│   ├── bcas_sun_emitter.lua ← 动态太阳：日晷模型 / 剪影投影 / 透云光束
+│   ├── bcas_sun_emitter.lua ← 动态太阳：日晷模型 / 透云光束
+│   ├── bcas_shadow_proj.lua ← 地面投影 v14：顶点斜投影（接管引擎 bloom 那一遍绘制）
 │   ├── bcas_glint.lua       ← 海面波光层（程序化 caustics 光网 quad）
 │   └── bcas_ocean.lua       ← 海洋地皮调色（世界生成时烘焙）
-├── shaders/                 ← 构建产物（调色/辉光/Bloom 链 + bcas_silhouette 六变体，勿手改）
+├── shaders/                 ← 构建产物（调色/辉光/Bloom 链 + bcas_shadow_proj 顶点斜投影，勿手改）
 ├── fonts/                   ← 思源黑体 85px 视网膜字模（取自 Chinese++，见 ATTRIBUTION.txt）
 └── anim/                    ← 资源：lightrays（游戏本体提取）/ bcas_surface（自建空白方块载体）
 src_shaders/                 ← 全部 GLSL ES 源码
@@ -71,26 +72,61 @@ PASS 2  bcas_studio.ksh   锐化与终合成
 性能：全分辨率 pass 从 3（cinema/studio/glow）一路降到 **1**；金字塔每级仅
 4 抽头、尺寸逐级减半，无稀疏大步长采样（无方块/斜向拖影）。
 
-## 动态太阳光影（世界空间，非屏幕空间）
+## 体积影子（v10：屏幕空间高度场 + 穿透判定行进）
 
 ```
-bcas_sun_emitter.lua
-  ├─ 日晷模型 GetSunParams()：TheWorld.state → (影长, 旋角, 透明度, 月光色)
-  │    单一解析式全局共享；缓存键 6 位精度，相位切换毛刺修复
-  ├─ 剪影投影：角色/地物挂 OnGround 剪影实体
-  │    移动实体逐帧同步（动画/皮肤/骑乘跟随）；静态实体 0.5s 距离分层错峰
-  │    姿态（影长/旋角/透明度）进逐帧调度器连续扫动
-  │    着色器：三个固定变体 ksh（可见/写深度孪生体/装备克隆）→ 硬 alpha 压平
-  │    + 逐部件深度错位 → 每像素只混合一层（原理与踩坑见 SHADOW_SILHOUETTE.md）
-  ├─ 透云光束：3 个光斑实体 gap→in→hold→out 状态机 + 引擎光源勾边
-  └─ 门控：洞穴静默 / 夜晚零开销 / 距离裁剪
+scripts/bcas_shadow_proj.lua —— 地面投影 v14：顶点斜投影
+  ├─ 调度层（沿用 v11 阶段二，与渲染出口无关）
+  │    相机矩形裁切（进出滞回）/ 0.2s 淡入淡出 / 静态施影者睡眠
+  │    / 原版椭圆影（DynamicShadow）接管与还原
+  ├─ 光源层（沿用 V13，一条没改）
+  │    方向池 / 冲淡池分离、主光滞回、副光稀释、投影死区、
+  │    装饰光与透云光柱排除、WashoutAt 线段距离冲淡 + 时间域低通
+  ├─ 几何层（v14 新）
+  │    影长 = AnimState:GetVisualBB 高度 × 实体缩放 × 日晷影长系数 L
+  │    根半径 = 物理半径 / 视觉半宽 / 按高度估（三级兜底，两级 clamp）
+  └─ 渲染出口（v14 新）
+       每施影者一个 quad（载体与海面波光共用 anim/bcas_surface.zip）
+       SetScale(side, side, side)   side = 影长 × CONE_QUAD_PAD（正方形 ⇒ 旋转不可能裁到锥）
+       SetFloatParams(根半径, 方向x, 方向z)
+       SetOceanBlendParams(柔度, 消散, 梢率, 呼吸)
+       SetMultColour(1,1,1,浓度)    ← 着色器读 COLOUR_XFORM[3][3]
+
+shaders/bcas_shadow_cone.ksh（src_shaders/bcas_shadow_cone.{vs,ps}）
+  VS  从 MatrixW 读回 quad 的真实世界轴（含长度）⇒ 不假设引擎怎么压平 OnGround
+      也不假设美术单位；把片元坐标投影成"横向 / 沿影子"两个世界单位分量
+  PS  解析胶囊：扫掠段半径 mix(根, 梢, t) + 两端圆帽
+      接触硬化半影 feather = max(soft·(0.30+1.70t), 0.10) · max(r, 0.55)
+      影色 = 世界光照贴图的缩放副本（夜里淡出 / 火把旁染色）
+      水面遮罩（原版海洋上不投影）
+      每个旋钮都有优雅降级：某通道没到 ⇒ 退化成物理精确的等半径胶囊
+
+scripts/bcas_sun_emitter.lua
+  └─ 只保留：日晷模型 GetSunParams / 透云光束 / 水面灯
+     （旧的剪影克隆体系整体删除；影子渲染出口在 bcas_shadow_dummy.lua）
 ```
 
-### 影子剪影细节
+渲染链顺序：场景 →（影子作为贴地实体直接画进场景）→ 本模组调色/锐化/辉光 → 输出。
 
-见 [SHADOW_SILHOUETTE.md](SHADOW_SILHOUETTE.md)：美术软边/部件重叠为什么变成"线条"、
-三次根因（运行时哨兵静默失效 / 孪生体几何不一致 / 深度错位落在量化噪声里）、
-数值标定表、验证工具链与回退开关。
+### 为什么不是"另画一份剪影"（也不是屏幕空间解算）
+
+两代旧方案都已下线：
+
+* **剪影克隆体**（SHADOW_SILHOUETTE.md，已归档）：给每个实体另建影子实体、
+  逐帧镜像动画与符号，靠深度错位保证每像素只混合一次。正确性依赖一长串需要
+  人工维护的镜像逻辑，并且有白名单 —— 大量物件本就没有影子。
+* **屏幕空间体积解算**（SHADOW_VOLUME.md，已归档）：实体在 bloom 通道回传像素
+  高度，再沿太阳方向做穿透判定。已整体删除（白名单 / 镜像漏项 / 深度博弈 /
+  每帧一次全屏行进）。
+* **镜像美术 + 屏幕门抖动**（v13，`tools/retired_v13/`）：把施影者的原画压扁贴地。
+  一棵树 5~8 个符号压平后同深度、每个各混合一次 ⇒ 必须用抖动压并集 ⇒
+  抖动等值线必然是平行直线 ⇒ 斜纹/摩尔纹。
+
+现行方案（顶点斜投影）**不做屏幕空间解算、不写深度、不用抖动网点、不建贴地哑元、
+不镜像美术**：接管引擎给每个动画实体多画的那一遍（`RENDERPASS.BLOOM`），在顶点端
+沿太阳方向把几何斜投影到地面（`ground.xz = world.xz + world.y · dir / tan(el)`），
+影长由每个顶点自己的世界高度决定（没有白名单）；片元把美术 alpha 写成覆盖度，
+而 bloom 缓冲是 alpha 混合 ⇒ 同一像素永远只有一层（不需要抖动）。
 
 ## 海洋地皮调色（世界生成烘焙）
 

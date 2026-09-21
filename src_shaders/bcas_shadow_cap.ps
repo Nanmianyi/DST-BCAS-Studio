@@ -1,0 +1,2 @@
+#define BCAS_MARK_BLUE 0.06
+precision highp float;uniform sampler2D SAMPLER[1];varying vec2 PS_TEXCOORD0;void main(){vec3 c=texture2D(SAMPLER[0],PS_TEXCOORD0.xy).rgb;float mk=c.b-max(c.r,c.g);float dens=clamp(mk/BCAS_MARK_BLUE,0.,1.);gl_FragColor=vec4(dens,dens,dens,1.);}

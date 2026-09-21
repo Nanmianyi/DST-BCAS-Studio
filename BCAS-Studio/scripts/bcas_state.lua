@@ -33,6 +33,13 @@ local State = {
     flicker = 1.0,        -- 光晕呼吸标量（Lua 8Hz 计算，BCAS_GLOW2.w）
     sun_u = 0.22,         -- 太阳屏幕 UV.x（cinema/glow 共用 BCAS_EXTRA.z）
     sun_v = 0.14,         -- 太阳屏幕 UV.y（BCAS_EXTRA.w）
+    shadow_day = 0,       -- 影子浓度（PushShadow 每拍更新）：白天=日晷因子，夜里=附近光照
+    light_presence = 0,   -- 附近辉光源照度 0..1（modmain 每拍从 SurfaceLight.LightPresence 取）
+                          -- 夜间影子的**唯一**来源：有火把才有影子，这是物理事实不是开关
+    texel_w = 0,          -- 一个"场景像素"的 uv 步长（1/屏宽），PushShadow 每拍刷新
+    texel_h = 0,          -- 同上（1/屏高）。合成端起点的所有抽头都靠它：
+                          --   BCAS_SHADOW2.yz = (texel_w, texel_h)
+                          -- 读它的两处都吃过大亏（见 PackUniform 里的说明）。
     handles = {},         -- uniform 名 -> 句柄
     enabled = true,
     boot_preset = "standard",
@@ -171,9 +178,39 @@ local VEC = {
     GodRays    = {uniform = "BCAS_GLOW3", comp = 4, min = 0, max = 2.0, default = 1.0},
 
     -- == 增强功能独立总控开关 (不占uniform) ==
-    ShadowsOn  = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
+    -- （ShadowsOn 已随哑元体系退役：地面影子由 ShadowProj 接管。）
     OceanOn    = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
     LightingMaster = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
+
+    -- == 物体立体光照（v11 阶段一，见 docs/SHADOW_V11_PLAN.md）==
+    -- 不占 uniform：开关与强度直接推给 bcas_surface_light，实体着色器从
+    -- FLOAT_PARAMS 读方向/强度。影子浓度由 ShadowDensity 在合成端调。
+    SurfaceLight   = {uniform = nil, comp = 0, min = 0, max = 1, default = 1},
+    SurfaceLightStrength = {uniform = nil, comp = 0, min = 0, max = 1, default = 0.85},
+    -- 受光色 / 背光色（用户 2026-09-21：「受光和背光的颜色属性暴露出来允许自定义」）
+    --
+    -- ⚠ 这两个**不是**下发 uniform 的：逐实体着色器（受光面）根本没有多余通道，
+    -- 它们跟着 FLOAT_PARAMS 的 y 槽一起打包分发（见 bcas_surface_light 的
+    -- PackY / 证明脚本 tools/bus_pack_proof.py）。
+    --   冷暖：0 = 冷（受光偏青蓝、背光偏暖）… 0.5 = 出厂中性（精确 1.0，逐位不变）
+    --         … 1 = 暖（受光偏橙红、背光偏冷）
+    --   对比：0 = 平淡（受光提亮与背光压暗都缩到 40%）… 0.5 = 出厂 … 1 = 强烈（160%）
+    ShadeWarm     = {uniform = nil, comp = 0, min = 0, max = 1, default = 0.5},
+    ShadeContrast = {uniform = nil, comp = 0, min = 0, max = 1, default = 0.5},
+
+    -- 背光侧专属两把（用户 2026-09-22：「你其实可以加个背光冷暖调节，往冷蓝色 B 通道
+    -- 上调，这样质感会变好，以及背光的黑白强度」）：
+    --   · 上面那对是**受光面**的冷暖/对比（背光面只是被动地跟着取互补色）；
+    --     这一对只作用在**背光面**，与受光面互不干涉 —— 用户要的是"背光自己调"。
+    --   · 它们装不进 y/z（48 位预算里只剩 5 位空隙），所以 2026-09-22 征用了 x 槽：
+    --     x = cool_q + 64*dark_q + 4096*f_q（布局与理由见 bcas_surface_light 的
+    --     M.PackX；x 对引擎完全沉睡——本体 7 处 FLOAT_PARAMS.x 读取全在 y>0 里，
+    --     证据 work/_recon12.py）。
+    --   背光冷暖：0 = 偏暖（背光偏橙红）… 0.5 = 出厂中性（精确 1.0，逐位不变）
+    --             … 1 = 偏冷蓝（B 通道上调、R 下调 —— 用户要的方向）
+    ShadeCool     = {uniform = nil, comp = 0, min = 0, max = 1, default = 0.5},
+    --   背光黑白：0 = 背光压暗缩到 40%（发白）… 0.5 = 出厂 … 1 = 加强到 160%（更黑）
+    ShadeDark     = {uniform = nil, comp = 0, min = 0, max = 1, default = 0.5},
 
     -- == 海面波光 (bcas_glint；非后处理参数，uniform 字段仅作面板标记，
     --    实际由 bcas_glint 每帧读取并 SetFloatParams/SetOceanBlendParams/
@@ -187,6 +224,20 @@ local VEC = {
     GlintGrain    = {uniform = "GLINT", comp = 3, min = 0.4,  max = 2.5,   default = 0.74},
     -- 海色融合：把金色与原版海水颜色混合的量，越大越像真实水下沙地
     GlintSoft     = {uniform = "GLINT", comp = 4, min = 0,    max = 1,     default = 1.0},
+
+    -- == 地面影子（V16：bloom 缓冲投影光栅；捕获在 bcas_shadow_cap.ksh，
+    --    浓度/影色/遮挡在 merged 合成端 —— 所以不需要逐实体 uniform）==
+    ShadowProj    = {uniform = nil,          comp = 0, min = 0,    max = 1,    default = 1},
+    ShadowDensity = {uniform = "BCAS_SHADOW", comp = 4, min = 0,    max = 1,    default = 0.62},
+    ShadowTintR   = {uniform = "BCAS_SHADOW", comp = 1, min = 0,    max = 1,    default = 0.10},
+    ShadowTintG   = {uniform = "BCAS_SHADOW", comp = 2, min = 0,    max = 1,    default = 0.12},
+    ShadowTintB   = {uniform = "BCAS_SHADOW", comp = 3, min = 0,    max = 1,    default = 0.20},
+    -- 光路遮挡：影子挡掉多少"太阳加光"（1 = 完全挡住，0 = 光路无视影子）
+    -- （ShadowOcclude 已随 V15 光路系统退役；BCAS_SHADOW2.x 现在是影子柔度。）
+    -- 光栅软度：>1 让影子中心更淡、边缘更柔（解码端的幂）
+    ShadowSoft    = {uniform = "BCAS_SHADOW2", comp = 1, min = 0.4, max = 2,    default = 1.15},
+    -- 夜间影子（用户拍板默认关；打开后由点光源解算器给方向）
+    ShadowNight   = {uniform = nil,          comp = 0, min = 0,    max = 1,    default = 1},
 }
 State.VEC = VEC
 
@@ -215,6 +266,8 @@ local EFFECT_UNIFORMS = {
         "BCAS_CDL_S", "BCAS_CDL_O", "BCAS_CDL_P",
         "BCAS_SEC_S", "BCAS_SEC_O", "BCAS_SEC_P",
         "BCAS_GLOW", "BCAS_GLOW2", "BCAS_GLOW3",
+        -- 地面影子（V16）：合成端的浓度/影色/遮挡
+        "BCAS_SHADOW", "BCAS_SHADOW2",
     },
     glow = {"BCAS_GLOW", "BCAS_GLOW2", "BCAS_GLOW3", "BCAS_EXTRA", "SCREEN_PARAMS"},
 }
@@ -230,7 +283,7 @@ end
 local PRESETS = {
     -- 作者特调（楠眠实机调校 2026-09-11 定版，按面板逐页截图基准）
     standard = {
-        ShadowsOn = 1, OceanOn = 1, LightingMaster = 1,
+        OceanOn = 1, LightingMaster = 1,
         -- 01 锐化
         Strength = 7.80, DeconvStrength = 1.89, NoiseReduce = 0.67, AntiRinging = 0.89, DarkProtect = 0.25,
         DeconvGate = 0.025, DeconvPenetr = 0.80,
@@ -261,7 +314,7 @@ local PRESETS = {
     },
     -- 轻量画质：作者特调的收敛版（低配 / 长时间游玩），保留同一色彩基调
     light = {
-        ShadowsOn = 1, OceanOn = 1, LightingMaster = 1,
+        OceanOn = 1, LightingMaster = 1,
         Strength = 5.00, DeconvStrength = 0.90, NoiseReduce = 0.50, AntiRinging = 0.70, DarkProtect = 0.15,
         DeconvGate = 0.025, DeconvPenetr = 0.75,
         RangeSigma = 0.26, SpatialSigma = 1.10, CenterWeight = 1.0, NoiseFloor = 0.012,
@@ -283,7 +336,7 @@ local PRESETS = {
     },
     -- 电影胶片：作者特调的加重版（截图 / 录视频），暖调、暗角、颗粒、重辉光
     cinema = {
-        ShadowsOn = 1, OceanOn = 1, LightingMaster = 1,
+        OceanOn = 1, LightingMaster = 1,
         Strength = 7.00, DeconvStrength = 1.50, NoiseReduce = 0.70, AntiRinging = 0.80, DarkProtect = 0.20,
         DeconvGate = 0.025, DeconvPenetr = 0.85,
         RangeSigma = 0.26, SpatialSigma = 1.10, CenterWeight = 1.0, NoiseFloor = 0.01,
@@ -304,7 +357,7 @@ local PRESETS = {
         GlintOn = 1, GlintStrength = 0.40, GlintDensity = 0.99, GlintGrain = 0.74, GlintSoft = 1.00,
     },
     off = {
-        ShadowsOn = 0, OceanOn = 0, LightingMaster = 0, GlintOn = 0,
+        OceanOn = 0, LightingMaster = 0, GlintOn = 0,
         Strength = 0, NoiseReduce = 0, AntiRinging = 0, DarkProtect = 0,
         ExposureEV = 0, Temp = 0, Tint = 0, Saturation = 1.0,
         Vibrance = 0, Contrast = 0, Lightness = 0, Gamma = 1.0,
@@ -362,6 +415,37 @@ function State.PackUniform(uniform)
             v[4] = 0.0
         end
     end
+    -- 地面影子（V16）：浓度/影色/遮挡只在合成端施加。
+    -- 关掉时把浓度归零 —— 投影着色器仍会画（它由 Lua 侧推的 FLOAT_PARAMS.z
+    -- 门控，见 bcas_shadow_proj.lua），但合成端乘 0，画面逐像素等于没有影子。
+    if uniform == "BCAS_SHADOW" then
+        local on = State.enabled ~= false
+            and (State.params.LightingMaster or 1) > 0.5
+            and (State.params.ShadowProj or 1) > 0.5
+            and State.merged_has_glow == true
+        v[1] = State.params.ShadowTintR or 0.10
+        v[2] = State.params.ShadowTintG or 0.12
+        v[3] = State.params.ShadowTintB or 0.20
+        -- 浓度 = 面板滑条 × 白天因子（日晷）。夜里/洞穴 day=0 ⇒ 密度精确为 0。
+        v[4] = on and (State.params.ShadowDensity or 0.62) * (State.shadow_day or 0) or 0
+    end
+    -- BCAS_SHADOW2.x = 光栅灰度的幂（面板「影子柔度」，>1 中心更淡边缘更柔）。
+    -- BCAS_SHADOW2.yz = 一个源像素的 uv 步长（1/屏宽, 1/屏高）。
+    --
+    -- 为什么必须由 Lua 喂，而不是读 SCREEN_PARAMS（2026-09-20 实机 BUG① 复发的
+    -- 真正原因）：SCREEN_PARAMS 是引擎的魔法 uniform 名，本 pass **没有**
+    -- AddUniformVariable 它，于是合成端读到 (0,0,0,0)，抽头步长掉进硬编码的
+    -- 1/1280×1/720 兜底。用户窗口 1721×876 ⇒ 每个抽头落在 1.34 个纹素外，
+    -- 水印的自相关（±1 像素的棋盘）被插值抹平 ⇒ 判据恒 0 ⇒ 本体豁免从不生效
+    -- ⇒ 影子照旧压在自己身上；同一个 px 还喂着 5 抽头锐化，锐化邻域也一并错位
+    -- （画面整体偏软 = 用户说的"低清"的另一半）。TheSim:GetScreenSize 是权威值，
+    -- 由 PushShadow 每拍刷新后写进这里。
+    -- （旧注释说"引擎对这一魔法名自动按 RT 填充"是错的：实机日志/画面都不支持。）
+    if uniform == "BCAS_SHADOW2" then
+        v[1] = State.params.ShadowSoft or 1.15
+        v[2] = State.texel_w or 0
+        v[3] = State.texel_h or 0
+    end
     return v
 end
 
@@ -381,6 +465,74 @@ function State.ApplyAll()
     end
 end
 
+-- 太阳光路的每拍动态量（modmain 8Hz 任务调用）：太阳屏幕锚点（世界→屏幕
+-- 两探针取方向迹线后外推）、宽高比、日晷光色、昼夜门控。探针依赖世界/
+-- 相机/焦点就绪（引擎侧原生断言类调用，进门先查——v10 §10.3 教训），
+-- 未就绪时 dayK=0，加光精确为零，pass 常开也无害。
+-- 地面影子（v17）的每拍动态量：白天因子（日晷浓度 / 0.5，洞穴=0）直接门控
+-- 合成端密度 —— 影子跟着日晷走：清晨淡、正午实、黄昏渐弱、夜里消失（除非
+-- 打开夜间影子，满月给一半）。光栅本体由投影着色器照写，这里只调"浓度"。
+-- 缓冲区分辨率就是引擎默认的 1/4（postprocesseffects.lua:219），全工程不再
+-- 改它 —— 低清方块由合成端的抽头柔化兜住，详见 RegisterShadowCaptureChain
+-- 上方那段说明。
+
+function State.PushShadow()
+    if State.merged_has_glow ~= true then return end
+    local SunSystem = _G.package.loaded["bcas_sun_emitter"]
+    if SunSystem == nil or SunSystem.GetSunParams == nil then return end
+    local ok, _sy, _rot, alpha = pcall(SunSystem.GetSunParams)
+    if not ok then return end
+    local day = (tonumber(alpha) or 0) / 0.5
+    if day > 1 then day = 1 elseif day < 0 then day = 0 end
+    local W = _G.TheWorld
+    -- 太阳不在这张图上（夜里 / 洞穴）：光只能来自**附近的辉光源**。
+    -- 旧版这两支都写死 0（夜里还是 `day * 0.55`，而 day 是太阳 alpha 斜率，恒 0），
+    -- 于是浓度精确归零 —— 用户报的「晚上没影子、朝向完全钉死」的源头就在这里，
+    -- 影子模块那边同一个开关还把逐实体方向解算一起跳过（见 bcas_shadow_proj）。
+    -- 现在浓度 = 附近光照存在性：有火把才有影子、火光绕人转影子跟着转、走远就消失。
+    local no_sun = W ~= nil
+        and (W:HasTag("cave") or (W.state ~= nil and W.state.phase == "night"))
+    if no_sun then
+        day = (State.params.ShadowNight or 1) > 0.5 and (State.light_presence or 0) or 0
+    end
+    State.shadow_day = day
+    -- 探针（2026-09-21 用户要求"把夜晚和洞穴的影子打开"）：夜间浓度是一个四环串联，
+    -- 只看结果分不出卡在哪一环 —— 无太阳判定失败 / 夜影开关关着 / 灯表是空的 /
+    -- 灯表非空但附近没光。四环全打出来，下一次日志就能定位。节流 4 秒一行。
+    do
+        local now_t = _G.GetTime ~= nil and _G.GetTime() or 0
+        if (now_t - (State._shadow_probe_t or -99)) > 4 then
+            State._shadow_probe_t = now_t
+            local SunLight = _G.package.loaded["bcas_surface_light"]
+            local n_light = -1
+            if SunLight ~= nil and SunLight.LightCount ~= nil then
+                local okn, n = pcall(SunLight.LightCount)
+                if okn and type(n) == "number" then n_light = n end
+            end
+            print(string.format(
+                "[BCAS] 影子密度自检: 无太阳=%s 相位=%s 洞穴=%s 夜影开关=%s 灯表=%d 照度=%.3f -> 浓度=%.3f",
+                no_sun and "是" or "否",
+                W ~= nil and W.state ~= nil and tostring(W.state.phase) or "?",
+                W ~= nil and W:HasTag("cave") and "是" or "否",
+                (State.params.ShadowNight or 1) > 0.5 and "开" or "关",
+                n_light, State.light_presence or 0, day))
+        end
+    end
+    State.ApplyUniform("BCAS_SHADOW")
+    -- 源像素步长（合成端所有抽头的尺度）。屏幕尺寸只在改分辨率/改窗口时变，
+    -- 所以这里每拍读一次、只有变了才推 uniform（AddUniformVariable 那一路
+    -- 每帧被引擎覆写，不能靠它）。
+    local ok_sz, sw, sh = pcall(TheSim.GetScreenSize, TheSim)
+    if ok_sz and type(sw) == "number" and type(sh) == "number" and sw > 0 and sh > 0 then
+        local w, h = 1.0 / sw, 1.0 / sh
+        if math.abs(w - (State.texel_w or 0)) > 1e-9
+            or math.abs(h - (State.texel_h or 0)) > 1e-9 then
+            State.texel_w, State.texel_h = w, h
+            State.ApplyUniform("BCAS_SHADOW2")
+        end
+    end
+end
+
 -- 原版昼夜滤镜开关（对齐 pxl_42 的做法：直接开关引擎的 ColourCube 效果）
 function State.ApplyEnhancements()
     local SunSystem = _G.package.loaded["bcas_sun_emitter"]
@@ -396,15 +548,60 @@ function State.ApplyEnhancements()
             SunSystem.SetMasterEnabled((State.params.LightingMaster or 1) > 0.5)
         end
     end
-    if SunSystem.SetShadowsEnabled ~= nil then
-        SunSystem.SetShadowsEnabled(master and (State.params.ShadowsOn or 1) > 0.5)
-    end
+    -- v11：不再接管引擎自带的软块阴影（DynamicShadow）—— 它是"小物体接地感"的
+    -- 兜底层，必须留着。长投影由阶段二的哑元层负责。
     if SunSystem.SetOceanEnabled ~= nil then
         SunSystem.SetOceanEnabled(master and (State.params.OceanOn or 1) > 0.5)
     end
     if SunSystem.SetShaftsAmount ~= nil then
         local amt = master and (State.params.GodRays or 0) or 0
         SunSystem.SetShaftsAmount(amt)
+    end
+    -- 贴地剪影：开关同步给影子模块（关掉 = 整体静默，不推参数、不进对象池）
+    -- 物体立体光照（v11 阶段一）：开关与强度都来自面板参数
+    local SunLight = _G.package.loaded["bcas_surface_light"]
+    if SunLight ~= nil then
+        if SunLight.SetStrength ~= nil then
+            SunLight.SetStrength(State.params.SurfaceLightStrength or 1.0)
+        end
+        if SunLight.SetEnabled ~= nil then
+            SunLight.SetEnabled(master and (State.params.SurfaceLight or 1) > 0.5)
+        end
+        -- 剪切蒙版标记（BUG① 的写入端载体）：影子还开着而受光面被关掉时，实体不能
+        -- 交还引擎原版着色器 —— 那样它身上就没有标记，读端就剪不掉"它自己盖在自己
+        -- 身上"的影子（用户原话：影子像图层比投影实体还高一层）。
+        -- 标记是二进制且不可见的：alpha=254/255 且 rgb 同比缩放（预乘不变式不变），
+        -- 读端在 bcas_merged_glow 里只认 [253.5/255, 254.5/255] 这个窄窗口 ——
+        -- 命中就把密度归零（扣掉）；引擎若把 alpha 洗成 1.0，窗口判据自然失效 ⇒
+        -- 不剪、影子照旧，绝不会误剪成"影子全没"。
+        -- 旧水印（蓝通道 4x4 棋盘格 ±12/255）已整段退休：按像素 headroom 截断 ⇒
+        -- 一半打不进标记（一半剪一半没剪）；改可见蓝通道 ⇒ 既遮影子又遮环境光。
+        -- ⚠ 光把标记写出去是不够的：读端还必须插在"会写 alpha=1.0 的引擎效果"
+        --   之前，否则窗口读到的恒是 1.0 —— 三个环节（写入端／读端／链位置）
+        --   任一断裂，BUG① 都静默复现。链位置那段死规矩见 State.SortAndStart。
+        -- 条件与底下 ShadowProj.SetEnabled 的完全一致（同一时刻影子是否在画）。
+        if SunLight.SetMarkMode ~= nil then
+            SunLight.SetMarkMode(master
+                and (State.params.ShadowProj or 1) > 0.5
+                and (State.params.LightingMaster or 1) > 0.5)
+        end
+    end
+    -- 地面投影（v15，V16 方案）：bloom 通道顶点斜投影。
+    -- 开关 = 总开关 + 影子开关；浓度/影色/遮挡在合成端（BCAS_SHADOW/SHADOW2），
+    -- 模块侧只需要"开关"与"夜里要不要画"。
+    local ShadowProj = _G.package.loaded["bcas_shadow_proj"]
+    if ShadowProj ~= nil then
+        -- ⚠ 不再调 ShadowProj.SetDensity：浓度是合成端的事（BCAS_SHADOW.w 由
+        --   PushShadow 每拍打包），模块侧那个 setter 只是历史 API（旧版用
+        --   "影子哑元池"的不透明度），留着是为了兼容外部调试脚本，别再用它。
+        if ShadowProj.SetNightShadows ~= nil then
+            ShadowProj.SetNightShadows((State.params.ShadowNight or 0) > 0.5)
+        end
+        if ShadowProj.SetEnabled ~= nil then
+            ShadowProj.SetEnabled(master
+                and (State.params.ShadowProj or 1) > 0.5
+                and (State.params.LightingMaster or 1) > 0.5)
+        end
     end
 end
 
@@ -752,19 +949,33 @@ function State.SetParam(key, value)
         -- 不走后处理 effect 的 uniform 表（该 pass 没有这些 uniform）
         return
     end
+    if meta.uniform == "SHADOW" then
+        return
+    end
     if key == "ColourCubeOn" then
         State.ApplyColourCube()
         return
     end
     if key == "BloomOn" then
         State.ApplyBloom()
-    State.ApplyEnhancements()
+        State.ApplyEnhancements()
         return
     end
-    if key == "ShadowsOn" or key == "OceanOn" or key == "GodRays" or key == "LightingMaster" then
+    if key == "OceanOn" or key == "GodRays" or key == "LightingMaster"
+        or key == "SurfaceLight" or key == "SurfaceLightStrength"
+        or key == "ShadowProj" or key == "ShadowNight" then
         State.ApplyEnhancements()
         if key == "GodRays" then
             State.ApplyUniform(meta.uniform)
+        end
+        -- 控制台可验证的落点：拨开关后 client_log 搜"开关生效"。
+        -- ⚠ ShadowProj / ShadowNight 必须在这张名单里（2026-09-19 实机 BUG：
+        --   "面板开关拨了没反应"）。它们 uniform=nil，路由缺席时落到底下的
+        --   ApplyUniform(nil) 静默返回 —— 面板只改了 params 表，引擎侧的
+        --   挂载/交还纹丝不动，开关等于装饰品。
+        local v = State.params[key]
+        if v == 0 or v == 1 then
+            print("[BCAS] 开关生效: " .. key .. " -> " .. tostring(v))
         end
         return
     end
@@ -872,42 +1083,32 @@ local function RegisterPass(ksh_path, effect_uniforms)
     return id
 end
 
--- 注册辉光金字塔（2026-09 v2）：两个合成 pass + 4 级 1/4 分辨率 Kawase。
+-- 注册辉光金字塔（v4：4 级，RT 尺寸依次 0.25 / 0.125 / 0.0625 / 0.03125）。
 -- 采样链输入 = 引擎辉光缓冲（SamplerEffectBase.BloomSampler，Klei 按实体
 -- 写入的辉光源，引擎每帧照常填充、与原生 Bloom 效果的开关无关——本项目
 -- 实测确认），逐级经 SamplerEffectBase.Shader 级联：
---   级 1 = 软膝预滤 + Kawase 步长 1（= 金字塔 CORE，预滤后才模糊）
---   级 2/3 = Kawase 步长 3/8（MID / HALO，每级仅 4 taps）
--- 合成 A 绑 core+mid，合成 B 绑 wide+halo（多 AddSampler 槽位语义同引擎
--- BuildLunacyShader：调用顺序 = SAMPLER[1..] 顺序）。
--- 性能：4 级 × 4 taps @ 1/4 分辨率 ≈ 每像素 1 tap 的原生分辨率开销，
---   比旧版 6 级 × 9 taps 高斯链省一半以上（Kawase 用双线性白嫖平滑）。
--- 不碰 SetBloomSamplerParams：保持引擎默认 0.25 分辨率 RGB 辉光缓冲。
--- 注意 ksh 是 sampler 效果：SAMPLER_PARAMS 魔法 uniform 由引擎按 RT 自动
--- 填充，只需经 SetEffectUniformVariables 绑定（同引擎 blur 链做法），
--- 绝不能 AddUniformVariable；预滤级额外绑 BCAS_GLOW（与合成共用句柄，
--- 引擎 OVERLAY_BLEND 先例）。
--- 注册辉光管线（2026-09 v4 单合成 pass + 3 级金字塔）：一个全分辨率
--- 合成 + 3 级 1/4 分辨率 Kawase（半径曲线 1.5/3.8/9.3 覆盖原四级
--- 1.5/2.9/5.3/10.1，中环一级承载原 mid+wide 能量，少一个 pass）。
--- 采样链输入 = 引擎辉光缓冲（SamplerEffectBase.BloomSampler，Klei 按实体
--- 写入的辉光源，引擎每帧照常填充、与原生 Bloom 效果的开关无关——本项目
--- 实测确认），逐级经 SamplerEffectBase.Shader 级联：
---   级 1 = 软膝预滤 + Kawase 步长 1（= 金字塔 CORE，预滤后才模糊）
---   级 2/3 = Kawase 步长 3/8（MID / HALO，每级仅 4 taps）
--- 合成 pass（bcas_glow.ksh v4）SAMPLER[1..3] 依次绑三级金字塔输出，
--- SAMPLER[0] = 链路输入（studio 输出），一次完成旧 A+B 全部合成
--- （权重/暖色/饱和塑形与旧两 pass 数学等价：饱和塑形对 bloom 线性）。
--- 性能：合成 2 pass -> 1 pass（全分辨率少一个 RT 往返）；3 级 × 4 taps
---   @ 1/4 分辨率 ≈ 每像素 0.75 tap 的原生分辨率开销（旧 4 级为 1 tap）。
+--   级 1 = 软膝预滤（bcas_bloom_pre，额外绑 BCAS_GLOW 预滤参数）
+--   级 2/3/4 = 2x2 双线性盒式降采样（bcas_bloom_down.ps 一套代码，每级
+--             4 taps，只有 RT 尺寸不同）
+-- 四级输出按注册顺序绑成合成 pass 的 SAMPLER[1..4]（多 AddSampler 槽位语义
+-- 同引擎 BuildLunacyShader：调用顺序 = SAMPLER[1..] 顺序）；折叠模式下合成
+-- 并进 merged 单 pass，否则单独注册 bcas_glow.ksh。
 -- 关闭真零开销：EnablePostProcessEffect 停合成 + SetSamplerEffectState
---   逐级停金字塔（引擎绑定表原生方法，v3 新接入——此前辉光关闭时
---   sampler 仍在每帧空跑）。
+--   逐级停金字塔（引擎绑定表原生方法——此前辉光关闭时 sampler 仍在空跑）。
 -- 不碰 SetBloomSamplerParams：保持引擎默认 0.25 分辨率 RGB 辉光缓冲。
 -- 注意 ksh 是 sampler 效果：SAMPLER_PARAMS 魔法 uniform 由引擎按 RT 自动
 -- 填充，只需经 SetEffectUniformVariables 绑定（同引擎 blur 链做法），
 -- 绝不能 AddUniformVariable；预滤级额外绑 BCAS_GLOW（与合成共用句柄，
 -- 引擎 OVERLAY_BLEND 先例）。
+local function Handle(name)
+    local h = State.handles[name]
+    if h == nil then
+        h = PostProcessor:AddUniformVariable(name, 4)
+        State.handles[name] = h
+    end
+    return h
+end
+
 local function RegisterGlowChain()
     -- 折叠模式：辉光合成已经并进 merged 单 pass，只需把 mip 金字塔挂到它上面，
     -- 不再注册独立的 glow 合成 pass（全分辨率 pass 1 个）。
@@ -973,6 +1174,42 @@ local function RegisterGlowChain()
     return glow_id
 end
 
+-- 影子光栅的载体 = 引擎自己的 bloom 缓冲，**1/4 分辨率**（2026-09-21 用户定案）。
+--
+-- 旧版（v14~v20）在这里把缓冲重钉成"全分辨率 RGBA"：包装 metatable 上的
+-- SetBloomSamplerParams 强制 1.0/RGBA，再重跑 BuildBloomShader() 让引擎按新参数
+-- 重建那条链。整段已退休，理由两条：
+--   · 代价离谱：缓冲从 1/4 变全分辨率 = 显存 ×16，外加每 2 秒一次的重钉调用、
+--     三道一次性探针日志（PostProcessor 方法表 / 各枚举 / 重建前 bloom 链）。
+--   · 用户拍板影子就用 1/4：1/4 放大后的方块边缘由合成端的抽头柔化兜住
+--     （见 bcas_merged_glow.ksh 影子那一段：so=px*2 落在半个 texel 上，
+--     靠引擎已开的 LINEAR 采样让硬件白补插值）。
+-- 于是不再有任何包装、重建、重钉或探针：影子直接吃引擎默认的缓冲。
+
+-- 注册地面影子步进链（V16.3）：bloom 缓冲的精灵信息场 → 日晷射线步进
+-- （半分辨率）→ merged 的 SAMPLER[5]。密度=0 时合成端乘 0，画面逐像素等于
+-- 没有影子；pass 本身常开无害。V'（射线屏幕迹线）由 PushShadow 每拍下发。
+-- SAMPLER 槽位顺序：1..4 金字塔、5 影子。
+local function RegisterShadowCaptureChain()
+    if not State.merged_has_glow then return nil end
+    if SamplerEffectBase == nil or SamplerSizes == nil or SamplerColourMode == nil
+        or FILTER_MODE == nil or MIP_FILTER_MODE == nil then
+        print("[BCAS] 警告：SamplerEffect 引擎全局量缺失，地面影子未创建")
+        return nil
+    end
+    local cap_id = PostProcessor:AddSamplerEffect(resolvefilepath("shaders/bcas_shadow_cap.ksh"),
+        SamplerSizes.Relative, 1.0, 1.0, SamplerColourMode.RGB, SamplerEffectBase.BloomSampler)
+    if cap_id == nil then
+        print("[BCAS] 警告：地面影子捕获 pass 注册失败")
+        return nil
+    end
+    PostProcessor:SetSamplerEffectFilter(cap_id, FILTER_MODE.LINEAR, FILTER_MODE.LINEAR, MIP_FILTER_MODE.NONE)
+    PostProcessor:AddSampler(State.merged_id, SamplerEffectBase.Shader, cap_id)
+    State.shadow_cap_id = cap_id
+    print("[BCAS] 地面影子捕获链注册 OK（bloom 缓冲 → 光栅解码，并入主 pass SAMPLER[5]）")
+    return cap_id
+end
+
 function State.InitShader()
     if PostProcessor == nil then
         print("[BCAS] PostProcessor 不可用，滤镜未加载")
@@ -1011,6 +1248,8 @@ function State.InitShader()
         end
     end
     State.glow_id = RegisterGlowChain()
+    -- 地面影子（V16）：辉光金字塔之后注册（SAMPLER[5] 槽位顺序）
+    State.shadow_cap_id = RegisterShadowCaptureChain()
     State.glow2_id = nil
     -- 只写参数，不在这里启用（启用统一放在 SortAndStart，对齐引擎时序）
     State.ApplyPreset(State.boot_preset, false)
@@ -1024,39 +1263,74 @@ function State.SortAndStart()
 
     -- 插入渲染链：全游戏生命周期只此一次（引擎在启动时统一调
     -- SortAndEnableShaders，链路跨存档持续存在；再插就是叠加副本）。
-    -- 顺序（用户定的管线）：先调色后锐化 -> 链路 Lunacy -> cinema -> studio。
+    -- 我们内部顺序（用户定的管线）：先调色后锐化 -> cinema -> studio。
     -- 调色在前让动态范围先稳定，锐化不会再被后续对比度二次拉伸；
     -- 颗粒在锐化之后生成，锐化永远采不到噪点。
-    local rc = false
-    if State.merged_id ~= nil then
-        -- 合并 pass 单体插入：位置同调色链（Lunacy 之后），锐化链全跳过
-        rc = PostProcessor:SetPostProcessEffectAfter(State.merged_id, PostProcessorEffects.Lunacy)
-        print("[BCAS] 插入合并pass After(Lunacy) -> " .. tostring(rc))
-    elseif State.effect2_id ~= nil then
-        rc = PostProcessor:SetPostProcessEffectAfter(State.effect2_id, PostProcessorEffects.Lunacy)
-        print("[BCAS] 插入调色链 After(Lunacy) -> " .. tostring(rc))
-    end
-    if not rc and State.merged_id ~= nil then
-        rc = PostProcessor:SetPostProcessEffectBefore(State.merged_id, PostProcessorEffects.Distort)
-        print("[BCAS] 合并pass Before(Distort) -> " .. tostring(rc))
+    --
+    -- ⚠ 在整条引擎链里的位置：**链首**。这是 2026-09-21 为 BUG① 定的死规矩，别改回去。
+    --   BUG①（影子盖住施影者自己）的剪切蒙版靠场景 alpha 里那个 254/255 标记：
+    --   写入端 bcas_surface_light.SetMarkMode，读端 bcas_merged_glow.ps 里
+    --   [253.5/255, 254.5/255] 的窄窗口，而读端读的就是 **SAMPLER[0].a**——
+    --   也就是"我们这个 pass 运行时的那张场景图"的 alpha。
+    --   引擎链上 ZoomBlur / Bloom / Distort / ColourCube / Lunacy **每一个**都写
+    --   vec4(..., 1.0)（逐个开 .ksh 看末尾一行核实过）。所以只要排在它们任何一个
+    --   后面，标记必然已经被洗成 1.0，窗口恒不命中，剪影**静默**失效——
+    --   实机症状正是"影子照样盖在施影者自己的像素上"。修复前我们排在 Lunacy 之后
+    --   （client_log 实证：插入合并pass After(Lunacy) -> true），五个洗涤者全在前头。
+    --   锚点优先级 ZoomBlur（链首）> Bloom > Distort；判据是"α 还是原始的"，
+    --   不是"画面好不好"。
+    local head = State.merged_id or State.effect2_id or State.effect_id
+    local rc, where = false, nil
+    if PostProcessorEffects ~= nil then
+        local anchors = {
+            { "ZoomBlur", PostProcessorEffects.ZoomBlur },
+            { "Bloom",    PostProcessorEffects.Bloom },
+            { "Distort",  PostProcessorEffects.Distort },
+        }
+        for _i = 1, #anchors do
+            if anchors[_i][2] ~= nil then
+                rc = PostProcessor:SetPostProcessEffectBefore(head, anchors[_i][2])
+                if rc then
+                    where = anchors[_i][1]
+                    break
+                end
+            end
+        end
     end
     if not rc then
-        -- 调色 pass 缺席时锐化直接顶上；或作为回退插入位置
-        rc = PostProcessor:SetPostProcessEffectBefore(State.effect_id, PostProcessorEffects.Distort)
-        print("[BCAS] 锐化链 Before(Distort) -> " .. tostring(rc))
+        -- 三个锚点全不可用（理论上不可能）：退回修复前的落点 After(Lunacy)。
+        -- 宁可让剪影回到"不剪"的旧状态，也绝不能把整个画质链路挤出链外。
+        where = "Lunacy(退化：剪影不工作)"
+        if PostProcessorEffects ~= nil and PostProcessorEffects.Lunacy ~= nil then
+            rc = PostProcessor:SetPostProcessEffectAfter(head, PostProcessorEffects.Lunacy)
+        end
     end
+    print("[BCAS] 插入合成链 Before(" .. tostring(where) .. ") -> " .. tostring(rc))
+    -- 一行自检：剪影要真的工作，必须同时满足「用的是带窗口判据的着色器」
+    -- 与「插在洗 alpha 的引擎效果之前」。两者任一不成立，BUG① 就静默复现。
+    local cut_shader = (State.merged_has_glow == true)
+    local cut_pos = (where == "ZoomBlur" or where == "Bloom")
+    print("[BCAS] 剪切蒙版自检: 着色器=" .. (cut_shader and "有窗口判据" or "缺窗口判据(merged_glow 未注册)")
+        .. " 链位置=" .. tostring(where) .. " -> " .. ((cut_shader and cut_pos) and "就绪" or "未就绪"))
     if State.effect_id ~= nil and State.effect2_id ~= nil then
         local rs = PostProcessor:SetPostProcessEffectAfter(State.effect_id, State.effect2_id)
         print("[BCAS] 插入锐化链 After(cinema) -> " .. tostring(rs))
     end
     -- merged 路径：effect_id == merged_id 且 effect2_id == nil，上面自然跳过
-    -- 辉光合成插在 studio 之后（链尾）：作用于最终画面，辉光层永不被
-    -- 锐化或二次调色。v3 单合成 pass：SAMPLER[0] 自动取链路输入
-    -- （studio 输出），SAMPLER[1..4] = 四级金字塔。MoonPulse（月暴）
-    -- 在引擎排序里位于我们之后，其事件效果叠在辉光上，可接受。
-    if State.glow_id ~= nil then
+    -- 辉光合成排在主 pass 之后（相对次序不变，整组一起待在链首）：辉光层永不被
+    -- 锐化或二次调色。v3 单合成 pass：SAMPLER[0] 现在拿到的是**未经任何后处理的
+    -- 原始场景**（这正是剪切蒙版要的：alpha 还是实体的 254/255 标记），
+    -- SAMPLER[1..4] = 四级金字塔。MoonPulse（月暴）在引擎排序里位于我们之后。
+    -- ⚠ 折叠模式（glow_id == effect_id）下**必须跳过**这一行：那是 After(X, X) 的自指
+    --   调用。引擎的 SetPostProcessEffectAfter 不是 Lua 方法（dst_scripts 里没有定义，
+    --   读不到实现），万一是"把 X 挪到链尾"语义，我们刚插到链首的合成会被自己这一行
+    --   挪回链尾 —— 剪切蒙版静默失效，而且日志上两行都打印 true，看不出来。
+    --   折叠时辉光已并进单 pass，本就没有任何东西需要排序。
+    if State.glow_id ~= nil and State.glow_id ~= State.effect_id then
         local rg = PostProcessor:SetPostProcessEffectAfter(State.glow_id, State.effect_id)
         print("[BCAS] 插入辉光链 After(studio) -> " .. tostring(rg))
+    else
+        print("[BCAS] 辉光已折叠进主 pass，跳过独立的辉光链排序")
     end
 
     local rc_en = PostProcessor:EnablePostProcessEffect(State.effect_id, true)
@@ -1132,6 +1406,10 @@ function State.Info()
     end
     print("[BCAS] enabled = " .. tostring(State.enabled))
     print("[BCAS] ready = " .. tostring(State.ready))
+    local SunLight = _G.package.loaded["bcas_surface_light"]
+    if SunLight ~= nil and SunLight.Info ~= nil then
+        SunLight.Info()
+    end
     for name, h in pairs(State.handles) do
         print("[BCAS] uniform " .. name .. " handle = " .. tostring(h))
     end

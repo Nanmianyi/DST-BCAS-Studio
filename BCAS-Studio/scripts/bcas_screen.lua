@@ -145,12 +145,18 @@ local VAL_X   = 154                   -- 数值框中心 X
 local RST_X   = 206                   -- 复位按钮中心 X
 
 -- 纵向台账
-local Y_HEADER   = 305                 -- 页眉深色圆角条中心
-local Y_PRESET   = 260
-local Y_DIV1     = 238
-local Y_TABS     = 220
-local Y_DIV2     = 196
-local Y_ROW0     = 164
+-- 2026-09-22：页签要放第二排（用户：「一行摆了一大堆……这两个新增的要多开一个列，
+-- 排到这个新列的中间，不要把他们挤出去」）。页眉条 58 高是 1:1 出图不能缩，
+-- 面板上沿又只剩 11 单位，所以把内容区整体下移 10（最挤的 03 色彩页仍留 5 单位
+-- 余量，由 work/panel_layout_check.py 盯着），空出来的位置正好放第二排页签。
+-- 页签胶囊 26 高：和预设行同高，而且 1:1 端帽图集里只有 26/28/36 三档（PILL_CAP）。
+local Y_HEADER   = 307                 -- 页眉深色圆角条中心（58 高 → [278, 336]）
+local Y_PRESET   = 259                 -- 预设胶囊中心（26 高 → [246, 272]）
+local Y_DIV1     = 240
+local Y_TABS     = 223                 -- 第一排页签中心（26 高 → [210, 236]）
+local Y_TABS2    = 193                 -- 第二排页签中心（26 高 → [180, 206]）
+local Y_DIV2     = 176
+local Y_ROW0     = 154                 -- 首行中心（卡片顶 172，离分隔线 4）
 local Y_DIV3     = -256
 local Y_BTNS     = -286
 local Y_HINT     = -324
@@ -168,7 +174,8 @@ local STR = {
         {key = "off",      label = "# 原版关闭"},
     },
     HINT = "拖动微调 · 单击键入 · R 复位 · ESC 退出 · P 快捷开关",
-    TABS = {"01 锐化", "02 进阶", "03 色彩", "04 调色", "05 氛围", "06 辉光", "07 光影", "08 水面"},
+    TABS = {"01 锐化", "02 进阶", "03 色彩", "04 调色", "05 氛围", "06 辉光", "07 光影", "08 水面", "09 影子",
+            "10 立体光照", "11 二次幕调色"},
     LABELS = {
         Strength = "锐化强度 STRENGTH", DeconvStrength = "逆卷积墨线收敛 DECONV",
         NoiseReduce = "图像降噪 DENOISE",
@@ -183,6 +190,13 @@ local STR = {
         AR_Threshold = "AURA 边缘阈值", AR_L_Overshoot = "AURA 亮部过冲",
         AR_D_Overshoot = "AURA 暗部过冲", ChromaProtect = "色度保护 CHROMA",
         HL_Desat = "高光去饱和 HL-DESAT", OriginalMix = "原画混合 ORIGINAL",
+        -- 二次目（BCAS_SEC_S/O/P）：接在一次目 CDL 之后的第二级校正。
+        -- 着色器实现早就写好了（bcas_merged_glow.ps：cdl2 = ApplyCDL(cdl, …)，
+        -- color = mix(cdl, cdl2, BCAS_CDL_S.w)），但面板一行都没暴露过 —— 用户 2026-09-22 点单。
+        SecOn = "二次目混合 2ND-MIX",
+        SecSlopeR = "二次斜率 R-SLOPE", SecSlopeG = "二次斜率 G-SLOPE", SecSlopeB = "二次斜率 B-SLOPE",
+        SecOffsetR = "二次偏移 R-OFFSET", SecOffsetG = "二次偏移 G-OFFSET", SecOffsetB = "二次偏移 B-OFFSET",
+        SecPowerR = "二次幂指数 R-POWER", SecPowerG = "二次幂指数 G-POWER", SecPowerB = "二次幂指数 B-POWER",
         SlopeR = "一级斜率 R-SLOPE", SlopeG = "一级斜率 G-SLOPE", SlopeB = "一级斜率 B-SLOPE",
         OffsetR = "一级偏移 R-OFFSET", OffsetG = "一级偏移 G-OFFSET", OffsetB = "一级偏移 B-OFFSET",
         PowerR = "一级幂指数 R-POWER", PowerG = "一级幂指数 G-POWER", PowerB = "一级幂指数 B-POWER",
@@ -195,7 +209,15 @@ local STR = {
         GlowKnee = "辉光软膝 KNEE", GlowSpread = "辉光扩散 SPREAD",
         GlowCompress = "高光压缩 COMPRESS",
         VanillaGrade = "官方调色强度 GRADE",
-        SunFill = "太阳全局光 SUN-FILL", GodRays = "透云光束 SUN-SHAFTS", LightingMaster = "光影总开关 LIGHTING", ShadowsOn = "地面投影 SHADOWS", OceanOn = "地皮色调 OCEAN-TILE", GlowTail = "光晕长尾 GLOW-TAIL", LightWrap = "光包裹 LIGHT-WRAP", GlowRim = "轮廓光 GLOW-RIM",
+        SunFill = "太阳全局光 SUN-FILL", GodRays = "透云光束 SUN-SHAFTS", LightingMaster = "光影总开关 LIGHTING", OceanOn = "地皮色调 OCEAN-TILE", GlowTail = "光晕长尾 GLOW-TAIL", LightWrap = "光包裹 LIGHT-WRAP", GlowRim = "轮廓光 GLOW-RIM",
+        SurfaceLight = "物体立体光照 SUN-LIGHT", SurfaceLightStrength = "光照强度 LIGHT-STRENGTH",
+        ShadeWarm = "受光冷暖 WARM-COOL", ShadeContrast = "黑白对比 LIGHT-SHADE",
+        -- 背光侧专属两把（只动背光面；打包在 x 槽，见 bcas_surface_light 的 M.PackX）
+        ShadeCool = "背光冷暖 SHADE-COOL", ShadeDark = "背光黑白 SHADE-TONE",
+        ShadowProj = "地面影子 GROUND-SHADOW", ShadowDensity = "影子浓度 SHADOW",
+        ShadowTintR = "影色 R-TINT", ShadowTintG = "影色 G-TINT", ShadowTintB = "影色 B-TINT",
+        ShadowSoft = "影子柔度 SOFT",
+        ShadowNight = "夜间影子 NIGHT-SHADOW",
         GlintOn = "海面波光 GLINT", GlintStrength = "波光强度 INTENSITY", GlintDensity = "波光增益 GAIN", GlintGrain = "波光颗粒 GRAIN", GlintSoft = "海色融合 MIX",
     },
     SHARP_NOTE = "双边自适应锐化：仅作用于游戏世界，HUD 界面不受影响。\n抗振铃 (AURA) 可消除白边与过冲伪影。",
@@ -204,6 +226,14 @@ local STR = {
     ATMO_NOTE  = "环境氛围：暗角压暗四边、胶片颗粒增添质感；\n官方调色可控制原版季节滤镜强度。",
     GLOW_NOTE  = "金字塔柔光：沿游戏自带光源柔化发散，软膝控制起点，\n长尾权重使光晕温暖宽广。",
     GLOW2_NOTE = "光影总开关 LIGHTING 拨 OFF 即彻底释放全部光影开销。\n地面投影随日晷；波光改的是海洋地块，绿洲般通透粼粼。\n⚠ 水面配色烘在世界生成：改动 OCEAN 需重进世界生效。",
+    SHADOW_NOTE = "地面影子 = 实体自己第二遍绘制，沿日晷方向斜投影到地面；\n"
+        .. "影长随太阳高度自然伸缩，与施影者动作逐帧同步。白天影向锁太阳，\n"
+        .. "夜里与洞穴改为跟随辉光/火把（光源在哪影子朝哪）。幽灵、影怪、\n"
+        .. "月灵、海里的生物与船只不投影（它们不该有落地影）。",
+    SURFACE_NOTE = "物体立体光照：实体按日晷方向给迎光面暖亮、背光面冷暗；\n"
+        .. "光源固定在世界里，转视角时亮面会换到朝光那侧，夜里随月光转冷。\n"
+        .. "受光冷暖 = 受光/背光的互补色偏；黑白对比 = 受光提亮、背光压暗、\n"
+        .. "轮廓光与接地影的统一幅度。两根滑条 0.5 都是出厂观感。",
     WB_TITLE   = "# 光学色轮 / 白平衡",
     WB_SUB     = "// CDL SPECTRUM ANALYZER",
     WB_CLOSE   = "完成校准",
@@ -230,13 +260,31 @@ local TAB_ROWS = {
            "DistortFree", "SnowCap", "SandFilter", "VanillaGrade"},
     [6] = {"BloomOn", "GlowIntensity", "GlowThreshold", "GlowKnee",
            "GlowSpread", "GlowWarmth", "GlowSat", "GlowCompress"},
-    [7] = {"LightingMaster", "ShadowsOn", "OceanOn", "SunFill", "GodRays", "GlowRim", "GlowTail", "LightWrap"},
+    [7] = {"LightingMaster", "OceanOn", "SunFill", "GodRays", "GlowRim", "GlowTail", "LightWrap"},
     [8] = {"GlintOn", "GlintStrength", "GlintDensity", "GlintGrain", "GlintSoft"},
+    -- 2026-09-22（用户实机：影子页说明卡戳出面板下沿、还盖住页脚按钮）
+    -- 影子页原本 9 行，加「受光冷暖/黑白对比」后变 11 行：11*42 = 462 单位 + 说明卡
+    -- 76 高，几何上必然越过页脚（按钮上沿 Y_BTNS+18 = -268）。行距 42、行高 36、
+    -- 说明卡贴图只有 42/52/76 三档（图集 1:1 出图不能拉伸），压缩一行都压不出 130
+    -- 单位的缺口，所以按用户选择把整组立体光照拆成独立的第 10 页。
+    [9] = {"ShadowProj", "ShadowDensity", "ShadowSoft",
+           "ShadowTintR", "ShadowTintG", "ShadowTintB", "ShadowNight"},
+    [10] = {"SurfaceLight", "SurfaceLightStrength", "ShadeWarm", "ShadeContrast",
+            "ShadeCool", "ShadeDark"},
+    -- 第 11 页「二次幕调色」：把早就写好、却一直没暴露的第二级 CDL 拿出来。
+    -- 10 行正好用满一页（这一页就不放说明卡了 —— 说明卡最低 42 高，10 行 + 42
+    -- 会顶到页脚按钮，见 Y_BTN 台账）。首行是 0~1 的混合量：0 = 只看一次目。
+    -- 参数顺序与 uniform 无关（BCAS_SEC_S/O/P 是按 comp 取的），这里按 R/G/B 分组排。
+    [11] = {"SecOn",
+            "SecSlopeR", "SecSlopeG", "SecSlopeB",
+            "SecOffsetR", "SecOffsetG", "SecOffsetB",
+            "SecPowerR", "SecPowerG", "SecPowerB"},
 }
 
 local BOOL_KEYS = { ColourCubeOn = true, BloomOn = true,
     SanityColourOn = true, DistortFree = true, SandFilter = true,
-    ShadowsOn = true, OceanOn = true, LightingMaster = true, GlintOn = true }
+    OceanOn = true, LightingMaster = true, GlintOn = true,
+    SurfaceLight = true, ShadowProj = true, ShadowNight = true }
 
 -- ==== 3. 颜色数学 ===========================================================
 
@@ -620,14 +668,23 @@ function BCASScreen:BuildPresetRow()
     end
 end
 
+-- 页签分两排（2026-09-22，用户：「选项卡里面一行他摆了一大堆……这两个新增的
+-- 你要多开一个列，让他们排到这个新列的中间，你不要把他们挤出去」）：
+--   第一排 = 前 9 个页签，尺寸与原设计一致（47 宽、13 号字），一个都不缩；
+--   第二排 = 多出来的（10 立体光照 / 11 二次幕调色），**水平居中**排，
+--            胶囊放宽到 96（只有两个，位置富裕），全名才写得下不被挤出去。
+local TAB_PER_ROW = 9
+local TAB_W2      = 96
+
 function BCASScreen:BuildTabRow()
     self.tab_btns = {}
     local n = #STR.TABS
-    local chip_w = math.floor((PANEL_W - 32 - (n - 1) * 3) / n)
+    local n1 = math.min(n, TAB_PER_ROW)
+    local chip_w = math.floor((PANEL_W - 32 - (n1 - 1) * 3) / n1)
     local step = chip_w + 3
-    for i, label in ipairs(STR.TABS) do
-        local btn_x = -PANEL_W / 2 + 16 + chip_w / 2 + (i - 1) * step
-        local btn = self:Chip(self.chrome, btn_x, Y_TABS, chip_w, 28, label, i == self.tab, nil, 13)
+    local function put(i, w, x)
+        local btn = self:Chip(self.chrome, x, (i <= TAB_PER_ROW) and Y_TABS or Y_TABS2,
+                              w, 26, STR.TABS[i], i == self.tab, nil, 13)
         btn:SetOnClick(function()
             if self.tab ~= i then
                 self.tab = i
@@ -636,6 +693,16 @@ function BCASScreen:BuildTabRow()
             end
         end)
         self.tab_btns[i] = btn
+    end
+    for i = 1, n1 do
+        put(i, chip_w, -PANEL_W / 2 + 16 + chip_w / 2 + (i - 1) * step)
+    end
+    local n2 = n - n1
+    if n2 > 0 then
+        local span = n2 * TAB_W2 + (n2 - 1) * 6
+        for j = 1, n2 do
+            put(n1 + j, TAB_W2, -span / 2 + TAB_W2 / 2 + (j - 1) * (TAB_W2 + 6))
+        end
     end
 end
 
@@ -650,6 +717,25 @@ end
 function BCASScreen:BuildRow(key, y)
     local meta = State.VEC[key]
     local isbool = BOOL_KEYS[key] == true
+    -- 兜底：面板行是手写的 key 列表，参数表却可能先变（v10 删掉 ShadowStrength
+    -- 时漏了这一行，点开"影子"页就 bad argument #2 to 'format' 直接崩）。
+    -- 缺参数一律跳过并只记一次日志，UI 允许少一行，客户端不许崩。
+    if meta == nil and not isbool then
+        if not self.bcas_missing_keys then self.bcas_missing_keys = {} end
+        if not self.bcas_missing_keys[key] then
+            self.bcas_missing_keys[key] = true
+            print("[BCAS] 面板跳过未知参数: " .. tostring(key) .. "（不在 State.VEC 里）")
+        end
+        return
+    end
+    if State.params[key] == nil then
+        if not self.bcas_missing_keys then self.bcas_missing_keys = {} end
+        if not self.bcas_missing_keys[key] then
+            self.bcas_missing_keys[key] = true
+            print("[BCAS] 面板跳过无值参数: " .. tostring(key) .. "（State.params 里是 nil）")
+        end
+        return
+    end
     local row = self.content:AddChild(Widget("row_" .. key))
     row:SetPosition(0, y)
     table.insert(self.content_children, row)
@@ -922,6 +1008,10 @@ function BCASScreen:BuildContent()
         self:BuildNote(note_card, STR.GLOW_NOTE, 52)
     elseif self.tab == 7 then
         self:BuildNote(note_card, STR.GLOW2_NOTE, 76)
+    elseif self.tab == 9 then
+        self:BuildNote(note_card, STR.SHADOW_NOTE, 76)
+    elseif self.tab == 10 then
+        self:BuildNote(note_card, STR.SURFACE_NOTE, 76)
     end
 
     -- 切页重置滚动

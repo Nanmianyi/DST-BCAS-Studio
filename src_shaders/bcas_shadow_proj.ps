@@ -1,0 +1,133 @@
+#extension GL_OES_standard_derivatives : enable
+#if defined( GL_ES )
+precision highp float;
+#endif
+// BCAS shadow projection - fragment stage (bloom render pass).
+//
+// Writes the projected silhouette into the bloom buffer as an ADDITIVE BLUE
+// MARKER. The vertex stage already moved this fragment onto the ground along
+// the sun direction; all that is left is to turn the artwork's alpha into a
+// coverage value.
+//
+// THE PAGE-SELECTION BRANCHES ARE LOAD-BEARING (2026-09-19 live crash):
+// the engine binds one texture per atlas page the entity uses, and ANGLE
+// asserts (mSamplersPS[samplerIndex].active, ProgramBinary.cpp:2407) the
+// moment it binds a slot the compiled program does not actively sample.
+// Sampling ONLY SAMPLER[0] made element [1] inactive -> instant crash on the
+// first two-page entity drawn in the bloom pass. So this stage keeps the
+// engine's own page-selection structure VERBATIM (including the
+// TRIPLE_ATLAS variant) and replaces only the final write.
+//
+// CONTRACT v17 (2026-09-21) - why the raster is blue, additive and a = 0.
+//
+// 1. ALPHA MUST BE 0. The bloom channel accumulates entities with a
+//    PREMULTIPLIED blend: dst.rgb = src.rgb + dst.rgb * (1 - src.a). Any
+//    write with a > 0 therefore eats that fraction of whatever glow an
+//    earlier fragment left in the shared buffer:
+//       a = 0.80 (the 2026-09-19 build) -> removes 80% of every covered glow
+//           pixel: the "black flickering veil over fire" the author reported.
+//       a = 1.00 -> dst = src, i.e. the glow is REPLACED; because the
+//           raster's shape moves every frame (swaying grass, walking
+//           characters) while draw order is y-sorted, covered pixels would
+//           flip hard between glow and raster -> the flicker.
+//    a = 0 with rgb > 0 is the only write in this channel that takes nothing
+//    away: dst.rgb = src.rgb + dst.rgb. Glow keeps 100% of its colour and
+//    brightness under a shadow.
+//
+// 2. THE MARKER LIVES ONLY IN BLUE. The glow pyramid (bcas_bloom_pre.ps)
+//    thresholds on Rec.709 luma, where blue weighs 0.0722. One layer adds
+//    BCAS_RASTER_BLUE * 0.0722 = 0.0043 luma, so more than ten overlapping
+//    layers are needed to reach the standard preset's 0.04 threshold - and
+//    overlap does not even accumulate that fast, because the additive write
+//    saturates the channel at 1.0. The prefilter therefore needs no raster
+//    rejection and no hole filling; the flicker disappears structurally
+//    rather than by tuning two thresholds against each other.
+//
+// 3. SATURATED GLOW REFUSES THE MARKER BY CONSTRUCTION. Over a bright glow
+//    pixel the addition clamps at 1.0, so the capture's discriminant
+//    mk = b - max(r,g) collapses to ~0 and that pixel can never be darkened
+//    by a shadow. Dim glow (below BCAS_GLOW_CEIL) is filtered on the
+//    composite side by the pyramid's own glow gate (bcas_merged_glow.ps).
+//
+// 4. NO OVERDRAW PATTERN IS NEEDED. Overlaps simply add: one layer lands on
+//    0.06, ten layers saturate at 1.0, and the capture normalizes by 0.06 and
+//    clamps at 1. Accepted consequence: two different casters whose shadows
+//    cross do not produce a darker patch. Darkness is a composite-side
+//    multiplier either way.
+//
+// Keeping this shape means a disabled system leaves the shared buffer
+// bit-identical to vanilla: unmounting the handle makes the entity fall back
+// to the engine's own anim_bloom.ps, which writes (0,0,0,colour.a).
+//
+// Keep BCAS_RASTER_BLUE in sync with BCAS_MARK_BLUE in bcas_shadow_cap.ps.
+#if defined( TRIPLE_ATLAS )
+    uniform sampler2D SAMPLER[6];
+#else
+    uniform sampler2D SAMPLER[2];
+#endif
+varying vec3 PS_TEXCOORD;
+// Art alpha is hard-cut rather than carried through as a gradient: artwork
+// soft edges are 1-2 px of brush anti-aliasing, and letting them blend turns
+// the shared borders between symbols into visible seams (the old system's
+// first root cause). 0.30 is the value that was measured for that cut.
+#define BCAS_ALPHA_CUT 0.30
+// Per-layer marker depth in the blue channel. Small enough that ten layers
+// are still invisible to the glow pyramid (see 2 above), large enough that the
+// capture's 0.045 floor accepts a single layer with 8-bit margin (0.06 / 255
+// rounding is 0.004 -> three times the floor's own headroom).
+#define BCAS_RASTER_BLUE 0.06
+// Area coverage over the texel footprint: cut each tap first, then average the
+// coverages -- that is what yields a *continuous* coverage. Averaging alpha and
+// then cutting stays nearly binary and gains nothing.
+// The raster is 1/4 resolution and the capture bilinear-upsamples it, so the
+// penumbra is carried by THIS window, not by the grid: (0.30, 0.52) left a
+// near-binary edge that read as stair steps and flickered. (0.14, 0.68) widens
+// the edge to 5.94 ground px, costing +0.6% RMSE and -0.3% jitter
+// (tools/shadow_edge_sim.py). The 3x3 grid stays: 4x4 buys +0.02 px.
+float bcas_shape( sampler2D tex )
+{
+    vec2 tx = dFdx( PS_TEXCOORD.xy ) * 0.3333;
+    vec2 ty = dFdy( PS_TEXCOORD.xy ) * 0.3333;
+    float acc = 0.0;
+    for( int i = -1; i <= 1; ++i )
+    {
+        for( int j = -1; j <= 1; ++j )
+        {
+            vec4 s = texture2D( tex, PS_TEXCOORD.xy + float(i) * tx + float(j) * ty );
+            acc += smoothstep( 0.14, 0.68, s.a );
+        }
+    }
+    return acc / 9.0;
+}
+void main()
+{
+    float shape;
+#if defined( TRIPLE_ATLAS )
+    if( PS_TEXCOORD.z < 0.5 )
+    {
+        shape = bcas_shape( SAMPLER[0] );
+    }
+    else if( PS_TEXCOORD.z < 1.5 )
+    {
+        shape = bcas_shape( SAMPLER[1] );
+    }
+    else
+    {
+        shape = bcas_shape( SAMPLER[5] );
+    }
+#else
+    if( PS_TEXCOORD.z < 0.5 )
+    {
+        shape = bcas_shape( SAMPLER[0] );
+    }
+    else
+    {
+        shape = bcas_shape( SAMPLER[1] );
+    }
+#endif
+    // shape is computed above, per branch, as area coverage.
+    // See work/next_probe_plan.md for the simulated numbers.
+    // No density factor here on purpose: density, tint and how much the raster
+    // blocks the sun relight are all composite-side uniforms.
+    gl_FragColor = vec4(0.0, 0.0, shape * BCAS_RASTER_BLUE, 0.0);
+}
